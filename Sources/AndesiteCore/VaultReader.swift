@@ -31,14 +31,14 @@ public struct VaultPath: Sendable, Equatable {
     }
 }
 
-private struct Fingerprint: Equatable {
-    let device: UInt64
-    let inode: UInt64
-    let size: Int64
-    let modificationSeconds: Int64
-    let modificationNanos: Int64
-    let changeSeconds: Int64
-    let changeNanos: Int64
+public struct FileFingerprint: Equatable, Sendable, Codable {
+    public let device: UInt64
+    public let inode: UInt64
+    public let size: Int64
+    public let modificationSeconds: Int64
+    public let modificationNanos: Int64
+    public let changeSeconds: Int64
+    public let changeNanos: Int64
 
     init(_ s: stat) {
         device = UInt64(s.st_dev); inode = UInt64(s.st_ino); size = Int64(s.st_size)
@@ -50,6 +50,11 @@ private struct Fingerprint: Equatable {
         changeSeconds = Int64(s.st_ctim.tv_sec); changeNanos = Int64(s.st_ctim.tv_nsec)
         #endif
     }
+}
+
+public struct ObservedFile: Sendable {
+    public let fingerprint: FileFingerprint
+    public let bytes: Data
 }
 
 /// Synchronous descriptor-relative observation. Run on a bounded blocking
@@ -76,7 +81,12 @@ public final class VaultReader {
     /// unobserved writes or a writer paused between edits.
     public func readStable(_ path: VaultPath, maximumBytes: Int, debounce: TimeInterval = 0.25) throws -> Data {
         guard maximumBytes >= 0, debounce >= 0, debounce.isFinite else { throw VaultReadError.invalidPath }
-        return try readStable(path, maximumBytes: maximumBytes, betweenObservations: {
+        return try observeStable(path, maximumBytes: maximumBytes, debounce: debounce).bytes
+    }
+
+    public func observeStable(_ path: VaultPath, maximumBytes: Int, debounce: TimeInterval = 0.25) throws -> ObservedFile {
+        guard maximumBytes >= 0, debounce >= 0, debounce.isFinite else { throw VaultReadError.invalidPath }
+        return try observeStable(path, maximumBytes: maximumBytes, betweenObservations: {
             Thread.sleep(forTimeInterval: debounce)
         })
     }
@@ -84,14 +94,18 @@ public final class VaultReader {
     // Internal seam for deterministic race tests. The caller must still run
     // this synchronous function on a blocking executor.
     func readStable(_ path: VaultPath, maximumBytes: Int, betweenObservations: () throws -> Void) throws -> Data {
+        try observeStable(path, maximumBytes: maximumBytes, betweenObservations: betweenObservations).bytes
+    }
+
+    private func observeStable(_ path: VaultPath, maximumBytes: Int, betweenObservations: () throws -> Void) throws -> ObservedFile {
         let first = try observe(path, maximumBytes: maximumBytes)
         try betweenObservations()
         let second = try observe(path, maximumBytes: maximumBytes)
         guard first.0 == second.0, first.1 == second.1 else { throw VaultReadError.unstable }
-        return second.1
+        return ObservedFile(fingerprint: second.0, bytes: second.1)
     }
 
-    private func observe(_ path: VaultPath, maximumBytes: Int) throws -> (Fingerprint, Data) {
+    private func observe(_ path: VaultPath, maximumBytes: Int) throws -> (FileFingerprint, Data) {
         var directory = dup(root)
         guard directory >= 0 else { throw VaultReadError.systemCall("dup root", errno) }
         defer { close(directory) }
@@ -130,8 +144,8 @@ public final class VaultReader {
         guard fstat(fd, &after) == 0 else { throw VaultReadError.systemCall("restat file", errno) }
         guard fstatat(directory, name, &atPath, AT_SYMLINK_NOFOLLOW) == 0 else { throw VaultReadError.unstable }
         guard (atPath.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG), atPath.st_nlink == 1,
-              Fingerprint(before) == Fingerprint(after), Fingerprint(after) == Fingerprint(atPath),
+              FileFingerprint(before) == FileFingerprint(after), FileFingerprint(after) == FileFingerprint(atPath),
               data.count == after.st_size else { throw VaultReadError.unstable }
-        return (Fingerprint(after), data)
+        return (FileFingerprint(after), data)
     }
 }

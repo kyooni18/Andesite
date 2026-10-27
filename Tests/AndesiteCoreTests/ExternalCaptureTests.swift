@@ -1,0 +1,47 @@
+import Foundation
+import Testing
+@testable import AndesiteCore
+
+@Test func externalCapturePersistsRevisionsWithoutWritingVault() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let vault = root.appendingPathComponent("vault"), objects = root.appendingPathComponent("objects")
+    try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: objects, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let file = vault.appendingPathComponent("note.md")
+    let firstBytes = Data("# First\r\n".utf8)
+    try firstBytes.write(to: file)
+    let db = try SQLiteConnection(path: root.appendingPathComponent("catalog.sqlite").path)
+    try CatalogSchema.migrate(db)
+    let vaultID = Data(repeating: 8, count: 16)
+    try db.executeValues("INSERT INTO vaults(id,root_config,epoch,created_at,state) VALUES(?, 'vault', ?, 'now', 'active')", bindings: [.blob(vaultID), .blob(vaultID)])
+    let reader = try VaultReader(rootPath: vault.path), store = try ObjectStore(directory: objects.path)
+    let path = try VaultPath("note.md")
+    let first = try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: vaultID, path: path, maximumBytes: 1024, debounce: 0)
+    #expect(first.sequence == 1)
+    #expect(try store.get(first.contentHash, maximumBytes: 1024) == firstBytes)
+    let unchanged = try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: vaultID, path: path, maximumBytes: 1024, debounce: 0)
+    #expect(unchanged.revisionID == first.revisionID && unchanged.sequence == nil)
+    let secondBytes = Data("# external edit\n".utf8)
+    try secondBytes.write(to: file, options: .atomic)
+    let second = try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: vaultID, path: path, maximumBytes: 1024, debounce: 0)
+    #expect(second.entryID == first.entryID && second.revisionID != first.revisionID && second.sequence == 2)
+    #expect(try store.get(first.contentHash, maximumBytes: 1024) == firstBytes)
+    #expect(try store.get(second.contentHash, maximumBytes: 1024) == secondBytes)
+    #expect(try Data(contentsOf: file) == secondBytes)
+    #expect(try db.queryValues("SELECT type FROM changes ORDER BY seq") == [[.text("created")], [.text("updated")]])
+    let failedBytes = Data("transaction failure".utf8)
+    try failedBytes.write(to: file)
+    try db.execute("CREATE TRIGGER fail_revision BEFORE INSERT ON revisions BEGIN SELECT RAISE(ABORT, 'injected'); END")
+    #expect(throws: SQLiteFailure.self) { try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: vaultID, path: path, maximumBytes: 1024, debounce: 0) }
+    #expect(try db.queryValues("SELECT count(*) FROM changes") == [[.integer(2)]])
+    #expect(try db.queryValues("SELECT next_seq FROM vaults") == [[.integer(3)]])
+    #expect(try Data(contentsOf: file) == failedBytes)
+    #expect(try store.get(ObjectStore.hash(failedBytes), maximumBytes: 1024) == failedBytes)
+    try db.execute("DROP TRIGGER fail_revision")
+    let recovered = try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: vaultID, path: path, maximumBytes: 1024, debounce: 0)
+    #expect(recovered.sequence == 3 && recovered.entryID == first.entryID)
+    try Data([0xff]).write(to: file)
+    #expect(throws: ExternalCaptureError.invalidMarkdown) { try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: vaultID, path: path, maximumBytes: 1024, debounce: 0) }
+    #expect(try db.queryValues("SELECT count(*) FROM changes") == [[.integer(3)]])
+}
