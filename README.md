@@ -37,3 +37,11 @@ memory, and does not handle orphan cleanup, quotas or a database journal. No
 code connects these primitives to a catalog or writes to vaults. They are not a
 recovery implementation, and no power-loss or filesystem qualification tests
 have been performed.
+
+`CatalogSchema` provides a transactional, versioned **subset** of the core
+catalog: vaults, entries, revisions, object metadata, changes and operation
+reservations. It refuses a newer schema and rolls back a failed migration. It
+is not yet an operational sync database: pending journals, conflicts,
+tombstones, snapshots, leases and indexes are missing, as are catalog APIs and
+process locking. The migration must not be run against production data without
+exclusive ownership and a backup.
