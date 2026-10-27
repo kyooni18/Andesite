@@ -1,0 +1,1250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://andesite.invalid/protocol/v1.schema.json",
+  "title": "Andesite sync v1 named wire schemas",
+  "$comment": "Select #/$defs/<name>; semantic validation is also required.",
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "maxLength": 19
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "cursor": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{103}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "kind": {
+      "enum": [
+        "markdown",
+        "attachment"
+      ]
+    },
+    "nullableUuid": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "resolution": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "const": "write"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/hash"
+            },
+            "size": {
+              "$ref": "#/$defs/decimal"
+            }
+          },
+          "required": [
+            "action",
+            "path",
+            "contentHash",
+            "size"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "const": "delete"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "const": "keep_head"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "operationRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "baseRevision": {
+              "type": "null"
+            },
+            "type": {
+              "const": "create"
+            },
+            "kind": {
+              "$ref": "#/$defs/kind"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/hash"
+            },
+            "size": {
+              "$ref": "#/$defs/decimal"
+            }
+          },
+          "required": [
+            "clientId",
+            "operationId",
+            "entryId",
+            "baseRevision",
+            "type",
+            "kind",
+            "path",
+            "contentHash",
+            "size"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "baseRevision": {
+              "$ref": "#/$defs/uuid"
+            },
+            "type": {
+              "const": "update"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/hash"
+            },
+            "size": {
+              "$ref": "#/$defs/decimal"
+            }
+          },
+          "required": [
+            "clientId",
+            "operationId",
+            "entryId",
+            "baseRevision",
+            "type",
+            "contentHash",
+            "size"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "baseRevision": {
+              "$ref": "#/$defs/uuid"
+            },
+            "type": {
+              "const": "move"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            }
+          },
+          "required": [
+            "clientId",
+            "operationId",
+            "entryId",
+            "baseRevision",
+            "type",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "baseRevision": {
+              "$ref": "#/$defs/uuid"
+            },
+            "type": {
+              "const": "delete"
+            }
+          },
+          "required": [
+            "clientId",
+            "operationId",
+            "entryId",
+            "baseRevision",
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "baseRevision": {
+              "$ref": "#/$defs/uuid"
+            },
+            "type": {
+              "const": "restore"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/hash"
+            },
+            "size": {
+              "$ref": "#/$defs/decimal"
+            }
+          },
+          "required": [
+            "clientId",
+            "operationId",
+            "entryId",
+            "baseRevision",
+            "type",
+            "path",
+            "contentHash",
+            "size"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "baseRevision": {
+              "$ref": "#/$defs/nullableUuid"
+            },
+            "type": {
+              "const": "resolve"
+            },
+            "conflictId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "resolution": {
+              "$ref": "#/$defs/resolution"
+            }
+          },
+          "required": [
+            "clientId",
+            "operationId",
+            "entryId",
+            "baseRevision",
+            "type",
+            "conflictId",
+            "resolution"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "requestId",
+        "retryable"
+      ]
+    },
+    "errorResponse": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/error"
+        }
+      },
+      "required": [
+        "error"
+      ]
+    },
+    "applied": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "const": "applied"
+        },
+        "operationId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "revision": {
+          "$ref": "#/$defs/nullableUuid"
+        },
+        "sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "idempotencyExpiresAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "required": [
+        "status",
+        "operationId",
+        "revision",
+        "sequence",
+        "idempotencyExpiresAt"
+      ]
+    },
+    "conflictOutcome": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "const": "conflict"
+        },
+        "error": {
+          "$ref": "#/$defs/error"
+        },
+        "operationId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "conflictId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "submittedRevision": {
+          "$ref": "#/$defs/nullableUuid"
+        },
+        "headRevision": {
+          "$ref": "#/$defs/nullableUuid"
+        },
+        "sequence": {
+          "$ref": "#/$defs/decimal"
+        },
+        "idempotencyExpiresAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "required": [
+        "status",
+        "error",
+        "operationId",
+        "conflictId",
+        "submittedRevision",
+        "headRevision",
+        "sequence",
+        "idempotencyExpiresAt"
+      ]
+    },
+    "pending": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "const": "pending"
+        },
+        "operationId": {
+          "$ref": "#/$defs/uuid"
+        }
+      },
+      "required": [
+        "status",
+        "operationId"
+      ]
+    },
+    "notApplied": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "const": "not_applied"
+        },
+        "operationId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "error": {
+          "$ref": "#/$defs/error"
+        },
+        "idempotencyExpiresAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "required": [
+        "status",
+        "operationId",
+        "error",
+        "idempotencyExpiresAt"
+      ]
+    },
+    "operationOutcome": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/applied"
+        },
+        {
+          "$ref": "#/$defs/conflictOutcome"
+        },
+        {
+          "$ref": "#/$defs/pending"
+        },
+        {
+          "$ref": "#/$defs/notApplied"
+        }
+      ]
+    },
+    "snapshot": {
+      "type": "object",
+      "properties": {
+        "snapshotId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "epoch": {
+          "$ref": "#/$defs/uuid"
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "cursor": {
+          "$ref": "#/$defs/cursor"
+        }
+      },
+      "required": [
+        "snapshotId",
+        "epoch",
+        "expiresAt",
+        "cursor"
+      ]
+    },
+    "entry": {
+      "type": "object",
+      "properties": {
+        "entryId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "kind": {
+          "$ref": "#/$defs/kind"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "revision": {
+          "$ref": "#/$defs/uuid"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/hash"
+        },
+        "size": {
+          "$ref": "#/$defs/decimal"
+        }
+      },
+      "required": [
+        "entryId",
+        "kind",
+        "path",
+        "revision",
+        "contentHash",
+        "size"
+      ]
+    },
+    "conflict": {
+      "type": "object",
+      "properties": {
+        "conflictId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "entryId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "operationId": {
+          "$ref": "#/$defs/nullableUuid"
+        },
+        "intentType": {
+          "enum": [
+            "create",
+            "update",
+            "move",
+            "delete",
+            "restore",
+            "resolve"
+          ]
+        },
+        "baseRevision": {
+          "$ref": "#/$defs/nullableUuid"
+        },
+        "observedHead": {
+          "$ref": "#/$defs/nullableUuid"
+        },
+        "requestedPath": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "submittedRevision": {
+          "$ref": "#/$defs/nullableUuid"
+        },
+        "contentHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/hash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/decimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "open",
+            "resolved"
+          ]
+        },
+        "createdAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "resolvedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "contentHash": {
+                "$ref": "#/$defs/hash"
+              },
+              "size": {
+                "$ref": "#/$defs/decimal"
+              },
+              "role": {
+                "enum": ["preimage", "observed", "recovery"]
+              }
+            },
+            "required": ["contentHash", "size", "role"]
+          }
+        }
+      },
+      "required": [
+        "conflictId",
+        "entryId",
+        "operationId",
+        "intentType",
+        "baseRevision",
+        "observedHead",
+        "requestedPath",
+        "submittedRevision",
+        "contentHash",
+        "size",
+        "status",
+        "createdAt",
+        "resolvedAt"
+      ]
+    },
+    "entryPage": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/entry"
+          },
+          "maxItems": 500
+        },
+        "nextPage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "items",
+        "nextPage"
+      ]
+    },
+    "conflictPage": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/conflict"
+          },
+          "maxItems": 500
+        },
+        "nextPage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "items",
+        "nextPage"
+      ]
+    },
+    "event": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "sequence": {
+              "$ref": "#/$defs/decimal"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/nullableUuid"
+            },
+            "type": {
+              "const": "created"
+            },
+            "revision": {
+              "$ref": "#/$defs/uuid"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "kind": {
+              "$ref": "#/$defs/kind"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/hash"
+            },
+            "size": {
+              "$ref": "#/$defs/decimal"
+            }
+          },
+          "required": [
+            "sequence",
+            "entryId",
+            "operationId",
+            "type",
+            "revision",
+            "path",
+            "kind",
+            "contentHash",
+            "size"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sequence": {
+              "$ref": "#/$defs/decimal"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/nullableUuid"
+            },
+            "type": {
+              "const": "updated"
+            },
+            "revision": {
+              "$ref": "#/$defs/uuid"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "kind": {
+              "$ref": "#/$defs/kind"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/hash"
+            },
+            "size": {
+              "$ref": "#/$defs/decimal"
+            }
+          },
+          "required": [
+            "sequence",
+            "entryId",
+            "operationId",
+            "type",
+            "revision",
+            "path",
+            "kind",
+            "contentHash",
+            "size"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sequence": {
+              "$ref": "#/$defs/decimal"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/nullableUuid"
+            },
+            "type": {
+              "const": "moved"
+            },
+            "revision": {
+              "$ref": "#/$defs/uuid"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "kind": {
+              "$ref": "#/$defs/kind"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/hash"
+            },
+            "size": {
+              "$ref": "#/$defs/decimal"
+            }
+          },
+          "required": [
+            "sequence",
+            "entryId",
+            "operationId",
+            "type",
+            "revision",
+            "path",
+            "kind",
+            "contentHash",
+            "size"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sequence": {
+              "$ref": "#/$defs/decimal"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/nullableUuid"
+            },
+            "type": {
+              "const": "deleted"
+            },
+            "revision": {
+              "$ref": "#/$defs/uuid"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "kind": {
+              "$ref": "#/$defs/kind"
+            },
+            "contentHash": {
+              "type": "null"
+            },
+            "size": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "sequence",
+            "entryId",
+            "operationId",
+            "type",
+            "revision",
+            "path",
+            "kind",
+            "contentHash",
+            "size"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sequence": {
+              "$ref": "#/$defs/decimal"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/nullableUuid"
+            },
+            "type": {
+              "const": "restored"
+            },
+            "revision": {
+              "$ref": "#/$defs/uuid"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "kind": {
+              "$ref": "#/$defs/kind"
+            },
+            "contentHash": {
+              "$ref": "#/$defs/hash"
+            },
+            "size": {
+              "$ref": "#/$defs/decimal"
+            }
+          },
+          "required": [
+            "sequence",
+            "entryId",
+            "operationId",
+            "type",
+            "revision",
+            "path",
+            "kind",
+            "contentHash",
+            "size"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sequence": {
+              "$ref": "#/$defs/decimal"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/nullableUuid"
+            },
+            "type": {
+              "const": "conflict_created"
+            },
+            "conflictId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "headRevision": {
+              "$ref": "#/$defs/nullableUuid"
+            }
+          },
+          "required": [
+            "sequence",
+            "entryId",
+            "operationId",
+            "type",
+            "conflictId",
+            "headRevision"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "sequence": {
+              "$ref": "#/$defs/decimal"
+            },
+            "entryId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "operationId": {
+              "$ref": "#/$defs/nullableUuid"
+            },
+            "type": {
+              "const": "conflict_resolved"
+            },
+            "conflictId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "headRevision": {
+              "$ref": "#/$defs/nullableUuid"
+            },
+            "action": {
+              "enum": [
+                "write",
+                "delete",
+                "keep_head"
+              ]
+            }
+          },
+          "required": [
+            "sequence",
+            "entryId",
+            "operationId",
+            "type",
+            "conflictId",
+            "headRevision",
+            "action"
+          ]
+        }
+      ]
+    },
+    "changesPage": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/event"
+          },
+          "maxItems": 500
+        },
+        "nextCursor": {
+          "$ref": "#/$defs/cursor"
+        },
+        "highWater": {
+          "$ref": "#/$defs/decimal"
+        },
+        "hasMore": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "events",
+        "nextCursor",
+        "highWater",
+        "hasMore"
+      ]
+    },
+    "ackRequest": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/cursor"
+        }
+      },
+      "required": [
+        "cursor"
+      ],
+      "additionalProperties": false
+    },
+    "snapshotPending": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "const": "pending"
+        },
+        "statusUrl": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "statusUrl"
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "properties": {
+        "protocolVersion": {
+          "const": "1"
+        },
+        "maxMarkdownBytes": {
+          "$ref": "#/$defs/decimal"
+        },
+        "maxAttachmentBytes": {
+          "$ref": "#/$defs/decimal"
+        },
+        "historyRetentionSeconds": {
+          "$ref": "#/$defs/decimal"
+        },
+        "snapshotTtlSeconds": {
+          "$ref": "#/$defs/decimal"
+        },
+        "maxPageSize": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "headingSlugVersion": {
+          "const": "1"
+        },
+        "externalWriterLockRequired": {
+          "const": false
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "maxMarkdownBytes",
+        "maxAttachmentBytes",
+        "historyRetentionSeconds",
+        "snapshotTtlSeconds",
+        "maxPageSize",
+        "headingSlugVersion",
+        "externalWriterLockRequired"
+      ]
+    },
+    "vault": {
+      "type": "object",
+      "properties": {
+        "vaultId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "name": {
+          "type": "string"
+        },
+        "epoch": {
+          "$ref": "#/$defs/uuid"
+        }
+      },
+      "required": [
+        "vaultId",
+        "name",
+        "epoch"
+      ]
+    },
+    "vaultPage": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/vault"
+          },
+          "maxItems": 500
+        },
+        "nextPage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "items",
+        "nextPage"
+      ]
+    },
+    "health": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "ready",
+            "degraded",
+            "unavailable"
+          ]
+        },
+        "recovery": {
+          "type": "string"
+        },
+        "indexing": {
+          "type": "string"
+        },
+        "lockErrors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "status",
+        "recovery",
+        "indexing",
+        "lockErrors"
+      ]
+    },
+    "searchHit": {
+      "type": "object",
+      "properties": {
+        "entryId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "revision": {
+          "$ref": "#/$defs/uuid"
+        },
+        "title": {
+          "type": "string"
+        },
+        "snippet": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entryId",
+        "path",
+        "revision",
+        "title",
+        "snippet"
+      ]
+    },
+    "searchPage": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/searchHit"
+          },
+          "maxItems": 500
+        },
+        "nextPage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "indexWatermark": {
+          "$ref": "#/$defs/decimal"
+        }
+      },
+      "required": [
+        "items",
+        "nextPage",
+        "indexWatermark"
+      ]
+    },
+    "backlink": {
+      "type": "object",
+      "properties": {
+        "sourceEntryId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "sourcePath": {
+          "$ref": "#/$defs/path"
+        },
+        "kind": {
+          "enum": [
+            "markdown",
+            "wiki",
+            "embed"
+          ]
+        },
+        "rawTarget": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sourceEntryId",
+        "sourcePath",
+        "kind",
+        "rawTarget"
+      ]
+    },
+    "backlinkPage": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/backlink"
+          },
+          "maxItems": 500
+        },
+        "nextPage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "indexWatermark": {
+          "$ref": "#/$defs/decimal"
+        }
+      },
+      "required": [
+        "items",
+        "nextPage",
+        "indexWatermark"
+      ]
+    }
+  }
+}
