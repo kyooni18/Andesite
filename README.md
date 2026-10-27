@@ -45,3 +45,8 @@ is not yet an operational sync database: pending journals, conflicts,
 tombstones, snapshots, leases and indexes are missing, as are catalog APIs and
 process locking. The migration must not be run against production data without
 exclusive ownership and a backup.
+
+An experimental process-lock primitive uses an OS advisory lock on a no-follow
+lock file in a trusted private state directory. It is not yet connected to
+server startup and cannot detect the same vault configured under another state
+directory. It never locks files against ordinary external editors.
