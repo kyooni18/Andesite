@@ -50,3 +50,8 @@ An experimental process-lock primitive uses an OS advisory lock on a no-follow
 lock file in a trusted private state directory. It is not yet connected to
 server startup and cannot detect the same vault configured under another state
 directory. It never locks files against ordinary external editors.
+
+A limited swift-markdown AST extractor validates UTF-8 and returns headings
+and ordinary link destinations without altering the input. It is not the v1
+Markdown indexer: frontmatter, wiki syntax, tags, slugging, link resolution,
+FTS integration and GFM conformance fixtures remain to be implemented.
