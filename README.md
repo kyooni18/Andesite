@@ -68,8 +68,9 @@ the object store, and catalog revisions/change events in a SQLite transaction.
 It preserves earlier captured objects across updates and does not write vault
 files. A failed database transaction leaves the catalog unchanged and may leave
 an unreferenced object. This is **not reconciliation**: it has no watcher,
-scan, deletion inference, rename handling, quarantine/incidents, or automatic
+scan, deletion inference, rename handling, complete quarantine, or automatic
 retry. It only accepts ASCII paths pending the specified portable Unicode key;
-callers must hold the process lock and serialize vault access. Invalid UTF-8 is
-rejected rather than published, but is not yet durably recorded as an incident.
+callers must hold the process lock and serialize vault access. Invalid UTF-8 is retained as an incident object and hides the affected entry
+from the experimental search index until a valid observation resolves it;
+entry reads and snapshot quarantine enforcement are not yet implemented.
 No server route or background service uses this experimental primitive.

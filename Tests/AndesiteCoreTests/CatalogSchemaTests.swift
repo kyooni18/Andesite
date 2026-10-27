@@ -9,7 +9,7 @@ import Testing
     let db = try SQLiteConnection(path: dir.appendingPathComponent("catalog.sqlite").path)
     try CatalogSchema.migrate(db)
     try CatalogSchema.migrate(db)
-    #expect(try db.scalarText("PRAGMA user_version") == "3")
+    #expect(try db.scalarText("PRAGMA user_version") == "4")
     try db.execute("INSERT INTO vaults(id,root_config,epoch,created_at,state) VALUES(zeroblob(16),'root',zeroblob(16),'now','active')")
     #expect(throws: SQLiteFailure.self) {
         try db.execute("INSERT INTO vaults(id,root_config,epoch,created_at,state) VALUES(zeroblob(15),'root',zeroblob(16),'now','active')")

@@ -41,7 +41,17 @@ import Testing
     try db.execute("DROP TRIGGER fail_revision")
     let recovered = try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: vaultID, path: path, maximumBytes: 1024, debounce: 0)
     #expect(recovered.sequence == 3 && recovered.entryID == first.entryID)
+    try SearchIndex.index(db: db, vaultID: vaultID, entryID: recovered.entryID, revisionID: recovered.revisionID, bytes: failedBytes)
+    #expect(try SearchIndex.search(db: db, vaultID: vaultID, phrase: "transaction", limit: 10).count == 1)
     try Data([0xff]).write(to: file)
     #expect(throws: ExternalCaptureError.invalidMarkdown) { try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: vaultID, path: path, maximumBytes: 1024, debounce: 0) }
     #expect(try db.queryValues("SELECT count(*) FROM changes") == [[.integer(3)]])
+    #expect(try db.queryValues("SELECT status FROM incidents") == [[.text("open")]])
+    #expect(try SearchIndex.search(db: db, vaultID: vaultID, phrase: "transaction", limit: 10).isEmpty)
+    #expect(try store.get(ObjectStore.hash(Data([0xff])), maximumBytes: 1024) == Data([0xff]))
+    try failedBytes.write(to: file)
+    let corrected = try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: vaultID, path: path, maximumBytes: 1024, debounce: 0)
+    #expect(corrected.sequence == nil && corrected.revisionID == recovered.revisionID)
+    #expect(try db.queryValues("SELECT status FROM incidents") == [[.text("resolved")]])
+    #expect(try SearchIndex.search(db: db, vaultID: vaultID, phrase: "transaction", limit: 10).count == 1)
 }
