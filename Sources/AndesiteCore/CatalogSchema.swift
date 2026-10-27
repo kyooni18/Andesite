@@ -9,7 +9,7 @@ public enum CatalogMigrationError: Error, Equatable {
 /// safe to use as a sync service until journal/recovery and the remaining tables
 /// are implemented. Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 1
+    public static let currentVersion = 2
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -21,8 +21,23 @@ public enum CatalogSchema {
                 for statement in versionOne { try db.execute(statement) }
                 try db.execute("PRAGMA user_version=1")
             }
+            if version < 2 {
+                for statement in versionTwo { try db.execute(statement) }
+                try db.execute("PRAGMA user_version=2")
+            }
         }
     }
+
+    private static let versionTwo = [
+        """
+        CREATE TABLE document_metadata (
+          vault_id BLOB NOT NULL, entry_id BLOB NOT NULL,
+          indexed_revision BLOB NOT NULL CHECK(length(indexed_revision)=16), title TEXT NOT NULL,
+          PRIMARY KEY(vault_id,entry_id), FOREIGN KEY(vault_id,entry_id) REFERENCES entries(vault_id,id)
+        ) WITHOUT ROWID
+        """,
+        "CREATE VIRTUAL TABLE document_fts USING fts5(vault_id UNINDEXED,entry_id UNINDEXED,title,body,tokenize='unicode61')"
+    ]
 
     private static let versionOne = [
         """

@@ -54,4 +54,11 @@ directory. It never locks files against ordinary external editors.
 A limited swift-markdown AST extractor validates UTF-8 and returns headings
 and ordinary link destinations without altering the input. It is not the v1
 Markdown indexer: frontmatter, wiki syntax, tags, slugging, link resolution,
-FTS integration and GFM conformance fixtures remain to be implemented.
+GFM conformance fixtures and full v1 indexing remain to be implemented.
+
+A preliminary SQLite FTS index can index supplied revision bytes and search a
+bounded literal phrase within a vault. It atomically checks the current head
+before committing and hides stale results. It currently indexes raw Markdown,
+not fully extracted document text; the caller must supply bytes from the correct
+verified immutable revision. It is not wired to ingestion or an API and lacks
+index generations, backlinks, pagination, snippets and index watermarks.
