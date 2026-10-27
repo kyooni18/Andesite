@@ -25,3 +25,15 @@ local Swift 6.4 toolchain, and in the `swift:6.2` Linux arm64 container with
 minimum deployment target warning; compatibility with older macOS releases has
 not been verified. Linux filesystem guarantees and server behavior are not
 verified by the SQLite test.
+
+Additional experimental primitives include descriptor-relative, no-follow,
+bounded two-observation vault reads and a SHA-256 object store. Reads reject
+hard-linked files, mount crossings and unsafe path components; an observed
+change between reads is rejected. These checks do not provide an atomic view
+or capture edits that were never observed. The object store verifies hashes,
+never replaces existing objects and syncs new contents and the directory, but
+currently requires a trusted pre-existing private directory, buffers objects in
+memory, and does not handle orphan cleanup, quotas or a database journal. No
+code connects these primitives to a catalog or writes to vaults. They are not a
+recovery implementation, and no power-loss or filesystem qualification tests
+have been performed.
