@@ -237,6 +237,9 @@ final class MutationJournal {
         if !pending.isEmpty { try requireDurableStorage() }
         for record in pending {
             if record.operation.state == "quarantined" { continue }
+            // A cancelled, never-staged intent owns no filesystem evidence;
+            // later ordinary parent deletion/moves must not re-block the vault.
+            if record.operation.state == "cancelled", record.stage == nil { continue }
             do {
                 let fs = try filesystem(path: record.operation.path, expected: record.directories)
                 switch record.operation.state {
