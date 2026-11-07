@@ -9,7 +9,7 @@ public enum CatalogMigrationError: Error, Equatable {
 /// safe to use as a sync service until journal/recovery and the remaining tables
 /// are implemented. Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 4
+    public static let currentVersion = 5
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -42,8 +42,37 @@ public enum CatalogSchema {
                 try db.execute("CREATE INDEX incidents_open_path ON incidents(vault_id,path_key) WHERE status='open'")
                 try db.execute("PRAGMA user_version=4")
             }
+            if version < 5 {
+                for statement in versionFive { try db.execute(statement) }
+                try db.execute("PRAGMA user_version=5")
+            }
         }
     }
+
+    private static let versionFive = [
+        """
+        CREATE TABLE snapshot_policy (
+          vault_id BLOB PRIMARY KEY NOT NULL REFERENCES vaults(id),
+          minimum_interval REAL NOT NULL CHECK(minimum_interval>=0),
+          retention_seconds REAL NOT NULL CHECK(retention_seconds>0)
+        ) WITHOUT ROWID
+        """,
+        """
+        CREATE TABLE recovery_snapshots (
+          vault_id BLOB NOT NULL, id BLOB NOT NULL CHECK(length(id)=16), entry_id BLOB NOT NULL,
+          revision_id BLOB NOT NULL, content_hash BLOB NOT NULL REFERENCES objects(hash),
+          byte_length INTEGER NOT NULL CHECK(byte_length>=0), path TEXT NOT NULL,
+          ordinal INTEGER NOT NULL CHECK(ordinal>0),
+          created_at REAL NOT NULL, expires_at REAL NOT NULL CHECK(expires_at>created_at),
+          reason TEXT NOT NULL CHECK(reason IN ('interval','rename','deletion','shutdown','recovery')),
+          PRIMARY KEY(vault_id,id), UNIQUE(vault_id,entry_id,revision_id), UNIQUE(vault_id,entry_id,ordinal),
+          FOREIGN KEY(vault_id,entry_id) REFERENCES entries(vault_id,id),
+          FOREIGN KEY(vault_id,revision_id) REFERENCES revisions(vault_id,revision_id)
+        ) WITHOUT ROWID
+        """,
+        "CREATE INDEX recovery_snapshots_document ON recovery_snapshots(vault_id,entry_id,created_at)",
+        "CREATE INDEX recovery_snapshots_expiry ON recovery_snapshots(vault_id,expires_at)"
+    ]
 
     private static let versionTwo = [
         """

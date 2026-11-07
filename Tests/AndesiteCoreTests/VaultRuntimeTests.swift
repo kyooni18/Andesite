@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import AndesiteCore
 
-private struct RuntimeFixture {
+struct RuntimeFixture {
     let root: URL
     let vault: URL
     let state: URL
@@ -40,7 +40,7 @@ private struct RuntimeFixture {
     let second = try #require(runtime.search("newword").first)
     #expect(first.entryID == second.entryID && first.revisionID != second.revisionID)
     #expect(try runtime.status().revisions == 3)
-    runtime.shutdown()
+    try runtime.shutdown()
     let reopened = try VaultRuntime(configuration: f.configuration)
     #expect(reopened.vaultID == id)
     #expect(try reopened.search("newword").first == second)
@@ -48,7 +48,7 @@ private struct RuntimeFixture {
     let store = try ObjectStore(directory: f.state.appendingPathComponent("objects").path)
     #expect(try store.get(ObjectStore.hash(Data(original.utf8)), maximumBytes: 1024) == Data(original.utf8))
     #expect(try String(contentsOf: f.vault.appendingPathComponent("노트.md"), encoding: .utf8) == "# Second\nnewword")
-    reopened.shutdown()
+    try reopened.shutdown()
     #expect(throws: VaultRuntimeError.closed) { try reopened.reconcile() }
 }
 
@@ -70,7 +70,7 @@ private struct RuntimeFixture {
     #expect(try orphanStore.get(orphanHash, maximumBytes: 1024) == Data("# Updated\nchanged".utf8))
     #expect(try db.queryValues("SELECT count(*) FROM objects WHERE lower(hex(hash))=?", bindings: [.text(orphanHash)]) == [[.integer(0)]])
     try db.execute("DROP TRIGGER injected")
-    runtime.shutdown()
+    try runtime.shutdown()
     let retry = try VaultRuntime(configuration: f.configuration)
     #expect(try retry.reconcile().revisionsCreated == 1)
     #expect(try retry.status().revisions == 2)
@@ -80,14 +80,14 @@ private struct RuntimeFixture {
     #expect(try retry.search("changed").isEmpty)
     #expect(try retry.status().openIncidents == 1)
     #expect(try retry.status().revisions == 2)
-    retry.shutdown()
+    try retry.shutdown()
     let quarantineRestart = try VaultRuntime(configuration: f.configuration)
     #expect(try quarantineRestart.search("changed").isEmpty)
     #expect(try quarantineRestart.status().openIncidents == 1)
     try f.write("a.md", "# Updated\nchanged")
     #expect(try quarantineRestart.search("changed").count == 1)
     #expect(try quarantineRestart.status().openIncidents == 0)
-    quarantineRestart.shutdown()
+    try quarantineRestart.shutdown()
     let hash = ObjectStore.hash(Data("# Initial\nhello".utf8))
     let object = f.state.appendingPathComponent("objects/" + hash)
     let currentBytes = try Data(contentsOf: f.vault.appendingPathComponent("a.md"))
@@ -99,14 +99,20 @@ private struct RuntimeFixture {
     #expect(try Data(contentsOf: f.vault.appendingPathComponent("a.md")) == currentBytes)
 }
 
-@Test func integratedUnsafeNamespaceAndUnsupportedRemoval() throws {
+@Test func integratedUnsafeNamespaceAndConservativeMoves() throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("a.md", "# Kept\nhistory")
     let runtime = try VaultRuntime(configuration: f.configuration)
     _ = try runtime.reconcile()
     try FileManager.default.moveItem(at: f.vault.appendingPathComponent("a.md"), to: f.vault.appendingPathComponent("moved.md"))
-    #expect(throws: VaultRuntimeError.unsupportedRemovalOrRename("a.md")) { try runtime.reconcile() }
-    #expect(try runtime.status().revisions == 1)
+    let move = try runtime.reconcile()
+    #if canImport(Darwin)
+    #expect(move.renamed == 1 && move.deleted == 0)
+    #expect(try runtime.status().revisions == 2)
+    #else
+    #expect(move.deleted == 1)
+    #expect(try runtime.status().revisions == 3)
+    #endif
     try FileManager.default.moveItem(at: f.vault.appendingPathComponent("moved.md"), to: f.vault.appendingPathComponent("a.md"))
     try FileManager.default.createSymbolicLink(atPath: f.vault.appendingPathComponent("link.md").path, withDestinationPath: f.vault.appendingPathComponent("a.md").path)
     #expect(throws: VaultReadError.unsafeFile) { try runtime.search("history") }
@@ -126,7 +132,7 @@ private struct RuntimeFixture {
     try FileManager.default.moveItem(at: f.vault, to: displaced)
     try FileManager.default.createDirectory(at: f.vault, withIntermediateDirectories: false)
     #expect(throws: VaultReadError.unstable) { try runtime.search("history") }
-    runtime.shutdown()
+    try runtime.shutdown()
     #expect(throws: VaultRuntimeError.identityMismatch) { try VaultRuntime(configuration: f.configuration) }
     let unsafe = VaultConfiguration(vaultDirectory: f.vault.path, stateDirectory: f.vault.path)
     #expect(throws: (any Error).self) { try VaultRuntime(configuration: unsafe) }
@@ -150,7 +156,7 @@ private struct RuntimeFixture {
     #expect(try SearchIndex.search(db: db, vaultID: runtime.vaultID, phrase: "oldtoken", limit: 10).isEmpty)
     #expect(try SearchIndex.search(db: db, vaultID: Data(repeating: 0x55, count: 16), phrase: "lasttoken", limit: 10).isEmpty)
     #expect(throws: SQLiteFailure.self) { try runtime.search("lasttoken") }
-    runtime.shutdown()
+    try runtime.shutdown()
     let restarted = try VaultRuntime(configuration: f.configuration)
     #expect(try restarted.status().state == "scanRequired")
     #expect(throws: SQLiteFailure.self) { try restarted.search("oldtoken") }
@@ -169,15 +175,15 @@ private struct RuntimeFixture {
     #expect(try db.queryValues("SELECT count(*) FROM entries WHERE state='live'") == [[.integer(3)]])
     #expect(try db.queryValues("SELECT count(*) FROM changes") == [[.integer(4)]])
     #expect(try db.queryValues("SELECT count(*) FROM revisions WHERE deleted=1") == [[.integer(0)]])
-    restarted.shutdown()
+    try restarted.shutdown()
     // An unknown newer schema is never migrated backwards, even after a failed scan.
     try db.execute("PRAGMA user_version=999")
     #expect(throws: CatalogMigrationError.unsupportedVersion(999)) { try VaultRuntime(configuration: f.configuration) }
     #expect(try db.scalarText("PRAGMA user_version") == "999")
     #expect(try Data(contentsOf: f.vault.appendingPathComponent("a.md")) == Data("# After\nnewtoken".utf8))
     #expect(try Data(contentsOf: f.vault.appendingPathComponent("b.md")) == Data("# Discovered\nnewfiletoken".utf8))
-    try db.execute("PRAGMA user_version=4")
+    try db.execute("PRAGMA user_version=5")
     // A failed startup did not retain ownership.
     let finalOpen = try VaultRuntime(configuration: f.configuration)
-    finalOpen.shutdown()
+    try finalOpen.shutdown()
 }

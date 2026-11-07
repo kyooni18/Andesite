@@ -45,17 +45,33 @@ public struct FileFingerprint: Equatable, Sendable, Codable {
     public let modificationNanos: Int64
     public let changeSeconds: Int64
     public let changeNanos: Int64
+    // Optional for compatibility with v3/v4 hints. Device/inode alone is not
+    // sufficient for cross-path identity: inodes can be reused.
+    public let birthSeconds: Int64?
+    public let birthNanos: Int64?
 
     init(_ s: stat) {
         device = UInt64(s.st_dev); inode = UInt64(s.st_ino); size = Int64(s.st_size)
         #if canImport(Darwin)
         modificationSeconds = Int64(s.st_mtimespec.tv_sec); modificationNanos = Int64(s.st_mtimespec.tv_nsec)
         changeSeconds = Int64(s.st_ctimespec.tv_sec); changeNanos = Int64(s.st_ctimespec.tv_nsec)
+        birthSeconds = Int64(s.st_birthtimespec.tv_sec); birthNanos = Int64(s.st_birthtimespec.tv_nsec)
         #else
         modificationSeconds = Int64(s.st_mtim.tv_sec); modificationNanos = Int64(s.st_mtim.tv_nsec)
         changeSeconds = Int64(s.st_ctim.tv_sec); changeNanos = Int64(s.st_ctim.tv_nsec)
+        birthSeconds = nil; birthNanos = nil
         #endif
     }
+
+    var renameIdentity: String? {
+        guard let birthSeconds, let birthNanos, birthSeconds != 0 || birthNanos != 0 else { return nil }
+        return "\(device):\(inode):\(birthSeconds):\(birthNanos)"
+    }
+}
+
+public struct ScannedMarkdownFile: Sendable {
+    public let path: VaultPath
+    public let fingerprint: FileFingerprint
 }
 
 public struct ObservedFile: Sendable {
@@ -94,8 +110,12 @@ public final class VaultReader {
 
     /// A failed enumeration never returns a partial listing.
     public func markdownPaths() throws -> [VaultPath] {
+        try markdownFiles().map(\.path)
+    }
+
+    public func markdownFiles() throws -> [ScannedMarkdownFile] {
         try verifyRoot()
-        var paths: [VaultPath] = []
+        var paths: [ScannedMarkdownFile] = []
         var namespace = Set<String>()
         func visit(_ fd: Int32, _ prefix: String) throws {
             let copy = dup(fd)
@@ -128,7 +148,7 @@ public final class VaultReader {
                     try visit(child, prefix + name + "/")
                 case mode_t(S_IFREG):
                     guard info.st_nlink == 1 else { throw VaultReadError.unsafeFile }
-                    if name.lowercased().hasSuffix(".md") { paths.append(path) }
+                    if name.lowercased().hasSuffix(".md") { paths.append(ScannedMarkdownFile(path: path, fingerprint: FileFingerprint(info))) }
                 default: throw VaultReadError.unsafeFile
                 }
             }
@@ -138,7 +158,30 @@ public final class VaultReader {
         defer { close(fd) }
         try visit(fd, "")
         try verifyRoot()
-        return paths.sorted { $0.components.joined(separator: "/") < $1.components.joined(separator: "/") }
+        return paths.sorted { $0.path.components.joined(separator: "/").utf8.lexicographicallyPrecedes($1.path.components.joined(separator: "/").utf8) }
+    }
+
+    /// Only ENOENT confirms absence. A complete scan must precede this check.
+    public func confirmAbsent(_ path: VaultPath) throws -> Bool {
+        try verifyRoot()
+        var directory = dup(root)
+        guard directory >= 0 else { throw VaultReadError.systemCall("dup root", errno) }
+        defer { close(directory) }
+        for component in path.components.dropLast() {
+            let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            if next < 0 {
+                if errno == ENOENT { return true }
+                throw VaultReadError.systemCall("check absent parent", errno)
+            }
+            var info = stat()
+            guard fstat(next, &info) == 0, UInt64(info.st_dev) == rootDevice else { close(next); throw VaultReadError.unsafeFile }
+            close(directory); directory = next
+        }
+        var info = stat()
+        if fstatat(directory, path.components.last!, &info, AT_SYMLINK_NOFOLLOW) == 0 { return false }
+        guard errno == ENOENT else { throw VaultReadError.systemCall("check absence", errno) }
+        try verifyRoot()
+        return true
     }
 
     /// Requires two matching byte and metadata observations separated by the

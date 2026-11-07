@@ -10,7 +10,6 @@ public enum VaultRuntimeError: Error, Equatable {
     case unsafeState
     case identityMismatch
     case inconsistentCatalog
-    case unsupportedRemovalOrRename(String)
     case portabilityCollision(String)
     case closed
 }
@@ -31,6 +30,9 @@ public struct ReconciliationReport: Sendable {
     public var revisionsCreated = 0
     public var unchanged = 0
     public var invalidMarkdown = 0
+    public var deleted = 0
+    public var renamed = 0
+    public var snapshotsCreated = 0
 }
 
 public struct VaultStatus: Sendable {
@@ -102,18 +104,29 @@ public final class VaultRuntime {
         self.resources = Resources(db: db, reader: reader, objects: objects)
         try setState("scanRequired")
         try verifyObjects()
+        if try db.queryValues("SELECT 1 FROM snapshot_policy WHERE vault_id=?", bindings: [.blob(id)]).isEmpty {
+            try RecoverySnapshots.configure(db: db, vaultID: id, policy: SnapshotPolicy())
+        }
+        _ = try RecoverySnapshots.policy(db: db, vaultID: id)
+        // Recover capture -> snapshot-registration interruptions before a new
+        // observation can advance the head. This never reads current vault bytes.
+        _ = try flushSnapshotHeads(at: Date(), reason: "recovery")
         let directory = open(state, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard directory >= 0 else { throw VaultRuntimeError.unsafeState }
         defer { close(directory) }
         guard fsync(directory) == 0 else { throw VaultRuntimeError.unsafeState }
     }
 
-    public func shutdown() {
-        resources = nil
-        processLock = nil
+    /// Flush observed pending heads, not a last-second filesystem scan. Failures
+    /// are reported, but resources/ownership are always released. Abrupt exits
+    /// leave durable revisions from which scheduling resumes on reconciliation.
+    public func shutdown(at date: Date = Date()) throws {
+        guard resources != nil else { return }
+        defer { resources = nil; processLock = nil }
+        _ = try flushSnapshots(at: date)
     }
 
-    deinit { shutdown() }
+    deinit { resources = nil; processLock = nil }
 
     public func status() throws -> VaultStatus {
         guard let r = resources else { throw VaultRuntimeError.closed }
@@ -131,38 +144,83 @@ public final class VaultRuntime {
         return try SearchIndex.search(db: r.db, vaultID: vaultID, phrase: phrase, limit: limit)
     }
 
-    public func reconcile() throws -> ReconciliationReport {
+    public func reconcile(at date: Date = Date()) throws -> ReconciliationReport {
         guard let r = resources else { throw VaultRuntimeError.closed }
+        try RecoverySnapshots.validateTime(date)
         try setState("scanning")
         do {
             try verifyObjects()
-            let paths = try r.reader.markdownPaths()
-            var keys: [String: String] = [:]
-            for path in paths {
-                let spelling = path.components.joined(separator: "/")
-                guard keys.updateValue(spelling, forKey: path.portabilityKey) == nil else { throw VaultRuntimeError.portabilityCollision(spelling) }
-            }
-            for row in try r.db.queryValues("SELECT path,path_key FROM entries WHERE state='live'") {
-                guard case .text(let name) = row[0], case .text(let key) = row[1] else { throw VaultRuntimeError.inconsistentCatalog }
-                guard let observed = keys[key] else { throw VaultRuntimeError.unsupportedRemovalOrRename(name) }
-                // Compare UTF-8 rather than Swift's canonically equivalent String equality.
-                guard Array(observed.utf8) == Array(name.utf8) else { throw VaultRuntimeError.portabilityCollision(name) }
-            }
+            let scan = try r.reader.markdownFiles()
+            let plan = try NamespacePlan(db: r.db, vaultID: vaultID, scan: scan)
             var report = ReconciliationReport()
-            report.discovered = paths.count
-            for path in paths {
-                do {
-                    let captured = try ExternalCapture.capture(db: r.db, reader: r.reader, objects: r.objects, vaultID: vaultID, path: path, maximumBytes: configuration.maximumBytes, debounce: configuration.debounce)
-                    // Index only verified immutable bytes, never a second mutable-file read.
-                    let bytes = try r.objects.get(captured.contentHash, maximumBytes: configuration.maximumBytes)
-                    try SearchIndex.index(db: r.db, vaultID: vaultID, entryID: captured.entryID, revisionID: captured.revisionID, bytes: bytes)
-                    if captured.sequence == nil { report.unchanged += 1 } else { report.revisionsCreated += 1 }
-                } catch ExternalCaptureError.invalidMarkdown { report.invalidMarkdown += 1 }
+            report.discovered = scan.count
+            var deferred: [(Int, ExternalCapture.Prepared)] = []
+            var quarantinedMove = false
+            func index(_ captured: ExternalCaptureResult) throws {
+                let bytes = try r.objects.get(captured.contentHash, maximumBytes: configuration.maximumBytes)
+                try SearchIndex.index(db: r.db, vaultID: vaultID, entryID: captured.entryID, revisionID: captured.revisionID, bytes: bytes)
+                if captured.sequence == nil { report.unchanged += 1 } else { report.revisionsCreated += 1 }
             }
-            // Catch namespace changes during ingestion. No deletion inference, ever.
-            let after = try r.reader.markdownPaths()
-            guard after.map({ Array($0.components.joined(separator: "/").utf8) }) == paths.map({ Array($0.components.joined(separator: "/").utf8) }) else { throw VaultReadError.unstable }
-            try setState(report.invalidMarkdown == 0 ? "ready" : "quarantined")
+            for (indexInScan, file) in scan.enumerated() {
+                let observation = try r.reader.observeStable(file.path, maximumBytes: configuration.maximumBytes, debounce: configuration.debounce)
+                guard observation.fingerprint == file.fingerprint else { throw VaultReadError.unstable }
+                let prepared = try ExternalCapture.prepare(path: file.path, observation: observation, objects: r.objects)
+                if plan.needsNamespaceCommit(index: indexInScan, file: file) {
+                    if !prepared.valid {
+                        let id = plan.assignment[indexInScan].map { plan.old[$0].id }
+                        try r.db.transaction { try ExternalCapture.incident(db: r.db, vaultID: vaultID, prepared: prepared, entryID: id, at: date) }
+                        report.invalidMarkdown += 1
+                        quarantinedMove = true
+                    } else { deferred.append((indexInScan, prepared)) }
+                    continue
+                }
+                let captured = try r.db.transaction { try ExternalCapture.publish(db: r.db, vaultID: vaultID, prepared: prepared, at: date) }
+                if let captured {
+                    if try r.db.transaction({ try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: captured.entryID, at: date) }) { report.snapshotsCreated += 1 }
+                    try index(captured)
+                } else { report.invalidMarkdown += 1 }
+            }
+            // Only a fully enumerated, unchanged namespace and a later secure
+            // absence check may authorize tombstones. A failure above or here
+            // leaves earlier captures intact but publishes no disappearances.
+            try NamespacePlan.validateUnchanged(scan, r.reader.markdownFiles())
+            if quarantinedMove {
+                try setState("quarantined")
+                return report
+            }
+            for prior in plan.deleted {
+                guard try r.reader.confirmAbsent(plan.old[prior].path) else { throw VaultReadError.unstable }
+            }
+            let results: [ExternalCaptureResult] = try r.db.transaction {
+                for prior in plan.moved.union(plan.deleted).sorted() {
+                    let reason = plan.deleted.contains(prior) ? "deletion" : "rename"
+                    if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: plan.old[prior].id, at: date, reason: reason, force: true) { report.snapshotsCreated += 1 }
+                }
+                for prior in plan.deleted.sorted() {
+                    try ExternalCapture.tombstone(db: r.db, vaultID: vaultID, entryID: plan.old[prior].id, at: date)
+                    report.deleted += 1; report.revisionsCreated += 1
+                }
+                // Release all old names together so swaps and reuse cannot violate
+                // uniqueness or expose partially moved catalog identities.
+                for prior in plan.moved.sorted() {
+                    try r.db.executeValues("UPDATE entries SET state='reserved',path=NULL,path_key=NULL WHERE vault_id=? AND id=?", bindings: [.blob(vaultID), .blob(plan.old[prior].id)])
+                }
+                var results: [ExternalCaptureResult] = []
+                for (indexInScan, prepared) in deferred {
+                    let id = plan.assignment[indexInScan].map { plan.old[$0].id }
+                    guard let captured = try ExternalCapture.publish(db: r.db, vaultID: vaultID, prepared: prepared, entryID: id, at: date) else { throw VaultRuntimeError.inconsistentCatalog }
+                    let moved = id != nil
+                    if moved { report.renamed += 1 }
+                    if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: captured.entryID, at: date, reason: moved ? "rename" : "interval", force: moved) { report.snapshotsCreated += 1 }
+                    results.append(captured)
+                }
+                return results
+            }
+            for captured in results { try index(captured) }
+            // Deleted/quarantined incident bytes are retained; an unresolved
+            // incident remains visible even when its original path disappears.
+            let incidents = try status().openIncidents
+            try setState(incidents == 0 ? "ready" : "quarantined")
             return report
         } catch {
             try? setState("scanFailed")
@@ -178,11 +236,108 @@ public final class VaultRuntime {
     private func verifyObjects() throws {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try r.db.queryValues("SELECT 1 FROM revisions r LEFT JOIN objects o ON o.hash=r.content_hash WHERE r.deleted=0 AND (o.hash IS NULL OR o.length!=r.byte_length) LIMIT 1").isEmpty,
-              try r.db.queryValues("SELECT 1 FROM entries e LEFT JOIN revisions r ON r.vault_id=e.vault_id AND r.entry_id=e.id AND r.revision_id=e.head_revision WHERE e.state='live' AND (r.revision_id IS NULL OR r.deleted!=0) LIMIT 1").isEmpty else { throw VaultRuntimeError.inconsistentCatalog }
+              try r.db.queryValues("SELECT 1 FROM entries e LEFT JOIN revisions r ON r.vault_id=e.vault_id AND r.entry_id=e.id AND r.revision_id=e.head_revision WHERE e.state IN ('live','deleted') AND (r.revision_id IS NULL OR r.deleted!=(e.state='deleted')) LIMIT 1").isEmpty,
+              try r.db.queryValues("""
+                SELECT 1 FROM recovery_snapshots s
+                LEFT JOIN revisions r ON r.vault_id=s.vault_id AND r.revision_id=s.revision_id
+                LEFT JOIN objects o ON o.hash=s.content_hash
+                WHERE r.revision_id IS NULL OR r.entry_id!=s.entry_id OR r.deleted!=0
+                  OR r.content_hash!=s.content_hash OR r.byte_length!=s.byte_length OR r.path!=s.path
+                  OR o.hash IS NULL OR o.length!=s.byte_length LIMIT 1
+                """).isEmpty else { throw VaultRuntimeError.inconsistentCatalog }
         for row in try r.db.queryValues("SELECT lower(hex(hash)),length,durable_location FROM objects") {
             guard case .text(let hash) = row[0], case .integer(let length) = row[1], row[2] == .text(hash), length >= 0, length <= Int.max else { throw VaultRuntimeError.inconsistentCatalog }
             let bytes = try r.objects.get(hash, maximumBytes: Int(length))
             guard bytes.count == Int(length) else { throw VaultRuntimeError.inconsistentCatalog }
+        }
+    }
+
+    public func snapshotPolicy() throws -> SnapshotPolicy {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        return try RecoverySnapshots.policy(db: r.db, vaultID: vaultID)
+    }
+
+    /// Persists across restarts. Existing expiration deadlines are deliberately
+    /// unchanged; configuration changes affect newly created snapshots only.
+    public func configureSnapshots(_ policy: SnapshotPolicy) throws {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        try r.db.transaction { try RecoverySnapshots.configure(db: r.db, vaultID: vaultID, policy: policy) }
+    }
+
+    public func snapshots(entryID: Data? = nil, path: String? = nil) throws -> [RecoverySnapshot] {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        try verifyObjects()
+        return try RecoverySnapshots.list(db: r.db, vaultID: vaultID, entryID: entryID, path: path)
+    }
+
+    public func inspectSnapshot(_ id: Data) throws -> RecoverySnapshot {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        try verifyObjects()
+        guard let snapshot = try RecoverySnapshots.list(db: r.db, vaultID: vaultID, snapshotID: id).first else { throw SnapshotError.notFound }
+        let bytes = try r.objects.get(snapshot.contentHash, maximumBytes: snapshot.byteLength)
+        guard bytes.count == snapshot.byteLength else { throw SnapshotError.inconsistentMetadata }
+        return snapshot
+    }
+
+    public func snapshotContents(_ id: Data) throws -> Data {
+        let snapshot = try inspectSnapshot(id)
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        return try r.objects.get(snapshot.contentHash, maximumBytes: snapshot.byteLength)
+    }
+
+    public func compareSnapshots(_ beforeID: Data, _ afterID: Data) throws -> SnapshotComparison {
+        let before = try inspectSnapshot(beforeID), after = try inspectSnapshot(afterID)
+        // Bound CollectionDifference's work for adversarial input. Export larger
+        // snapshots for comparison using the user's preferred diff tool.
+        guard before.byteLength <= 256 * 1024, after.byteLength <= 256 * 1024 else { throw SnapshotError.comparisonTooLarge }
+        let a = try snapshotContents(beforeID), b = try snapshotContents(afterID)
+        guard let old = String(data: a, encoding: .utf8), let new = String(data: b, encoding: .utf8) else { throw SnapshotError.inconsistentMetadata }
+        let oldLines = old.components(separatedBy: "\n"), newLines = new.components(separatedBy: "\n")
+        guard oldLines.count <= 2000, newLines.count <= 2000 else { throw SnapshotError.comparisonTooLarge }
+        let changes = newLines.difference(from: oldLines).map { change -> String in
+            switch change {
+            case .remove(let offset, let line, _): return "-\(offset):\(line)"
+            case .insert(let offset, let line, _): return "+\(offset):\(line)"
+            }
+        }
+        return SnapshotComparison(before: before, after: after, changes: changes)
+    }
+
+    public func exportSnapshot(_ id: Data, to destination: String) throws {
+        let bytes = try snapshotContents(id)
+        try SnapshotExport.publish(bytes, to: destination, excluding: [configuration.vaultDirectory, configuration.stateDirectory])
+    }
+
+    /// Explicit fail-closed placeholder. In-place replacement requires the v1
+    /// mutation journal, preserved current preimage and restart conflict handling.
+    /// Export is available now; this method NEVER mutates the vault.
+    public func restoreSnapshot(_ id: Data) throws {
+        _ = try inspectSnapshot(id)
+        throw SnapshotError.restorationRequiresMutationJournal
+    }
+
+    public func snapshotStorage(at date: Date = Date()) throws -> SnapshotStorageUsage {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        try verifyObjects()
+        return try RecoverySnapshots.usage(db: r.db, vaultID: vaultID, at: date)
+    }
+
+    @discardableResult
+    public func flushSnapshots(at date: Date = Date()) throws -> Int {
+        try flushSnapshotHeads(at: date, reason: "shutdown")
+    }
+
+    private func flushSnapshotHeads(at date: Date, reason: String) throws -> Int {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        try verifyObjects()
+        try RecoverySnapshots.validateTime(date)
+        return try r.db.transaction {
+            var created = 0
+            for row in try r.db.queryValues("SELECT id FROM entries WHERE vault_id=? AND state='live' AND kind='markdown' ORDER BY id", bindings: [.blob(vaultID)]) {
+                guard case .blob(let id) = row[0] else { throw VaultRuntimeError.inconsistentCatalog }
+                if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: id, at: date, reason: reason, force: true) { created += 1 }
+            }
+            return created
         }
     }
 

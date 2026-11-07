@@ -45,7 +45,7 @@ public enum SearchIndex {
             JOIN entries e ON e.vault_id=m.vault_id AND e.id=m.entry_id
             WHERE document_fts MATCH ? AND f.vault_id=? AND m.vault_id=?
               AND e.state='live' AND e.head_revision=m.indexed_revision
-              AND NOT EXISTS (SELECT 1 FROM incidents i WHERE i.vault_id=e.vault_id AND i.path_key=e.path_key AND i.status='open')
+              AND NOT EXISTS (SELECT 1 FROM incidents i WHERE i.vault_id=e.vault_id AND (i.path_key=e.path_key OR i.entry_id=e.id) AND i.status='open')
             ORDER BY rank, m.entry_id LIMIT ?
             """, bindings: [.text(expression), .text(vaultKey), .blob(vaultID), .integer(Int64(limit))])
         return try rows.map { row in
