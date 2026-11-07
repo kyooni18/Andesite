@@ -1,76 +1,134 @@
-# AndesiteServer (incomplete)
+# Andesite — integrated local backend (experimental)
 
-This repository is not a usable server. The executable intentionally exits with
-an error instead of serving requests: authentication, recovery and the storage
-engine are not implemented. Do not use it with real vaults.
+A Swift 6 headless Markdown vault backend. **Local CLI ingestion and search now
+work end-to-end. HTTP serving, authentication and sync are not implemented.**
+Use temporary test vaults, not production notes; filesystem/power-loss
+qualification and full v1 recovery remain outstanding.
 
-The current milestone provides a Swift 6 package and an experimental SQLite
-connection wrapper. It verifies SQLite >= 3.35, WAL and FTS5 at connection
-startup, enables foreign keys and FULL synchronous mode, and supports bound
-text statements and rollback on transaction failure. Callers must serialize
-access and move blocking I/O off network event loops. This is not yet the
-operational database or a filesystem/SQLite recovery protocol.
+## Build and exercise
 
-## Build and test
+Requires Swift 6.2+, SQLite >= 3.35 with FTS5 and development headers/pkg-config.
+Run `swift build` and `swift test`. Dependencies remain pinned in SwiftPM.
 
-Install Swift 6.2 or later, SQLite development headers, pkg-config, and SQLite
-with FTS5. Run `swift build` and `swift test`. The resolved dependency versions
-are checked in. Hummingbird 2.28.0 and swift-markdown 0.9.0 are pinned; the
-transitive swift-collections version is constrained to 1.3.0 because 1.7.5
-failed with the locally installed Swift 6.4 prerelease toolchain.
+Create separate, pre-existing vault and state directories. State must be owned
+by your OS user and mode 0700. Supply absolute physical paths: no symlink in any
+ancestor (on macOS, use `/private/tmp`, not `/tmp`). Ancestors must not be
+writable by other users, except shared sticky directories. Vault and state must
+not overlap. Only one vault is configured per state directory.
 
-The package has been built and its SQLite test run on macOS arm64 with the
-local Swift 6.4 toolchain, and in the `swift:6.2` Linux arm64 container with
-`libsqlite3-dev`. The local macOS build linked Homebrew's SQLite and emitted a
-minimum deployment target warning; compatibility with older macOS releases has
-not been verified. Linux filesystem guarantees and server behavior are not
-verified by the SQLite test.
+```sh
+sample=$(mktemp -d /private/tmp/andesite-demo.XXXXXX) # Linux: /tmp instead
+mkdir "$sample/vault" "$sample/state"
+chmod 700 "$sample/state"
+printf '# Example\ninitial phrase\n' > "$sample/vault/note.md"
+.build/debug/andesite-server init --vault "$sample/vault" --state "$sample/state"
+.build/debug/andesite-server search --vault "$sample/vault" --state "$sample/state" 'initial phrase'
+printf '# Revised\nreplacement phrase\n' > "$sample/vault/note.md"
+.build/debug/andesite-server reconcile --vault "$sample/vault" --state "$sample/state"
+.build/debug/andesite-server status --vault "$sample/vault" --state "$sample/state"
+```
 
-Additional experimental primitives include descriptor-relative, no-follow,
-bounded two-observation vault reads and a SHA-256 object store. Reads reject
-hard-linked files, mount crossings and unsafe path components; an observed
-change between reads is rejected. These checks do not provide an atomic view
-or capture edits that were never observed. The object store verifies hashes,
-never replaces existing objects and syncs new contents and the directory, but
-currently requires a trusted pre-existing private directory, buffers objects in
-memory, and does not handle orphan cleanup, quotas or a database journal. No
-code connects these primitives to a catalog or writes to vaults. They are not a
-recovery implementation, and no power-loss or filesystem qualification tests
-have been performed.
+`init` is an idempotent open + reconcile, not a reset. `status` checks stored
+objects and reports catalog counts; it does **not** scan current files. Each
+open marks the vault `scanRequired`; `reconcile` produces `ready` or
+`quarantined`, and failures produce `scanFailed`. Search always reconciles
+first, so an unsuccessful scan fails search rather than presenting an old
+index as current. Invalid UTF-8 Markdown is retained as an incident object;
+other valid files remain searchable. CLI prints entry IDs and heading titles.
+No arguments/unknown commands fail closed; no command opens a network listener.
 
-`CatalogSchema` provides a transactional, versioned **subset** of the core
-catalog: vaults, entries, revisions, object metadata, changes and operation
-reservations. It refuses a newer schema and rolls back a failed migration. It
-is not yet an operational sync database: pending journals, conflicts,
-tombstones, snapshots, leases and indexes are missing, as are catalog APIs and
-process locking. The migration must not be run against production data without
-exclusive ownership and a backup.
+## What is integrated
 
-An experimental process-lock primitive uses an OS advisory lock on a no-follow
-lock file in a trusted private state directory. It is not yet connected to
-server startup and cannot detect the same vault configured under another state
-directory. It never locks files against ordinary external editors.
+`VaultRuntime` owns configuration validation, exclusive process lock, SQLite
+migration/connection, immutable objects, stable observations, external capture,
+Markdown analysis and revision-aware FTS. It is a synchronous, non-Sendable
+owner; call from one blocking executor, never an NIO event loop. `shutdown()`
+closes resources before releasing ownership; startup errors release resources.
+A future HTTP layer can use this coordinator behind serialized blocking offload.
 
-A limited swift-markdown AST extractor validates UTF-8 and returns headings
-and ordinary link destinations without altering the input. It is not the v1
-Markdown indexer: frontmatter, wiki syntax, tags, slugging, link resolution,
-GFM conformance fixtures and full v1 indexing remain to be implemented.
+* A no-follow, descriptor-relative recursive scan discovers case-insensitive
+  `.md` files. Attachments are not ingested in this milestone. Symlinks, special
+  files, hard links, mount crossings, unreadable/invalid names and portable
+  namespace collisions abort the scan, even for non-Markdown entries.
+* Paths retain original spelling; portability comparison uses Unicode NFC plus
+  Foundation Unicode case folding (POSIX locale). Unicode filenames work;
+  invalid UTF-8, controls, traversal, backslashes and `.andesite*` scan names
+  are rejected. This is not yet a version-pinned cross-platform Unicode table.
+* Files are canonical and never rewritten. Two bounded byte/metadata reads
+  capture observations. New/changed bytes become durable SHA-256 objects,
+  stable path-based entry IDs, parent-linked revisions and ordered changes.
+  Unchanged bytes do not allocate revisions or change sequences.
+* Invalid UTF-8 is stored separately without replacing a good head/history;
+  repeated identical open incidents are deduplicated. Corrected valid content
+  resolves incidents, even if it matches the previous head.
+* Verified immutable revision bytes feed the existing basic swift-markdown
+  extractor and FTS. Search is vault-scoped, literal-phrase, bounded, current-head
+  checked, and excludes open incidents. It currently indexes raw Markdown with
+  a heading title, not complete v1 extracted document text.
 
-A preliminary SQLite FTS index can index supplied revision bytes and search a
-bounded literal phrase within a vault. It atomically checks the current head
-before committing and hides stale results. It currently indexes raw Markdown,
-not fully extracted document text; the caller must supply bytes from the correct
-verified immutable revision. It is not wired to ingestion or an API and lacks
-index generations, backlinks, pagination, snippets and index watermarks.
+## Recovery contract and limits
 
-An experimental explicit single-file external capture connects stable reads,
-the object store, and catalog revisions/change events in a SQLite transaction.
-It preserves earlier captured objects across updates and does not write vault
-files. A failed database transaction leaves the catalog unchanged and may leave
-an unreferenced object. This is **not reconciliation**: it has no watcher,
-scan, deletion inference, rename handling, complete quarantine, or automatic
-retry. It only accepts ASCII paths pending the specified portable Unicode key;
-callers must hold the process lock and serialize vault access. Invalid UTF-8 is retained as an incident object and hides the affected entry
-from the experimental search index until a valid observation resolves it;
-entry reads and snapshot quarantine enforcement are not yet implemented.
-No server route or background service uses this experimental primitive.
+This milestone introduces **observation-only recovery**, not the v1 mutation
+journal. No runtime operation writes source vault files.
+
+* Object contents and directory are synced before catalog references are
+  committed. Per-file revision/head/object metadata/event/sequence publication
+  is one SQLite transaction (WAL, foreign keys, FULL synchronous mode).
+* A scan is not a global transaction or atomic filesystem snapshot. Earlier
+  successful files remain captured if a later file fails. Restart/reconcile
+  retries idempotently; unchanged heads are reused. The final namespace is
+  checked again, but edits after an observation can only be captured next time.
+  Unobserved intermediate editor versions cannot be recovered.
+* Index publication is a separate rebuildable transaction. A crash between
+  capture and indexing leaves a stale index excluded by the head check; the
+  next reconciliation reindexes verified heads. Runtime search cannot bypass
+  reconciliation. Direct primitives still require their documented ownership
+  and serialization preconditions.
+* Startup and reconciliation verify catalog integrity/head references and every
+  registered object hash/length. Missing/corrupt objects, newer schema, unknown
+  vault identity/root directory replacement and unresolved consistency failures
+  stop the operation; there is no silent reconstruction from current notes.
+  An earlier manually seeded primitive-only catalog may be refused because it
+  lacks this runtime's physical root identity binding. Do not delete its state
+  to "repair" it; retain history and arrange an explicit migration.
+* Crash-created temporary/unreferenced objects are retained, not garbage
+  collected or treated as revisions. They do not prevent retry. Registered
+  objects, including retained history/incidents, must verify. No history pruning.
+* Missing previously cataloged paths are explicitly rejected as unsupported
+  removal/rename reconciliation **before** ingesting new paths. No deletion is
+  ever inferred, including after incomplete scans. Restore the old path or wait
+  for an audited deletion/rename implementation; hashes alone do not relink IDs.
+* The advisory lock coordinates one state directory, not editors or another
+  state directory pointed at the same vault. Operators must not configure the
+  same vault twice. State directories must remain trusted and not be mutated
+  by other processes. Network filesystems and concurrent state manipulation
+  are unsupported. Directory fsync is required; power-loss durability has not
+  been experimentally qualified. This is not a coherent online backup tool.
+
+Not implemented: watchers, automatic retries, server writes/journal recovery,
+rename/deletion publication, attachment scanning, quotas/GC, authentication,
+HTTP API, snapshots/cursors/offline synchronization or web client. The basic
+extractor lacks complete v1 frontmatter/wiki syntax/tags/link resolution,
+backlinks, snippets, pagination and index generations.
+
+## Verification and next milestone
+
+The suite contains the 10 original tests plus 4 integrated tests covering fresh
+scan/search, discovery, edits/history, unchanged ingestion, Unicode, restart,
+locking, transaction failure/retry, invalid UTF-8 quarantine, missing/corrupt
+objects, unsafe namespaces and unsupported renames. A dedicated recovery test
+forces failure between revision capture and index publication, then verifies
+stale-result exclusion, partial-scan retry without duplicate revisions/events,
+incomplete-scan non-deletion, and newer-schema refusal. Quarantine is also
+checked after restart. All use temporary vaults.
+`swift build` and `swift test` pass locally on macOS arm64 (14 tests).
+Existing unused-dependency/test warnings and the Homebrew SQLite deployment
+version linker warning remain. Linux and power-loss behavior were not verified
+for this milestone.
+
+Next: audited observation-side deletion/rename handling and persistent scan
+health diagnostics, with cross-platform race/fault-injection tests, before
+adding authenticated read-only HTTP access. Full server writes require the
+specified mutation journal/recovery protocol, not just this ingestion runtime.
+See `docs/andesite-server-spec.md` and `docs/andesite-protocol-v1.schema.json`
+for the **planned** v1 contract, not a declaration of implemented functionality.

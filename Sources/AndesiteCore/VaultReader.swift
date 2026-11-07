@@ -29,6 +29,12 @@ public struct VaultPath: Sendable, Equatable {
         }
         components = pieces
     }
+
+    public var portabilityKey: String {
+        components.joined(separator: "/").precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .precomposedStringWithCanonicalMapping
+    }
 }
 
 public struct FileFingerprint: Equatable, Sendable, Codable {
@@ -63,6 +69,8 @@ public struct ObservedFile: Sendable {
 public final class VaultReader {
     private let root: Int32
     private let rootDevice: UInt64
+    private let rootInode: UInt64
+    private let rootPath: String
 
     public init(rootPath: String) throws {
         let fd = open(rootPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
@@ -73,8 +81,65 @@ public final class VaultReader {
         }
         root = fd
         rootDevice = UInt64(info.st_dev)
+        rootInode = UInt64(info.st_ino)
+        self.rootPath = rootPath
     }
     deinit { close(root) }
+
+    private func verifyRoot() throws {
+        var info = stat()
+        guard lstat(rootPath, &info) == 0, info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              UInt64(info.st_dev) == rootDevice, UInt64(info.st_ino) == rootInode else { throw VaultReadError.unstable }
+    }
+
+    /// A failed enumeration never returns a partial listing.
+    public func markdownPaths() throws -> [VaultPath] {
+        try verifyRoot()
+        var paths: [VaultPath] = []
+        var namespace = Set<String>()
+        func visit(_ fd: Int32, _ prefix: String) throws {
+            let copy = dup(fd)
+            guard copy >= 0 else { throw VaultReadError.systemCall("dup scan", errno) }
+            guard let stream = fdopendir(copy) else { close(copy); throw VaultReadError.systemCall("open scan", errno) }
+            defer { closedir(stream) }
+            while true {
+                errno = 0
+                guard let item = readdir(stream) else {
+                    guard errno == 0 else { throw VaultReadError.systemCall("read directory", errno) }
+                    break
+                }
+                let name: String? = withUnsafePointer(to: &item.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(validatingCString: $0) }
+                }
+                guard let name else { throw VaultReadError.invalidPath }
+                if name == "." || name == ".." { continue }
+                let path = try VaultPath(prefix + name)
+                guard !name.lowercased().hasPrefix(".andesite"), namespace.insert(path.portabilityKey).inserted else { throw VaultReadError.invalidPath }
+                var info = stat()
+                guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw VaultReadError.unstable }
+                guard UInt64(info.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
+                switch info.st_mode & mode_t(S_IFMT) {
+                case mode_t(S_IFDIR):
+                    let child = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                    guard child >= 0 else { throw VaultReadError.unsafeFile }
+                    defer { close(child) }
+                    var opened = stat()
+                    guard fstat(child, &opened) == 0, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else { throw VaultReadError.unstable }
+                    try visit(child, prefix + name + "/")
+                case mode_t(S_IFREG):
+                    guard info.st_nlink == 1 else { throw VaultReadError.unsafeFile }
+                    if name.lowercased().hasSuffix(".md") { paths.append(path) }
+                default: throw VaultReadError.unsafeFile
+                }
+            }
+        }
+        let fd = openat(root, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard fd >= 0 else { throw VaultReadError.systemCall("open scan root", errno) }
+        defer { close(fd) }
+        try visit(fd, "")
+        try verifyRoot()
+        return paths.sorted { $0.components.joined(separator: "/") < $1.components.joined(separator: "/") }
+    }
 
     /// Requires two matching byte and metadata observations separated by the
     /// caller-specified debounce. Even matching observations cannot rule out
@@ -106,6 +171,7 @@ public final class VaultReader {
     }
 
     private func observe(_ path: VaultPath, maximumBytes: Int) throws -> (FileFingerprint, Data) {
+        try verifyRoot()
         var directory = dup(root)
         guard directory >= 0 else { throw VaultReadError.systemCall("dup root", errno) }
         defer { close(directory) }

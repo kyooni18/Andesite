@@ -19,16 +19,14 @@ public struct ExternalCaptureResult: Sendable, Equatable {
 /// A limited, explicit single-file capture, not a directory scanner or watcher.
 /// The caller must hold the state-directory process lock, serialize all catalog
 /// work for the vault, and call this on a bounded blocking executor. No vault
-/// writes are performed. Only ASCII paths are accepted until the specified
-/// platform-independent Unicode portability key is implemented.
+/// writes are performed. Unicode paths use NFC plus case folding for comparison.
 public enum ExternalCapture {
     public static func capture(db: SQLiteConnection, reader: VaultReader, objects: ObjectStore,
                                vaultID: Data, path: VaultPath, maximumBytes: Int,
                                debounce: TimeInterval = 0.25) throws -> ExternalCaptureResult {
         guard vaultID.count == 16 else { throw ExternalCaptureError.unknownVault }
         let name = path.components.joined(separator: "/")
-        guard name.utf8.allSatisfy({ $0 < 128 }) else { throw ExternalCaptureError.unsupportedPath }
-        let key = name.lowercased()
+        let key = path.portabilityKey
         let kind = name.lowercased().hasSuffix(".md") ? "markdown" : "attachment"
         let observation = try reader.observeStable(path, maximumBytes: maximumBytes, debounce: debounce)
         let hash = try objects.put(observation.bytes)
@@ -49,7 +47,10 @@ public enum ExternalCapture {
                     entry = row[0]
                 } else { entry = .null }
                 try registerObject(db: db, hash: hash, hashBytes: hashBytes, length: observation.bytes.count, timestamp: timestamp)
-                try db.executeValues("INSERT INTO incidents(vault_id,id,path,path_key,entry_id,content_hash,fs_hint,status,observed_at) VALUES(?,?,?,?,?,?,?,'open',?)", bindings: [.blob(vaultID), .blob(identifier()), .text(name), .text(key), entry, .blob(hashBytes), .blob(hint), .text(timestamp)])
+                let prior = try db.queryValues("SELECT id FROM incidents WHERE vault_id=? AND path_key=? AND content_hash=? AND status='open'", bindings: [.blob(vaultID), .text(key), .blob(hashBytes)])
+                if prior.isEmpty {
+                    try db.executeValues("INSERT INTO incidents(vault_id,id,path,path_key,entry_id,content_hash,fs_hint,status,observed_at) VALUES(?,?,?,?,?,?,?,'open',?)", bindings: [.blob(vaultID), .blob(identifier()), .text(name), .text(key), entry, .blob(hashBytes), .blob(hint), .text(timestamp)])
+                }
             }
             throw ExternalCaptureError.invalidMarkdown
         }
