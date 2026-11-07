@@ -41,6 +41,7 @@ public struct VaultStatus: Sendable {
     public let entries: Int
     public let revisions: Int
     public let openIncidents: Int
+    public let unfinishedMutations: Int
 }
 
 /// Synchronous, deliberately non-Sendable owner. Use on one blocking executor;
@@ -145,7 +146,7 @@ public final class VaultRuntime {
         func count(_ table: String, _ suffix: String = "") throws -> Int {
             Int(try r.db.scalarText("SELECT count(*) FROM \(table) \(suffix)") ?? "") ?? 0
         }
-        return try VaultStatus(vaultID: vaultID, state: r.db.scalarText("SELECT state FROM vaults") ?? "unknown", entries: count("entries"), revisions: count("revisions"), openIncidents: count("incidents", "WHERE status='open'"))
+        return try VaultStatus(vaultID: vaultID, state: r.db.scalarText("SELECT state FROM vaults") ?? "unknown", entries: count("entries"), revisions: count("revisions"), openIncidents: count("incidents", "WHERE status='open'"), unfinishedMutations: count("mutation_journal", "WHERE state NOT IN ('completed','cancelled')"))
     }
 
     /// Search refreshes canonical files first; failed/partial scans never expose

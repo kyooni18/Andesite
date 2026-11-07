@@ -39,5 +39,11 @@ public final class ProcessLock {
         descriptor = fd
     }
 
-    deinit { close(descriptor) }
+    deinit {
+        // Explicit unlock also releases ownership immediately if an unrelated
+        // concurrent posix_spawn briefly inherited the CLOEXEC descriptor before
+        // exec. Closing alone can retain an OFD lock in that short fork window.
+        _ = flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
 }

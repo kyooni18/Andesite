@@ -108,6 +108,13 @@ final class MutationJournal {
         guard let r = try records().first(where: { $0.operation.id == id }) else { throw VaultRuntimeError.inconsistentCatalog }
         return r
     }
+    func filesystem(path: String, expected: [DirectoryIdentity]? = nil) throws -> MutationFilesystem {
+        let fs = try MutationFilesystem(root: root, path: VaultPath(path), expected: expected)
+        let rootIndex = root.split(separator: "/").count - 1
+        let identity = fs.identities[rootIndex]
+        guard try db.queryValues("SELECT root_config FROM vaults WHERE id=?", bindings: [.blob(vaultID)]) == [[.text("\(root)\n\(identity.device):\(identity.inode)")]] else { throw MutationError.conflict("vault root no longer matches the catalog") }
+        return fs
+    }
     func restore(_ id: Data) throws -> MutationOperation {
         #if !canImport(Darwin)
         throw MutationError.unsupportedPlatform
@@ -121,7 +128,7 @@ final class MutationJournal {
             """, bindings: [.blob(vaultID), .blob(snapshot.entryID)])
         guard let row = rows.first, case .text(let path) = row[0], case .blob(let parent) = row[1],
               case .blob(let hint) = row[2], case .blob(let hash) = row[3] else { throw MutationError.conflict("snapshot document is not a live Markdown file; export instead") }
-        let fs = try MutationFilesystem(root: root, path: VaultPath(path))
+        let fs = try filesystem(path: path)
         let observation = try fs.observe(fs.name, maximumBytes: maximumBytes)
         let original = try JSONDecoder().decode(FileFingerprint.self, from: hint)
         guard observation.fingerprint == original, ObjectStore.hash(observation.bytes) == Self.hex(hash) else { throw MutationError.conflict("target changed since its last captured revision; reconcile and review before retrying") }
@@ -129,7 +136,11 @@ final class MutationJournal {
         _ = try objects.put(observation.bytes)
         let now = Date()
         try fault("before-preimage")
-        let preimage = try db.transaction { try preserveHead(entryID: snapshot.entryID, at: now) }
+        let preimage = try db.transaction {
+            let id = try preserveHead(entryID: snapshot.entryID, at: now)
+            try fault("preimage-written")
+            return id
+        }
         try fault("preimage-preserved")
         let operationID = ExternalCapture.identifier(), revision = ExternalCapture.identifier()
         let artifact = ".andesite-mutation-" + Self.hex(operationID)
@@ -138,6 +149,7 @@ final class MutationJournal {
                 INSERT INTO mutation_journal(vault_id,id,entry_id,snapshot_id,preimage_id,parent_revision,revision_id,path,artifact,original_hint,directories,state,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,'prepared',?)
                 """, bindings: [.blob(vaultID), .blob(operationID), .blob(snapshot.entryID), .blob(id), .blob(preimage), .blob(parent), .blob(revision), .text(path), .text(artifact), .blob(hint), .blob(try JSONEncoder().encode(fs.identities)), .real(now.timeIntervalSince1970)])
+            try fault("intent-written")
         }
         try fault("intent-committed")
         let staged = try fs.stage(replacement, artifact: artifact, original: original, fault: fault)
@@ -171,8 +183,10 @@ final class MutationJournal {
         #endif
     }
     func verifyPublished(_ record: Record, fs: MutationFilesystem) throws {
-        let (_, wanted) = try snapshot(record.operation.snapshotID)
-        let (_, preimage) = try snapshot(record.operation.preimageID)
+        let (source, wanted) = try snapshot(record.operation.snapshotID)
+        let (before, preimage) = try snapshot(record.operation.preimageID)
+        guard source.entryID == record.operation.entryID, before.entryID == record.operation.entryID,
+              before.revisionID == record.parent else { throw MutationError.conflict("journal snapshot identity or preimage lineage mismatch") }
         guard let stage = record.stage else { throw MutationError.conflict("missing durable stage identity") }
         let target = try fs.observe(fs.name, maximumBytes: maximumBytes)
         let displaced = try fs.observe(record.operation.artifact, maximumBytes: maximumBytes)
@@ -209,7 +223,7 @@ final class MutationJournal {
         for record in try records() {
             if record.operation.state == "quarantined" { continue }
             do {
-                let fs = try MutationFilesystem(root: root, path: VaultPath(record.operation.path), expected: record.directories)
+                let fs = try filesystem(path: record.operation.path, expected: record.directories)
                 switch record.operation.state {
                 case "completed":
                     // Keep watching displaced inodes: an editor with an open FD

@@ -103,7 +103,7 @@ private extension RuntimeFixture {
     #expect(recreated.count == 3)
     #expect(Set(recreated.map(\.entryID)).count == 2)
     #expect(try db.scalarText("SELECT count(*) FROM revisions") == "4")
-    #expect(try db.scalarText("SELECT next_seq FROM vaults") == "6")
+    #expect(try db.scalarText("SELECT next_seq FROM vaults") == "5")
     try runtime.shutdown()
     let reopened = try VaultRuntime(configuration: f.configuration)
     #expect(try reopened.snapshots(entryID: initial.entryID).count == 2)

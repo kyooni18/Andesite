@@ -56,6 +56,7 @@ final class MutationFilesystem {
             }
             if let expected { guard expected == chain else { throw MutationError.conflict("parent directory identity changed") } }
         } catch { close(fd); throw error }
+        guard andesite_supported_filesystem(fd) == 1 else { close(fd); throw MutationError.unsupportedPlatform }
         directory = fd; identities = chain
     }
     deinit { close(directory) }
@@ -113,6 +114,7 @@ final class MutationFilesystem {
         guard andesite_copy_metadata(source, fd) == 0 else { throw MutationError.conflict("metadata cannot be preserved on this filesystem") }
         try Self.syncFile(fd)
         try syncDirectory()
+        try Self.syncFile(fd) // barrier AFTER publishing/syncing the staging name
         guard fstat(fd, &s) == 0 else { throw MutationError.conflict("cannot stat staged file") }
         try fault("stage-written")
         return FileFingerprint(s)

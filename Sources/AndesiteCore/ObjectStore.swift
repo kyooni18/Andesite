@@ -41,6 +41,10 @@ public final class ObjectStore {
             guard try get(hash, maximumBytes: bytes.count) == bytes else { throw ObjectStoreError.corruptObject }
             // An earlier interrupted put may have linked but not synced the name.
             guard fsync(root) == 0 else { throw ObjectStoreError.systemCall("sync object directory", errno) }
+            let fd = openat(root, hash, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { throw ObjectStoreError.systemCall("open object barrier", errno) }
+            defer { close(fd) }
+            try durabilityBarrier(fd)
             return hash
         }
         guard errno == ENOENT else { throw ObjectStoreError.systemCall("check object", errno) }
@@ -60,17 +64,24 @@ public final class ObjectStore {
                 offset += n
             }
         }
-        #if canImport(Darwin)
-        guard fcntl(fd, F_FULLFSYNC) == 0 else { throw ObjectStoreError.systemCall("full sync object", errno) }
-        #else
-        guard fsync(fd) == 0 else { throw ObjectStoreError.systemCall("sync object", errno) }
-        #endif
+        try durabilityBarrier(fd)
         if linkat(root, temp, root, hash, 0) != 0 {
             guard errno == EEXIST else { throw ObjectStoreError.systemCall("publish object", errno) }
             guard try get(hash, maximumBytes: bytes.count) == bytes else { throw ObjectStoreError.corruptObject }
         }
         guard fsync(root) == 0 else { throw ObjectStoreError.systemCall("sync object directory", errno) }
+        // Flush after the directory entry as well, on the OBJECT volume (which
+        // may differ from the destination or SQLite volume).
+        try durabilityBarrier(fd)
         return hash
+    }
+
+    private func durabilityBarrier(_ fd: Int32) throws {
+        #if canImport(Darwin)
+        guard fcntl(fd, F_FULLFSYNC) == 0 else { throw ObjectStoreError.systemCall("full sync object", errno) }
+        #else
+        guard fsync(fd) == 0 else { throw ObjectStoreError.systemCall("sync object", errno) }
+        #endif
     }
 
     public func get(_ hash: String, maximumBytes: Int) throws -> Data {

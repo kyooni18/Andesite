@@ -84,7 +84,7 @@ do {
             }
         default:
             let status = try runtime.status()
-            print("vault=\(hex(status.vaultID)) state=\(status.state) entries=\(status.entries) revisions=\(status.revisions) openIncidents=\(status.openIncidents)")
+            print("vault=\(hex(status.vaultID)) state=\(status.state) entries=\(status.entries) revisions=\(status.revisions) openIncidents=\(status.openIncidents) unfinishedMutations=\(status.unfinishedMutations)")
         }
         try runtime.shutdown()
     } catch {
