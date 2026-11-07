@@ -170,7 +170,7 @@ public final class VaultReader {
         for component in path.components.dropLast() {
             let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             if next < 0 {
-                if errno == ENOENT { return true }
+                if errno == ENOENT { try verifyRoot(); return true }
                 throw VaultReadError.systemCall("check absent parent", errno)
             }
             var info = stat()

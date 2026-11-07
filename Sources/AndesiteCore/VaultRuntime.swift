@@ -188,10 +188,12 @@ public final class VaultRuntime {
                 try setState("quarantined")
                 return report
             }
-            for prior in plan.deleted {
-                guard try r.reader.confirmAbsent(plan.old[prior].path) else { throw VaultReadError.unstable }
-            }
             let results: [ExternalCaptureResult] = try r.db.transaction {
+                // Recheck after acquiring SQLite's writer lock, not before a
+                // potentially long lock wait. No metadata has changed yet.
+                for prior in plan.deleted {
+                    guard try r.reader.confirmAbsent(plan.old[prior].path) else { throw VaultReadError.unstable }
+                }
                 for prior in plan.moved.union(plan.deleted).sorted() {
                     let reason = plan.deleted.contains(prior) ? "deletion" : "rename"
                     if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: plan.old[prior].id, at: date, reason: reason, force: true) { report.snapshotsCreated += 1 }
@@ -294,7 +296,7 @@ public final class VaultRuntime {
         guard let old = String(data: a, encoding: .utf8), let new = String(data: b, encoding: .utf8) else { throw SnapshotError.inconsistentMetadata }
         let oldLines = old.components(separatedBy: "\n"), newLines = new.components(separatedBy: "\n")
         guard oldLines.count <= 2000, newLines.count <= 2000 else { throw SnapshotError.comparisonTooLarge }
-        let changes = newLines.difference(from: oldLines).map { change -> String in
+        let changes = newLines.difference(from: oldLines, by: { $0.utf8.elementsEqual($1.utf8) }).map { change -> String in
             switch change {
             case .remove(let offset, let line, _): return "-\(offset):\(line)"
             case .insert(let offset, let line, _): return "+\(offset):\(line)"

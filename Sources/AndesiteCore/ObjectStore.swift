@@ -34,6 +34,16 @@ public final class ObjectStore {
     @discardableResult
     public func put(_ bytes: Data) throws -> String {
         let hash = Self.hash(bytes)
+        var existing = stat()
+        if fstatat(root, hash, &existing, AT_SYMLINK_NOFOLLOW) == 0 {
+            // Dedup without even writing a redundant temporary copy. Verification
+            // is still mandatory; a damaged object is never repaired in place.
+            guard try get(hash, maximumBytes: bytes.count) == bytes else { throw ObjectStoreError.corruptObject }
+            // An earlier interrupted put may have linked but not synced the name.
+            guard fsync(root) == 0 else { throw ObjectStoreError.systemCall("sync object directory", errno) }
+            return hash
+        }
+        guard errno == ENOENT else { throw ObjectStoreError.systemCall("check object", errno) }
         let temp = ".object-" + UUID().uuidString.lowercased()
         let fd = openat(root, temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
         guard fd >= 0 else { throw ObjectStoreError.systemCall("create temporary object", errno) }

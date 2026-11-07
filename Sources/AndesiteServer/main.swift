@@ -52,9 +52,9 @@ do {
             for snapshot in snapshots { print(describe(snapshot)) }
         case "snapshot-inspect":
             let id = try identifier(args[5])
-            print(describe(try runtime.inspectSnapshot(id)))
-            print("--- contents ---")
-            FileHandle.standardOutput.write(try runtime.snapshotContents(id))
+            var output = Data((describe(try runtime.inspectSnapshot(id)) + "\n--- contents ---\n").utf8)
+            output.append(try runtime.snapshotContents(id))
+            FileHandle.standardOutput.write(output)
         case "snapshot-compare":
             let comparison = try runtime.compareSnapshots(identifier(args[5]), identifier(args[6]))
             print("--- \(hex(comparison.before.id))\n+++ \(hex(comparison.after.id))")

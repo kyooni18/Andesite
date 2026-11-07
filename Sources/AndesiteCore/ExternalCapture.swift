@@ -44,6 +44,7 @@ public enum ExternalCapture {
     public static func capture(db: SQLiteConnection, reader: VaultReader, objects: ObjectStore,
                                vaultID: Data, path: VaultPath, maximumBytes: Int,
                                debounce: TimeInterval = 0.25) throws -> ExternalCaptureResult {
+        guard vaultID.count == 16 else { throw ExternalCaptureError.unknownVault }
         let observation = try reader.observeStable(path, maximumBytes: maximumBytes, debounce: debounce)
         let prepared = try prepare(path: path, observation: observation, objects: objects)
         let result = try db.transaction { try publish(db: db, vaultID: vaultID, prepared: prepared, at: Date()) }
@@ -81,7 +82,7 @@ public enum ExternalCapture {
         let moved = oldPath.map { Array($0.utf8) != Array(p.name.utf8) } ?? false
         if oldHash == p.hashBytes && !moved, let head = oldRevision {
             try db.executeValues("UPDATE entries SET fs_hint=? WHERE vault_id=? AND id=?", bindings: [.blob(p.hint), .blob(vaultID), .blob(entryID)])
-            try resolveIncidents(db: db, vaultID: vaultID, key: p.path.portabilityKey)
+            try resolveIncidents(db: db, vaultID: vaultID, key: p.path.portabilityKey, entryID: entryID)
             return ExternalCaptureResult(entryID: entryID, revisionID: head, contentHash: p.hash, sequence: nil)
         }
         if oldRevision == nil {
@@ -94,7 +95,7 @@ public enum ExternalCapture {
             """, bindings: [.blob(vaultID), .blob(entryID), .blob(revision), oldRevision.map(SQLiteValue.blob) ?? .null,
                             .blob(p.hashBytes), .integer(Int64(p.length)), .text(p.name), .text(timestamp), .blob(p.hint)])
         try db.executeValues("UPDATE entries SET path=?,path_key=?,head_revision=?,state='live',fs_hint=? WHERE vault_id=? AND id=?", bindings: [.text(p.name), .text(p.path.portabilityKey), .blob(revision), .blob(p.hint), .blob(vaultID), .blob(entryID)])
-        try resolveIncidents(db: db, vaultID: vaultID, key: p.path.portabilityKey)
+        try resolveIncidents(db: db, vaultID: vaultID, key: p.path.portabilityKey, entryID: entryID)
         let type = moved ? "moved" : (oldRevision == nil ? "created" : "updated")
         let sequence = try event(db: db, vaultID: vaultID, entryID: entryID, revision: revision, type: type,
                                  path: p.name, kind: p.kind, hash: p.hash, length: p.length, fromPath: moved ? oldPath : nil)
@@ -125,8 +126,8 @@ public enum ExternalCapture {
         guard try db.queryValues("SELECT length,durable_location FROM objects WHERE hash=?", bindings: [.blob(p.hashBytes)]) == [[.integer(Int64(p.length)), .text(p.hash)]] else { throw ExternalCaptureError.corruptCatalog }
     }
 
-    private static func resolveIncidents(db: SQLiteConnection, vaultID: Data, key: String) throws {
-        try db.executeValues("UPDATE incidents SET status='resolved' WHERE vault_id=? AND path_key=? AND status='open'", bindings: [.blob(vaultID), .text(key)])
+    private static func resolveIncidents(db: SQLiteConnection, vaultID: Data, key: String, entryID: Data) throws {
+        try db.executeValues("UPDATE incidents SET status='resolved' WHERE vault_id=? AND (entry_id=? OR (entry_id IS NULL AND path_key=?)) AND status='open'", bindings: [.blob(vaultID), .blob(entryID), .text(key)])
     }
 
     private static func event(db: SQLiteConnection, vaultID: Data, entryID: Data, revision: Data, type: String,

@@ -125,12 +125,18 @@ enum RecoverySnapshots {
         var bindings: [SQLiteValue] = [.blob(vaultID)]
         if let entryID { predicates.append("s.entry_id=?"); bindings.append(.blob(entryID)) }
         if let snapshotID { predicates.append("s.id=?"); bindings.append(.blob(snapshotID)) }
-        // Historical exact path spellings intentionally return multiple identities
-        // after delete/recreate; no implicit relink or selection of a winner.
+        // Use the same portable key as observation, not SQLite's ASCII NOCASE
+        // or byte equality (filesystems may enumerate decomposed Unicode). A
+        // historical path can select several IDs; it never relinks their history.
+        var historicalEntries: Set<Data>?
         if let path {
-            _ = try VaultPath(path)
-            predicates.append("EXISTS(SELECT 1 FROM revisions p WHERE p.vault_id=s.vault_id AND p.entry_id=s.entry_id AND p.path=?)")
-            bindings.append(.text(path))
+            let key = try VaultPath(path).portabilityKey
+            var ids = Set<Data>()
+            for row in try db.queryValues("SELECT DISTINCT entry_id,path FROM revisions WHERE vault_id=?", bindings: [.blob(vaultID)]) {
+                guard case .blob(let id) = row[0], case .text(let name) = row[1] else { throw SnapshotError.inconsistentMetadata }
+                if try VaultPath(name).portabilityKey == key { ids.insert(id) }
+            }
+            historicalEntries = ids
         }
         let rows = try db.queryValues("""
             SELECT s.id,s.entry_id,s.revision_id,lower(hex(s.content_hash)),s.byte_length,s.path,s.created_at,s.expires_at,s.reason,e.state,r.created_at
@@ -138,11 +144,12 @@ enum RecoverySnapshots {
             JOIN revisions r ON r.vault_id=s.vault_id AND r.revision_id=s.revision_id
             WHERE \(predicates.joined(separator: " AND ")) ORDER BY s.entry_id,s.ordinal
             """, bindings: bindings)
-        return try rows.map { row in
+        return try rows.compactMap { row in
             guard case .blob(let id) = row[0], case .blob(let entry) = row[1], case .blob(let revision) = row[2],
                   case .text(let hash) = row[3], case .integer(let length) = row[4], length >= 0, length <= Int.max,
                   case .text(let path) = row[5], let created = number(row[6]), let expires = number(row[7]),
                   case .text(let reason) = row[8], case .text(let state) = row[9], case .text(let observed) = row[10] else { throw SnapshotError.inconsistentMetadata }
+            if let historicalEntries, !historicalEntries.contains(entry) { return nil }
             return RecoverySnapshot(id: id, entryID: entry, revisionID: revision, contentHash: hash, byteLength: Int(length), originalPath: path, createdAt: Date(timeIntervalSince1970: created), expiresAt: Date(timeIntervalSince1970: expires), reason: reason, documentState: state, observedAt: observed)
         }
     }
