@@ -2,6 +2,8 @@
 
 Status: design, not an implementation. Normative words **MUST**, **MUST NOT**, and **SHOULD** describe v1 requirements. API examples are illustrative but the field semantics and state machines below are normative. No frontend or real-time transport is required.
 
+**Implemented local subset (snapshot milestone):** the synchronous CLI/runtime now supports Markdown observation, verified immutable content, revisions/FTS, persistent individual-file recovery snapshots, external tombstones and conservative identity-based moves. See [the implemented file-recovery contract](andesite-file-recovery.md) and README for exact behavior and limitations. There is no HTTP listener, watcher, mutation journal, in-place restore or sync service yet. The per-file snapshots have a default minimum interval of five minutes and seven-day expiration eligibility; they are **not** the full-vault synchronization manifests with a 24-hour TTL in §10.2. Expiration does not prune anything in the implementation. This note does not relax the future mutation/recovery guarantees below.
+
 ## 1. Scope, guarantees, and limits
 
 AndesiteServer manages one or more vaults of ordinary UTF-8 Markdown and opaque attachments. Files are canonical for their **current visible contents and paths**. SQLite holds durable identity, revisions, operation and sync metadata as well as rebuildable indexes. Private immutable content objects retain exact bytes needed for recovery, history, conflicts and protocol delivery; they are operational history, not the authoritative current document. A SQLite rebuild must never write or delete vault files.
