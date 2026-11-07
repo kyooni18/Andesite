@@ -55,6 +55,15 @@ public final class VaultRuntime {
     private var processLock: ProcessLock?
     private let configuration: VaultConfiguration
     public let vaultID: Data
+    // Internal deterministic hooks for tests; never supplied by vault contents.
+    var mutationFault: ((String) throws -> Void)?
+    private func journal() throws -> MutationJournal {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        let journal = MutationJournal(db: r.db, objects: r.objects, vaultID: vaultID,
+            root: configuration.vaultDirectory, maximumBytes: configuration.maximumBytes)
+        if let mutationFault { journal.fault = mutationFault }
+        return journal
+    }
 
     public init(configuration: VaultConfiguration) throws {
         let c = configuration
@@ -110,7 +119,10 @@ public final class VaultRuntime {
         _ = try RecoverySnapshots.policy(db: db, vaultID: id)
         // Recover capture -> snapshot-registration interruptions before a new
         // observation can advance the head. This never reads current vault bytes.
-        _ = try flushSnapshotHeads(at: Date(), reason: "recovery")
+        try journal().recover()
+        if (try? journal().assertResolved()) != nil {
+            _ = try flushSnapshotHeads(at: Date(), reason: "recovery")
+        } else { try setState("quarantined") }
         let directory = open(state, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard directory >= 0 else { throw VaultRuntimeError.unsafeState }
         defer { close(directory) }
@@ -123,7 +135,7 @@ public final class VaultRuntime {
     public func shutdown(at date: Date = Date()) throws {
         guard resources != nil else { return }
         defer { resources = nil; processLock = nil }
-        _ = try flushSnapshots(at: date)
+        if (try? journal().assertResolved()) != nil { _ = try flushSnapshots(at: date) }
     }
 
     deinit { resources = nil; processLock = nil }
@@ -146,11 +158,13 @@ public final class VaultRuntime {
 
     public func reconcile(at date: Date = Date()) throws -> ReconciliationReport {
         guard let r = resources else { throw VaultRuntimeError.closed }
+        try journal().recover()
+        try journal().assertResolved()
         try RecoverySnapshots.validateTime(date)
         try setState("scanning")
         do {
             try verifyObjects()
-            let scan = try r.reader.markdownFiles()
+            let scan = try r.reader.markdownFiles(artifacts: journal().scanArtifacts())
             let plan = try NamespacePlan(db: r.db, vaultID: vaultID, scan: scan)
             var report = ReconciliationReport()
             report.discovered = scan.count
@@ -183,7 +197,7 @@ public final class VaultRuntime {
             // Only a fully enumerated, unchanged namespace and a later secure
             // absence check may authorize tombstones. A failure above or here
             // leaves earlier captures intact but publishes no disappearances.
-            try NamespacePlan.validateUnchanged(scan, r.reader.markdownFiles())
+            try NamespacePlan.validateUnchanged(scan, r.reader.markdownFiles(artifacts: journal().scanArtifacts()))
             if quarantinedMove {
                 try setState("quarantined")
                 return report
@@ -310,12 +324,18 @@ public final class VaultRuntime {
         try SnapshotExport.publish(bytes, to: destination, excluding: [configuration.vaultDirectory, configuration.stateDirectory])
     }
 
-    /// Explicit fail-closed placeholder. In-place replacement requires the v1
-    /// mutation journal, preserved current preimage and restart conflict handling.
-    /// Export is available now; this method NEVER mutates the vault.
-    public func restoreSnapshot(_ id: Data) throws {
+    /// Restores the snapshot to its stable document's CURRENT live path (which
+    /// may differ from its historical snapshot path). Does not recreate tombstones.
+    @discardableResult
+    public func restoreSnapshot(_ id: Data) throws -> MutationOperation {
         _ = try inspectSnapshot(id)
-        throw SnapshotError.restorationRequiresMutationJournal
+        let j = try journal()
+        try j.recover()
+        return try j.restore(id)
+    }
+
+    public func mutationOperations() throws -> [MutationOperation] {
+        try journal().records().map(\.operation)
     }
 
     public func snapshotStorage(at date: Date = Date()) throws -> SnapshotStorageUsage {

@@ -187,7 +187,7 @@ enum RecoverySnapshots {
             registeredObjectBytes: objects.reduce(0) { $0 + $1.byteLength }, objects: objects)
     }
 
-    private static func number(_ value: SQLiteValue) -> Double? {
+    static func number(_ value: SQLiteValue) -> Double? {
         switch value { case .real(let number): return number.isFinite ? number : nil
         case .integer(let number): return Double(number)
         default: return nil }

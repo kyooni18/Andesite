@@ -114,6 +114,10 @@ public final class VaultReader {
     }
 
     public func markdownFiles() throws -> [ScannedMarkdownFile] {
+        try markdownFiles(artifacts: [:])
+    }
+
+    func markdownFiles(artifacts: [String: FileFingerprint]) throws -> [ScannedMarkdownFile] {
         try verifyRoot()
         var paths: [ScannedMarkdownFile] = []
         var namespace = Set<String>()
@@ -134,9 +138,14 @@ public final class VaultReader {
                 guard let name else { throw VaultReadError.invalidPath }
                 if name == "." || name == ".." { continue }
                 let path = try VaultPath(prefix + name)
-                guard !name.lowercased().hasPrefix(".andesite"), namespace.insert(path.portabilityKey).inserted else { throw VaultReadError.invalidPath }
                 var info = stat()
                 guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw VaultReadError.unstable }
+                if let expected = artifacts[prefix + name] {
+                    guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), info.st_nlink == 1,
+                          FileFingerprint(info).sameInode(as: expected) else { throw VaultReadError.unsafeFile }
+                    continue
+                }
+                guard !name.lowercased().hasPrefix(".andesite"), namespace.insert(path.portabilityKey).inserted else { throw VaultReadError.invalidPath }
                 guard UInt64(info.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
                 switch info.st_mode & mode_t(S_IFMT) {
                 case mode_t(S_IFDIR):

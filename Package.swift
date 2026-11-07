@@ -13,7 +13,8 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(name: "CSQLite", pkgConfig: "sqlite3", providers: [.brew(["sqlite3"]), .apt(["libsqlite3-dev"])]),
-        .target(name: "AndesiteCore", dependencies: ["CSQLite", .product(name: "Markdown", package: "swift-markdown"), .product(name: "Crypto", package: "swift-crypto")]),
+        .target(name: "CAndesiteFS"),
+        .target(name: "AndesiteCore", dependencies: ["CSQLite", "CAndesiteFS", .product(name: "Markdown", package: "swift-markdown"), .product(name: "Crypto", package: "swift-crypto")]),
         .executableTarget(name: "AndesiteServer", dependencies: ["AndesiteCore", .product(name: "Hummingbird", package: "hummingbird")]),
         .testTarget(name: "AndesiteCoreTests", dependencies: ["AndesiteCore"])
     ], swiftLanguageModes: [.v6]

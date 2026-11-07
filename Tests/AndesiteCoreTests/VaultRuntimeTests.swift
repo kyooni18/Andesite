@@ -182,7 +182,7 @@ struct RuntimeFixture {
     #expect(try db.scalarText("PRAGMA user_version") == "999")
     #expect(try Data(contentsOf: f.vault.appendingPathComponent("a.md")) == Data("# After\nnewtoken".utf8))
     #expect(try Data(contentsOf: f.vault.appendingPathComponent("b.md")) == Data("# Discovered\nnewfiletoken".utf8))
-    try db.execute("PRAGMA user_version=5")
+    try db.execute("PRAGMA user_version=6")
     // A failed startup did not retain ownership.
     let finalOpen = try VaultRuntime(configuration: f.configuration)
     try finalOpen.shutdown()

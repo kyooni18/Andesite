@@ -103,7 +103,7 @@ private extension RuntimeFixture {
     #expect(recreated.count == 3)
     #expect(Set(recreated.map(\.entryID)).count == 2)
     #expect(try db.scalarText("SELECT count(*) FROM revisions") == "4")
-    #expect(try db.scalarText("SELECT next_seq FROM vaults") == "5")
+    #expect(try db.scalarText("SELECT next_seq FROM vaults") == "6")
     try runtime.shutdown()
     let reopened = try VaultRuntime(configuration: f.configuration)
     #expect(try reopened.snapshots(entryID: initial.entryID).count == 2)
@@ -264,7 +264,7 @@ private extension RuntimeFixture {
     try restarted.shutdown()
 }
 
-@Test func snapshotExportIntegrityRetentionAndRestorationRefusal() throws {
+@Test func snapshotExportIntegrityRetentionAndRestorationValidation() throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     let start = Date()
     let bytes = Data("# Café\r\noriginal\r\n".utf8)
@@ -296,7 +296,11 @@ private extension RuntimeFixture {
     let targetLink = f.root.appendingPathComponent("target.md")
     try FileManager.default.createSymbolicLink(at: targetLink, withDestinationURL: f.vault.appendingPathComponent("a.md"))
     #expect(throws: SnapshotError.unsafeExport) { try runtime.exportSnapshot(first.id, to: targetLink.path) }
-    #expect(throws: SnapshotError.restorationRequiresMutationJournal) { try runtime.restoreSnapshot(first.id) }
+    #if canImport(Darwin)
+    #expect(try runtime.restoreSnapshot(first.id).state == "completed")
+    #else
+    #expect(throws: MutationError.self) { try runtime.restoreSnapshot(first.id) }
+    #endif
     #expect(try Data(contentsOf: f.vault.appendingPathComponent("a.md")) == bytes)
     // Byte-wise comparison must distinguish canonically equivalent UTF-8.
     try f.write("a.md", "# Cafe\u{301}\r\noriginal\r\n")
@@ -325,6 +329,7 @@ private extension RuntimeFixture {
     let db = try f.database()
     // Fixture for an actual v4 operational catalog: no recovery tables existed.
     // These test-only drops remove empty new tables, never operational history.
+    try db.execute("DROP TABLE mutation_journal")
     try db.execute("DROP TABLE recovery_snapshots")
     try db.execute("DROP TABLE snapshot_policy")
     try db.execute("PRAGMA user_version=4")
@@ -339,7 +344,7 @@ private extension RuntimeFixture {
     #expect(throws: ExternalCaptureError.invalidMarkdown) { try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: identity, path: path, maximumBytes: 1024, debounce: 0) }
     let upgraded = try VaultRuntime(configuration: f.configuration)
     #expect(upgraded.vaultID == identity)
-    #expect(try db.scalarText("PRAGMA user_version") == "5")
+    #expect(try db.scalarText("PRAGMA user_version") == "6")
     #expect(try upgraded.status().revisions == 2 && upgraded.status().openIncidents == 1)
     let snapshot = try #require(upgraded.snapshots().first)
     #expect(snapshot.reason == "recovery" && snapshot.entryID == old.entryID)

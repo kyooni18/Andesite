@@ -9,7 +9,7 @@ public enum CatalogMigrationError: Error, Equatable {
 /// safe to use as a sync service until journal/recovery and the remaining tables
 /// are implemented. Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 5
+    public static let currentVersion = 6
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -46,6 +46,25 @@ public enum CatalogSchema {
                 for statement in versionFive { try db.execute(statement) }
                 try db.execute("PRAGMA user_version=5")
             }
+            if version < 6 {
+                try db.execute("""
+                    CREATE TABLE mutation_journal (
+                      vault_id BLOB NOT NULL REFERENCES vaults(id), id BLOB NOT NULL CHECK(length(id)=16),
+                      entry_id BLOB NOT NULL, snapshot_id BLOB NOT NULL, preimage_id BLOB NOT NULL,
+                      parent_revision BLOB NOT NULL, revision_id BLOB NOT NULL CHECK(length(revision_id)=16),
+                      path TEXT NOT NULL, artifact TEXT NOT NULL, original_hint BLOB NOT NULL,
+                      stage_hint BLOB, directories BLOB NOT NULL,
+                      state TEXT NOT NULL CHECK(state IN ('prepared','staged','published','catalogued','completed','cancelled','quarantined')),
+                      diagnostic TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
+                      PRIMARY KEY(vault_id,id),
+                      FOREIGN KEY(vault_id,entry_id) REFERENCES entries(vault_id,id),
+                      FOREIGN KEY(vault_id,snapshot_id) REFERENCES recovery_snapshots(vault_id,id),
+                      FOREIGN KEY(vault_id,preimage_id) REFERENCES recovery_snapshots(vault_id,id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("CREATE INDEX mutation_journal_state ON mutation_journal(vault_id,state)")
+            }
+            if version < 6 { try db.execute("PRAGMA user_version=6") }
         }
     }
 

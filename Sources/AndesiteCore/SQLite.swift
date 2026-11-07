@@ -39,6 +39,10 @@ public final class SQLiteConnection {
                 throw SQLiteFailure(code: SQLITE_ERROR, message: "WAL unavailable")
             }
             try execute("PRAGMA synchronous=FULL")
+            #if canImport(Darwin)
+            try execute("PRAGMA fullfsync=ON")
+            try execute("PRAGMA checkpoint_fullfsync=ON")
+            #endif
             // Exercise the actual FTS5 implementation, not a compile-option guess.
             try execute("CREATE VIRTUAL TABLE temp.andesite_fts_probe USING fts5(content)")
             try execute("DROP TABLE temp.andesite_fts_probe")

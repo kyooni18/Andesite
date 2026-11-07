@@ -16,20 +16,21 @@ public struct SearchIndexHit: Equatable, Sendable {
 /// All database access must be serialized with catalog writes. Callers must
 /// parse immutable revision bytes off the network event loop.
 public enum SearchIndex {
-    public static func index(db: SQLiteConnection, vaultID: Data, entryID: Data, revisionID: Data, bytes: Data) throws {
+    public static func index(db: SQLiteConnection, vaultID: Data, entryID: Data, revisionID: Data, bytes: Data, withinTransaction: Bool = false) throws {
         guard vaultID.count == 16, entryID.count == 16, revisionID.count == 16 else { throw SearchIndexError.invalidIdentifier }
         let facts = try MarkdownAnalyzer.analyze(bytes)
         guard let body = String(data: bytes, encoding: .utf8) else { throw MarkdownAnalysisError.invalidUTF8 }
         let title = facts.headings.first?.text ?? ""
         let vaultKey = vaultID.map { String(format: "%02x", $0) }.joined()
         let entryKey = entryID.map { String(format: "%02x", $0) }.joined()
-        try db.transaction {
+        let publish = {
             let rows = try db.queryValues("SELECT head_revision FROM entries WHERE vault_id=? AND id=? AND state='live' AND kind='markdown'", bindings: [.blob(vaultID), .blob(entryID)])
             guard rows == [[.blob(revisionID)]] else { throw SearchIndexError.staleRevision }
             try db.executeValues("INSERT INTO document_metadata(vault_id,entry_id,indexed_revision,title) VALUES(?,?,?,?) ON CONFLICT(vault_id,entry_id) DO UPDATE SET indexed_revision=excluded.indexed_revision,title=excluded.title", bindings: [.blob(vaultID), .blob(entryID), .blob(revisionID), .text(title)])
             try db.executeValues("DELETE FROM document_fts WHERE vault_id=? AND entry_id=?", bindings: [.text(vaultKey), .text(entryKey)])
             try db.executeValues("INSERT INTO document_fts(vault_id,entry_id,title,body) VALUES(?,?,?,?)", bindings: [.text(vaultKey), .text(entryKey), .text(title), .text(body)])
         }
+        if withinTransaction { try publish() } else { try db.transaction(publish) }
     }
 
     /// Interprets the query as a literal FTS phrase, not FTS operator syntax.
