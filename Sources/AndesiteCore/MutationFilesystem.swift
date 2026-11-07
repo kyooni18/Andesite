@@ -14,7 +14,7 @@ public enum MutationError: Error, CustomStringConvertible {
         switch self {
         case .conflict(let message): return "Restoration conflict: \(message). Inspect mutation-journal; preserve journal artifacts and use snapshot-export for manual recovery."
         case .unfinished: return "Unresolved mutation journal; ordinary reconciliation/restoration is blocked. Inspect mutation-journal and export snapshots; do not remove retained artifacts."
-        case .unsupportedPlatform: return "In-place restoration requires qualified macOS metadata/exchange semantics; use snapshot-export on this platform."
+        case .unsupportedPlatform: return "In-place restoration requires local macOS/APFS vault and state with qualified metadata/exchange semantics; use snapshot-export on this platform."
         }
     }
 }
@@ -60,6 +60,12 @@ final class MutationFilesystem {
         directory = fd; identities = chain
     }
     deinit { close(directory) }
+    static func requireSupportedDirectory(_ path: String) throws {
+        let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw MutationError.unsupportedPlatform }
+        defer { close(fd) }
+        guard andesite_supported_filesystem(fd) == 1 else { throw MutationError.unsupportedPlatform }
+    }
     func verifyChain() throws {
         _ = try MutationFilesystem(root: rootPath, path: path, expected: identities)
     }

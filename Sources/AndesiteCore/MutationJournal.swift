@@ -35,6 +35,7 @@ final class MutationJournal {
     let objects: ObjectStore
     let vaultID: Data
     let root: String
+    let stateRoot: String
     let maximumBytes: Int
     var fault: (String) throws -> Void = { point in
         // Deliberately opt-in, deterministic process-death harness. Never reads
@@ -44,8 +45,8 @@ final class MutationJournal {
             kill(getpid(), SIGKILL)
         }
     }
-    init(db: SQLiteConnection, objects: ObjectStore, vaultID: Data, root: String, maximumBytes: Int) {
-        self.db = db; self.objects = objects; self.vaultID = vaultID; self.root = root; self.maximumBytes = maximumBytes
+    init(db: SQLiteConnection, objects: ObjectStore, vaultID: Data, root: String, stateRoot: String, maximumBytes: Int) {
+        self.db = db; self.objects = objects; self.vaultID = vaultID; self.root = root; self.stateRoot = stateRoot; self.maximumBytes = maximumBytes
     }
     func records() throws -> [Record] {
         try db.queryValues("""
@@ -70,8 +71,15 @@ final class MutationJournal {
         }
     }
     static func hex(_ bytes: Data) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
+    func hasUnfinished() throws -> Bool {
+        try records().contains { !["completed", "cancelled"].contains($0.operation.state) }
+    }
     func assertResolved() throws {
-        guard try records().allSatisfy({ ["completed", "cancelled"].contains($0.operation.state) }) else { throw MutationError.unfinished }
+        if try hasUnfinished() { throw MutationError.unfinished }
+    }
+    func requireDurableStorage() throws {
+        try MutationFilesystem.requireSupportedDirectory(stateRoot)
+        try MutationFilesystem.requireSupportedDirectory(stateRoot + "/objects")
     }
     func snapshot(_ id: Data) throws -> (RecoverySnapshot, Data) {
         guard let s = try RecoverySnapshots.list(db: db, vaultID: vaultID, snapshotID: id).first else { throw SnapshotError.notFound }
@@ -120,6 +128,7 @@ final class MutationJournal {
         throw MutationError.unsupportedPlatform
         #else
         try assertResolved()
+        try requireDurableStorage()
         let (snapshot, replacement) = try snapshot(id)
         let rows = try db.queryValues("""
             SELECT e.path,e.head_revision,e.fs_hint,r.content_hash FROM entries e JOIN revisions r
@@ -163,11 +172,15 @@ final class MutationJournal {
         try db.transaction {
             try fs.verifyChain()
             let current = try fs.observe(fs.name, maximumBytes: maximumBytes)
+            let stagedBytes = try fs.observe(artifact, maximumBytes: maximumBytes)
             guard current.fingerprint == original, current.bytes == observation.bytes,
-                  try fs.observe(artifact, maximumBytes: maximumBytes).fingerprint == staged else { throw MutationError.conflict("external edit before publication") }
+                  stagedBytes.fingerprint == staged, stagedBytes.bytes == replacement else { throw MutationError.conflict("external edit or damaged stage before publication") }
             try fault("before-exchange")
             // Revalidate after a deterministic test hook as well.
-            guard try fs.observe(fs.name, maximumBytes: maximumBytes).fingerprint == original else { throw MutationError.conflict("external edit at publication boundary") }
+            let finalTarget = try fs.observe(fs.name, maximumBytes: maximumBytes)
+            let finalStage = try fs.observe(artifact, maximumBytes: maximumBytes)
+            guard finalTarget.fingerprint == original, finalTarget.bytes == observation.bytes,
+                  finalStage.fingerprint == staged, finalStage.bytes == replacement else { throw MutationError.conflict("external edit at publication boundary") }
             try fs.exchange(artifact: artifact)
             try fault("exchanged")
             try fs.syncPublished()
@@ -197,7 +210,7 @@ final class MutationJournal {
     func publishCatalog(_ record: Record, fs: MutationFilesystem) throws {
         try verifyPublished(record, fs: fs)
         let observed = try fs.observe(fs.name, maximumBytes: maximumBytes)
-        guard observed.fingerprint.sameInode(as: record.stage!), observed.bytes == (try snapshot(record.operation.snapshotID).1) else { throw MutationError.conflict("target changed before catalog publication") }
+        guard let stage = record.stage, observed.fingerprint.sameInode(as: stage), observed.bytes == (try snapshot(record.operation.snapshotID).1) else { throw MutationError.conflict("target changed before catalog publication") }
         let p = try ExternalCapture.prepare(path: VaultPath(record.operation.path), observation: observed, objects: objects)
         try fault("before-catalog")
         try db.transaction {
@@ -220,7 +233,9 @@ final class MutationJournal {
     /// No restart ever retries an unpublished exchange. Already-visible exchange
     /// is redone only in the catalog with its preallocated revision ID.
     func recover() throws {
-        for record in try records() {
+        let pending = try records()
+        if !pending.isEmpty { try requireDurableStorage() }
+        for record in pending {
             if record.operation.state == "quarantined" { continue }
             do {
                 let fs = try filesystem(path: record.operation.path, expected: record.directories)
@@ -240,6 +255,7 @@ final class MutationJournal {
                     let target = try fs.observe(fs.name, maximumBytes: maximumBytes)
                     let artifact = try fs.observe(record.operation.artifact, maximumBytes: maximumBytes)
                     if record.operation.state == "staged", target.fingerprint == record.original,
+                       target.bytes == (try snapshot(record.operation.preimageID).1),
                        artifact.fingerprint == stage, artifact.bytes == (try snapshot(record.operation.snapshotID).1) {
                         try db.transaction { try setState(record, "cancelled", "Staged but not published; source not modified by recovery") }
                     } else {
@@ -253,7 +269,11 @@ final class MutationJournal {
                 default: throw VaultRuntimeError.inconsistentCatalog
                 }
             } catch let error as SQLiteFailure { throw error } // A busy/failed DB is not an FS conflict.
-            catch {
+            catch let error as MutationError {
+                // MutationError messages are authored here and contain no file
+                // bytes. Keep the specific conflict cause useful to operators.
+                try db.transaction { try setState(record, "quarantined", error.description) }
+            } catch {
                 // Diagnostics are fixed descriptions, never file contents.
                 try db.transaction { try setState(record, "quarantined", "Filesystem/object/identity verification failed; retained artifact and immutable preimage require manual review") }
             }

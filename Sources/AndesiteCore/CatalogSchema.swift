@@ -6,8 +6,8 @@ public enum CatalogMigrationError: Error, Equatable {
 }
 
 /// Initial catalog subset. Migrations do not touch vault files. A catalog is not
-/// safe to use as a sync service until journal/recovery and the remaining tables
-/// are implemented. Call only with exclusive process ownership and a backup.
+/// safe to use as a sync service until general operations/recovery and the
+/// remaining protocol tables are implemented (the local restore journal is v6). Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
     public static let currentVersion = 6
 
@@ -51,12 +51,13 @@ public enum CatalogSchema {
                     CREATE TABLE mutation_journal (
                       vault_id BLOB NOT NULL REFERENCES vaults(id), id BLOB NOT NULL CHECK(length(id)=16),
                       entry_id BLOB NOT NULL, snapshot_id BLOB NOT NULL, preimage_id BLOB NOT NULL,
-                      parent_revision BLOB NOT NULL, revision_id BLOB NOT NULL CHECK(length(revision_id)=16),
+                      parent_revision BLOB NOT NULL CHECK(length(parent_revision)=16), revision_id BLOB NOT NULL CHECK(length(revision_id)=16),
                       path TEXT NOT NULL, artifact TEXT NOT NULL, original_hint BLOB NOT NULL,
                       stage_hint BLOB, directories BLOB NOT NULL,
                       state TEXT NOT NULL CHECK(state IN ('prepared','staged','published','catalogued','completed','cancelled','quarantined')),
                       diagnostic TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
-                      PRIMARY KEY(vault_id,id),
+                      PRIMARY KEY(vault_id,id), UNIQUE(vault_id,revision_id),
+                      FOREIGN KEY(vault_id,parent_revision) REFERENCES revisions(vault_id,revision_id),
                       FOREIGN KEY(vault_id,entry_id) REFERENCES entries(vault_id,id),
                       FOREIGN KEY(vault_id,snapshot_id) REFERENCES recovery_snapshots(vault_id,id),
                       FOREIGN KEY(vault_id,preimage_id) REFERENCES recovery_snapshots(vault_id,id)

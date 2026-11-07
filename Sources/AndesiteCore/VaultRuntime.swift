@@ -61,7 +61,7 @@ public final class VaultRuntime {
     private func journal() throws -> MutationJournal {
         guard let r = resources else { throw VaultRuntimeError.closed }
         let journal = MutationJournal(db: r.db, objects: r.objects, vaultID: vaultID,
-            root: configuration.vaultDirectory, maximumBytes: configuration.maximumBytes)
+            root: configuration.vaultDirectory, stateRoot: configuration.stateDirectory, maximumBytes: configuration.maximumBytes)
         if let mutationFault { journal.fault = mutationFault }
         return journal
     }
@@ -118,12 +118,11 @@ public final class VaultRuntime {
             try RecoverySnapshots.configure(db: db, vaultID: id, policy: SnapshotPolicy())
         }
         _ = try RecoverySnapshots.policy(db: db, vaultID: id)
-        // Recover capture -> snapshot-registration interruptions before a new
-        // observation can advance the head. This never reads current vault bytes.
+        // Resolve source/catalog publication first. Then recover the separate
+        // capture -> snapshot-registration window without observing newer bytes.
         try journal().recover()
-        if (try? journal().assertResolved()) != nil {
-            _ = try flushSnapshotHeads(at: Date(), reason: "recovery")
-        } else { try setState("quarantined") }
+        if try journal().hasUnfinished() { try setState("quarantined") }
+        else { _ = try flushSnapshotHeads(at: Date(), reason: "recovery") }
         let directory = open(state, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard directory >= 0 else { throw VaultRuntimeError.unsafeState }
         defer { close(directory) }
@@ -136,7 +135,7 @@ public final class VaultRuntime {
     public func shutdown(at date: Date = Date()) throws {
         guard resources != nil else { return }
         defer { resources = nil; processLock = nil }
-        if (try? journal().assertResolved()) != nil { _ = try flushSnapshots(at: date) }
+        if try !journal().hasUnfinished() { _ = try flushSnapshots(at: date) }
     }
 
     deinit { resources = nil; processLock = nil }
