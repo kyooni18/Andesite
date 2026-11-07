@@ -1,7 +1,8 @@
 # Andesite — integrated local backend (experimental)
 
 A Swift 6 headless Markdown vault backend. **Local CLI ingestion, search,
-per-file recovery snapshots, tombstones and conservative external moves work
+per-file recovery snapshots, journaled in-place restoration (macOS/APFS),
+tombstones and conservative external moves work
 end-to-end. HTTP serving, authentication and sync are not implemented.**
 Use temporary test vaults, not production notes; filesystem/power-loss
 qualification and full v1 recovery remain outstanding.
@@ -57,7 +58,7 @@ A future HTTP layer can use this coordinator behind serialized blocking offload.
   Foundation Unicode case folding (POSIX locale). Unicode filenames work;
   invalid UTF-8, controls, traversal, backslashes and `.andesite*` scan names
   are rejected. This is not yet a version-pinned cross-platform Unicode table.
-* Files are canonical and never rewritten. Two bounded byte/metadata reads
+* Ordinary observation never rewrites canonical files. Two bounded byte/metadata reads
   capture observations. New/changed bytes become durable SHA-256 objects,
   random stable document IDs, parent-linked revisions and ordered changes.
   Unchanged bytes do not allocate revisions or change sequences; a verified
@@ -75,7 +76,8 @@ A future HTTP layer can use this coordinator behind serialized blocking offload.
 Snapshots are complete files, not diffs. Metadata is in the private state's
 SQLite catalog and contents reference the existing immutable SHA-256 objects in
 `state/objects`. Identical content is shared across revisions, snapshots and
-incidents; no second snapshot-content directory or vault sidecars are created.
+incidents; no second snapshot-content directory is created. Journaled restoration
+retains a hidden displaced-inode artifact in the destination directory (see below).
 
 * First valid Markdown capture creates an initial snapshot. Ordinary snapshots
   of changed content are spaced by **at least 300 seconds per document** by
@@ -107,6 +109,8 @@ UUIDs are also accepted. Use `snapshots` without a selector to discover IDs.
 .build/debug/andesite-server snapshot-inspect --vault "$sample/vault" --state "$sample/state" SNAPSHOT_ID
 .build/debug/andesite-server snapshot-compare --vault "$sample/vault" --state "$sample/state" OLD_ID NEW_ID
 .build/debug/andesite-server snapshot-export --vault "$sample/vault" --state "$sample/state" SNAPSHOT_ID "$sample/recovered.md"
+.build/debug/andesite-server snapshot-restore --vault "$sample/vault" --state "$sample/state" SNAPSHOT_ID --in-place
+.build/debug/andesite-server mutation-journal --vault "$sample/vault" --state "$sample/state"
 .build/debug/andesite-server snapshot-storage --vault "$sample/vault" --state "$sample/state"
 .build/debug/andesite-server snapshot-config --vault "$sample/vault" --state "$sample/state" 300 604800
 ```
@@ -120,17 +124,52 @@ following symlinks. Its parent directories must already exist and be safe.
 `pendingDocuments` in storage status counts observed heads awaiting snapshots;
 byte counts cover registered objects, not SQLite overhead or crash-created orphans.
 
-**In-place restore is intentionally deferred.**
-`snapshot-restore --vault ... --state ... SNAPSHOT_ID --in-place` explicitly
-fails with `restorationRequiresMutationJournal` and never writes source files.
-Export and review a snapshot now; do not treat export as an in-place restore.
-Before enabling overwrite, Andesite must journal the operation, preserve the
-current file as a preimage snapshot, and recover safely from every mutation phase.
+### Journaled in-place restoration
+
+`snapshot-restore --vault ... --state ... SNAPSHOT_ID --in-place` restores an
+**existing live Markdown document** at its current path, even if the snapshot
+was captured before a rename. Deleted documents are export-only. It refuses a
+changed target: first reconcile and review external edits before retrying.
+
+The current complete bytes are verified and committed as a **preimage snapshot**
+before any source mutation. Existing identical revision snapshots are reused;
+otherwise preimages bypass snapshot spacing/hash coalescing. Restoring even
+identical content creates a **new child revision**, never rewinds history.
+Restored bytes, revision, event, snapshot and FTS publication are consistent.
+Output identifies the document, supplier snapshot, preimage, new revision,
+operation and completion state. `status` includes `unfinishedMutations`.
+
+A persistent schema-v6 journal separates SQLite commits from filesystem
+publication: `prepared → staged → published → catalogued → completed`. On
+restart, unpublished work is cancelled; verified, already-published work finishes
+idempotently. Ambiguity is **quarantined**, blocking reconciliation/search/new
+restores while snapshot inspection/export and `mutation-journal` remain available.
+There is no automatic destructive rollback or conflict-resolution command.
+
+Restoration uses no-follow descriptor-relative traversal, exclusive same-directory
+staging, metadata copying, atomic **exchange**, file durability barriers and
+parent-directory synchronization. The displaced inode remains at
+`.andesite-mutation-OPERATION_ID` indefinitely, including after success: do not
+remove or edit these artifacts. Only exact journal-owned paths/inodes are ignored
+by ordinary read-only scans. They can consume space equal to the preimage (not
+included in `snapshot-storage`). Moving their parent directory currently requires
+manual recovery review; moving the restored file itself remains supported.
+
+**Platform/concurrency limits:** in-place restoration is currently enabled only
+when vault and state use local **macOS/APFS**. Linux and other filesystems fail closed; export remains
+available. Atomic exchange is **not a content compare-and-swap**: stat/hash checks
+cannot exclude an external edit in the final syscall window or writes through an
+already-open descriptor. Detected changes retain evidence and quarantine; the
+original/displaced inode is never automatically deleted. A completed operation
+means verified at completion, not immunity to later edits. Keep backups.
+Filesystem namespace ownership and private state must remain trusted. See the
+[technical contract](docs/andesite-file-recovery.md#mutation-journal-and-restoration)
+for recovery states, handling conflicts and remaining limits.
 
 ## Recovery contract and limits
 
-This milestone introduces **observation-only recovery**, not the v1 mutation
-journal. No runtime operation writes source vault files.
+Ordinary reconciliation remains read-only. Only explicit journaled restoration
+mutates source files; it is a local subset, not the full v1 mutation service.
 
 * Object contents and directory are synced before catalog references are
   committed. Per-file revision/head/object metadata/event/sequence publication
@@ -140,7 +179,7 @@ journal. No runtime operation writes source vault files.
   retries idempotently; unchanged heads are reused. The final namespace is
   checked again, but edits after an observation can only be captured next time.
   Unobserved intermediate editor versions cannot be recovered.
-* Index publication is a separate rebuildable transaction. A crash between
+* For external observations, index publication is a separate rebuildable transaction. A crash between
   capture and indexing leaves a stale index excluded by the head check; the
   next reconciliation reindexes verified heads. Runtime search cannot bypass
   reconciliation. Direct primitives still require their documented ownership
@@ -174,10 +213,12 @@ journal. No runtime operation writes source vault files.
   same vault twice. State directories must remain trusted and not be mutated
   by other processes. Network filesystems and concurrent state manipulation
   are unsupported. Directory fsync is required; power-loss durability has not
-  been experimentally qualified. This is not a coherent online backup tool.
+  been experimentally qualified. Actual SIGKILL/restart recovery is tested, not
+  physical power loss. This is not a coherent online backup tool.
 
-Not implemented: watchers, automatic retries, server writes/mutation-journal
-recovery, in-place restore, attachment scanning, quotas/GC, authentication,
+Not implemented: watchers, automatic mutation retries, Linux in-place restoration,
+quarantine resolution/artifact retirement, general-purpose server mutations,
+attachment scanning, quotas/GC, authentication,
 HTTP API, full-vault sync manifests/cursors/offline synchronization or web client.
 Invalid UTF-8 bytes remain incident history, not valid Markdown snapshots; a file
 that was never valid has no document snapshot yet. The basic
@@ -210,3 +251,20 @@ migration. `docs/andesite-server-spec.md` and
 `docs/andesite-protocol-v1.schema.json` describe the **planned** v1 HTTP/sync
 contract, not an implemented listener. Their 24-hour full-vault sync snapshots are
 not these 7-day individual-file recovery snapshots.
+
+## Verification and next work
+
+`swift build` and `swift test` pass on the development macOS/APFS host: **26 tests**
+(the original 21 plus five focused journal tests). The journal matrix terminates
+real CLI subprocesses with **SIGKILL at 16 lifecycle points**, including inside
+SQLite transactions and immediately after exchange; additional cases kill during
+startup redo and introduce post-publication external/open-descriptor writes.
+Repeated restarts check stable history counts, exact bytes, SQLite integrity and
+foreign keys. Other cases cover preimages, lineage, identical/repeated restores,
+Unicode/nested renamed paths, search, permissions/xattrs, unsafe paths, lock
+conflicts, corrupt/missing objects and catalog/index publication failure.
+
+Recommended next milestone: explicit, non-destructive quarantine resolution and
+artifact lifecycle/relocation, Linux metadata qualification and cross-platform
+fault CI. Qualify physical power-loss/storage behavior separately before adding
+continuous watchers or mutation HTTP APIs.
