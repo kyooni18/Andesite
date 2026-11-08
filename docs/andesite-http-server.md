@@ -44,12 +44,23 @@ before Hummingbird binds TCP.
 
 | Path | Result |
 | --- | --- |
+| `/v1/documents?limit=50&offset=0` | Paginated live Markdown document metadata and stable IDs |
+| `/v1/documents/ID` | Indexed head metadata, headings, Markdown destinations and lexical wikilinks |
+| `/v1/documents/ID/content` | Current immutable Markdown bytes (up to 1 MiB) |
 | `/v1/status` | Vault catalog/readiness |
 | `/v1/search?q=phrase&limit=50` | FTS hits with stable document/revision IDs |
 | `/v1/snapshots?path=note.md&limit=50&offset=0` | Snapshot history metadata |
 | `/v1/snapshots?document=ID` | History of one document |
 | `/v1/snapshots/ID` | Verified snapshot metadata |
 | `/v1/snapshots/ID/content` | Verified Markdown bytes, at most 1 MiB |
+
+Document listing is path-sorted. Detail extraction exposes raw
+CommonMark headings and link syntax, including Obsidian wikilinks, embeds,
+aliases and anchors, but **does not resolve target files or backlinks**.
+Document structure extraction is limited to notes of at most 256 KiB,
+and caps each list at 256 entries with a structureTruncated flag. For notes
+larger than 1 MiB, metadata is available but body retrieval is unavailable. Compare gaps in the
+[Obsidian parity register](obsidian-compatibility.md).
 
 The payload format and resource limits follow the existing
 [private Unix-socket API](andesite-local-http.md).

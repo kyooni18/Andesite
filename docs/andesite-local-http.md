@@ -52,6 +52,9 @@ network listener.
 | Endpoint | Result |
 | --- | --- |
 | `/v1/status` | Catalog state, counts, open incidents, unfinished mutations, indexed readiness |
+| `/v1/documents?limit=50&offset=0` | Paginated current Markdown heads |
+| `/v1/documents/ID` | Current metadata, headings and raw link syntax |
+| `/v1/documents/ID/content` | Exact current immutable Markdown bytes up to 1 MiB |
 | `/v1/search?q=phrase&limit=50` | Literal-phrase search hit IDs, revision IDs and heading titles |
 | `/v1/snapshots?path=note.md&limit=50&offset=0` | Newest-first snapshot metadata and pagination counts |
 | `/v1/snapshots?document=ID` | Snapshot history for a stable document ID |
