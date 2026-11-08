@@ -128,8 +128,11 @@ contains CommonMark headings and lexical links; linked backlinks are
 resolved against the current indexed note IDs. A coalescing work
 scheduler runs file reconciliation before disposable cached link-graph
 updates; GET requests page in-memory data without reparsing notes.
-Obsidian unlinked mentions, full Properties, rename rewrites and
-large-Vault parity remain unimplemented.
+Obsidian-compatible YAML frontmatter properties (typed values), inline
+and nested tags, and the corresponding SQLite metadata indexes and
+filters are now supported at the backend level. The Obsidian property
+editor/UI, advanced query expressions, unlinked mentions, rename
+rewrites and large-Vault parity remain unimplemented.
 
 From a separate local client, the same-user Unix socket supports:
 
@@ -139,6 +142,11 @@ python3 scripts/andesite-api.py --state /absolute/private/state document DOCUMEN
 python3 scripts/andesite-api.py --state /absolute/private/state document-content DOCUMENT_ID
 python3 scripts/andesite-api.py --state /absolute/private/state links DOCUMENT_ID
 python3 scripts/andesite-api.py --state /absolute/private/state backlinks DOCUMENT_ID
+python3 scripts/andesite-api.py --state /absolute/private/state tags
+python3 scripts/andesite-api.py --state /absolute/private/state properties
+python3 scripts/andesite-api.py --state /absolute/private/state document-properties DOCUMENT_ID
+python3 scripts/andesite-api.py --state /absolute/private/state documents --tag project
+python3 scripts/andesite-api.py --state /absolute/private/state search phrase --property priority --value 5
 ```
 
 No LAN listener, CORS, TLS, remote auth, file creation/deletion API,
@@ -149,6 +157,10 @@ Track what still differs from Obsidian in the
 The [work scheduler design](docs/andesite-work-queue.md) explains
 immediate filesystem edits, deferred indexing, priority and cache
 invalidation without a second SQLite owner.
+See [Obsidian YAML Properties and tags](docs/andesite-obsidian-metadata.md)
+for supported property types, tag hierarchies, search operators,
+migration behavior, and the remaining editor compatibility gaps.
+Canvas and Bases are intentionally postponed.
 The first authorized edit route is
 PUT /v1/documents/ID/content with a required exact If-Match revision,
 limited to 256 KiB. Existing Markdown notes are journaled through the
@@ -461,8 +473,9 @@ The macOS-only Unix-socket API authorizes same-UID peers; it does not implement
 the planned multi-user, remotely authenticated v1 API.
 Invalid UTF-8 bytes remain incident history, not valid Markdown snapshots; a file
 that was never valid has no document snapshot yet. The basic
-extractor lacks complete v1 frontmatter/wiki syntax/tags/link resolution,
-unlinked mentions, snippets, advanced search pagination and index generations.
+extractor now supports typed YAML frontmatter and indexed inline/YAML
+tags, but lacks complete Obsidian Markdown extensions, link resolution,
+unlinked mentions, snippets, advanced search syntax and index generations.
 
 The [milestone engineering report](docs/andesite-quarantine-milestone.md) records
 implementation decisions, verified boundaries and remaining risks.
@@ -470,17 +483,18 @@ implementation decisions, verified boundaries and remaining risks.
 ## Verification and next milestone
 
 `swift build` and `swift test` pass on the macOS/APFS development host with
-**76 tests** (67 prior plus three cooperative-cache and six
-conditional-edit/journal/API tests). They exercise FSEvents, snapshot promotion, durable mutation recovery,
+**85 tests** (76 prior plus nine YAML frontmatter/tag/search and
+migration/HTTP compatibility tests). They exercise FSEvents, snapshot promotion, durable mutation recovery,
 same-UID HTTP access, live document heads, pagination, immutable
 content, syntax-only Obsidian links, and safe preservation of
 the .obsidian, .trash and .git folders.
 Prior journal/recovery SIGKILL tests remain in the suite. Additional watcher
 smoke tests use only temporary vaults and preserve source bytes.
 
-Next: verified crash-safe file creation/deletion and rename semantics,
-Obsidian-complete heading/block anchors, unlinked mentions and typed
-Properties/frontmatter. Large-Vault cache limits, Bases/Canvas, cross-volume
-migration and Linux inotify remain separate priorities.
+Next: journal-backed file creation/deletion/rename, Obsidian-complete
+heading/block links and unlinked mentions, and typed Properties/tag
+editing in the eventual UI. Canvas and Bases are deferred by design.
+Large-Vault cache budgets, cross-volume migration and Linux inotify
+remain separate priorities.
 Network HTTP mutations, remote sync, physical power-loss qualification
 and object garbage collection remain separate milestones.

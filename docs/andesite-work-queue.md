@@ -24,6 +24,12 @@ contracts and are not exposed over HTTP.
 2. Register due recovery snapshots.
 3. Build or refresh the disposable, derived link cache.
 
+Frontmatter, property and tag projections are committed as part of the
+durable per-revision FTS indexing step (1), rather than lazily parsing
+each HTTP GET. On a v8-v9 upgrade, missing metadata is backfilled from
+immutable current head objects during the first successful reconciliation.
+Only the link graph remains a disposable memory cache.
+
 A burst of thousands of events produces one pending scan and at most one
 pending cache refresh. Existing 400 ms debounce, 2-second hard coalescing,
 300-second fallback scan, and bounded scan/cache retries remain in place.

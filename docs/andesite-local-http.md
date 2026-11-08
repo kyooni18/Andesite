@@ -52,6 +52,9 @@ network listener.
 | Endpoint | Result |
 | --- | --- |
 | `/v1/status` | Catalog state, counts, open incidents, unfinished mutations, indexed readiness |
+| `/v1/tags?limit=50&offset=0` | Distinct canonical YAML/inline tags with document counts |
+| `/v1/properties?limit=50&offset=0` | YAML property keys, observed type lists and document counts |
+| `/v1/documents/ID/properties` | Revision-aligned typed properties and tags |
 | `/v1/documents?limit=50&offset=0` | Paginated current Markdown heads |
 | `/v1/documents/ID` | Current metadata, headings and raw link syntax |
 | `/v1/documents/ID/content` | Exact current immutable Markdown bytes up to 1 MiB |
@@ -120,3 +123,10 @@ A single, exact-revision conditional PUT is available at
 /v1/documents/ID/content, accepting at most 256 KiB of Markdown.
 It is processed on the VaultRuntime owner thread and uses the existing
 durable mutation journal. See [conditional edit and recovery](andesite-conditional-edit.md). Other writes are rejected.
+
+Typed YAML frontmatter and nested/inline Unicode tags are indexed with
+the same current head revision as FTS. Document listing and search support
+tag, property and value selectors. The query string additionally supports
+a bounded tag:#project and [property:value] search subset. See
+[Obsidian metadata API](andesite-obsidian-metadata.md); no source YAML
+is modified by GET requests.

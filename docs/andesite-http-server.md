@@ -45,13 +45,16 @@ before Hummingbird binds TCP.
 
 | Path | Result |
 | --- | --- |
-| `/v1/documents?limit=50&offset=0` | Paginated live Markdown document metadata and stable IDs |
+| `/v1/documents?limit=50&offset=0` | Paginated live Markdown document metadata and stable IDs; optional tag/property/value AND filters |
 | `/v1/documents/ID` | Indexed head metadata, headings, Markdown destinations and lexical wikilinks |
 | `/v1/documents/ID/content` | Current immutable Markdown bytes (up to 1 MiB) |
 | `/v1/documents/ID/links?limit=50&offset=0` | Outgoing lexical Markdown and wikilink references with conservative note/anchor resolution |
 | `/v1/documents/ID/backlinks?limit=50&offset=0` | Inbound resolved mentions from verified indexed Markdown notes, with pagination |
+| `/v1/tags?limit=50&offset=0` | Canonical frontmatter/inline tag summary with document counts |
+| `/v1/properties?limit=50&offset=0` | Indexed YAML property keys, observed types and document counts |
+| `/v1/documents/ID/properties` | Revision-aligned typed YAML properties, tags and diagnostics |
 | `/v1/status` | Vault catalog/readiness |
-| `/v1/search?q=phrase&limit=50` | FTS hits with stable document/revision IDs |
+| `/v1/search?q=phrase&limit=50` | FTS with optional tag/property/value filters, limited Obsidian tag:/[property:value] syntax |
 | `/v1/snapshots?path=note.md&limit=50&offset=0` | Snapshot history metadata |
 | `/v1/snapshots?document=ID` | History of one document |
 | `/v1/snapshots/ID` | Verified snapshot metadata |
@@ -103,6 +106,14 @@ unobserved external edits. The returned state has indexReady=false
 until the subsequent scan and cache jobs complete. All other mutating
 methods are rejected. See
 [conditional edit and recovery](andesite-conditional-edit.md).
+
+YAML metadata is derived from current immutable indexed Markdown heads.
+The Yams parser recognizes typed properties and normalized Unicode tags,
+with case-insensitive nested-tag matching. A v8-v9 migration backfills
+the metadata from historic immutable objects; no note is rewritten.
+Malformed YAML is flagged explicitly instead of indexing a partial map.
+Advanced Obsidian query expressions and the property editor are not
+implemented. Details: [Obsidian YAML, tags and query API](andesite-obsidian-metadata.md).
 
 The payload format and resource limits follow the existing
 [private Unix-socket API](andesite-local-http.md).
