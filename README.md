@@ -2,8 +2,8 @@
 
 A Swift 6 headless Markdown vault backend. **Local CLI ingestion, search,
 per-file recovery snapshots, journaled in-place restoration (macOS/APFS),
-tombstones and conservative external moves work
-end-to-end. HTTP serving, authentication and sync are not implemented.**
+tombstones, conservative external moves and continuous macOS FSEvents monitoring
+work end-to-end. HTTP serving, authentication and sync are not implemented.**
 Use temporary test vaults, not production notes; filesystem/power-loss
 qualification and full v1 recovery remain outstanding.
 
@@ -38,6 +38,34 @@ first, so an unsuccessful scan fails search rather than presenting an old
 index as current. Invalid UTF-8 Markdown is retained as an incident object;
 other valid files remain searchable. CLI prints entry IDs and heading titles.
 No arguments/unknown commands fail closed; no command opens a network listener.
+
+## Continuous monitoring (macOS)
+
+The `watch` command opens a real FSEvents stream **before** the startup full
+reconciliation, then runs on a single synchronous owner thread until SIGINT or
+SIGTERM. It owns the state lock for its entire lifetime:
+
+```sh
+.build/debug/andesite-server watch --vault "$sample/vault" --state "$sample/state"
+```
+
+File events (including loss/overflow hints) cause a **full secure rescan** through
+the existing `VaultRuntime.reconcile()`; FSEvents paths are not trusted as file
+identities. Events are coalesced for 400 ms (maximum 2 seconds), and a full
+fallback scan occurs every five minutes, including after relaunch. A separate
+15-second timer promotes already captured revisions to recovery snapshots once
+the per-document minimum snapshot interval has elapsed. A clean stop flushes
+pending captured content. No callback reads files or mutates the catalog.
+
+For opt-in background execution via a per-vault macOS LaunchAgent, see
+[watcher operations](docs/andesite-watcher.md). An agent is **not automatically
+installed**: explicitly choose a test vault and private state directory. While
+watching, separate `andesite-server` CLI operations on the same state directory
+are blocked by the exclusive lock; stop the watcher before using those commands.
+
+FSEvents is advisory; intermediate edits between scans are not guaranteed
+versions, and physical power-loss behavior is not qualified. Source Markdown
+is never modified by the watcher. There is no HTTP listener or sync service.
 
 ## What is integrated
 
@@ -261,7 +289,7 @@ mutate the vault; it is a local subset, not the full v1 mutation service.
   been experimentally qualified. Actual SIGKILL/restart recovery is tested, not
   physical power loss. This is not a coherent online backup tool.
 
-Not implemented: watchers, automatic mutation retries, Linux in-place restoration,
+Not implemented: Linux inotify monitoring, automatic mutation retries, Linux in-place restoration,
 general-purpose server mutations,
 attachment scanning, quotas/GC, authentication,
 HTTP API, full-vault sync manifests/cursors/offline synchronization or web client.
@@ -275,21 +303,15 @@ implementation decisions, verified boundaries and remaining risks.
 
 ## Verification and next milestone
 
-`swift build` and `swift test` pass on the development macOS/APFS host: **31 tests**,
-retaining all 26 prior tests and adding five focused recovery/maintenance tests.
-The suite executes real SIGKILL subprocesses at the original 16 restoration
-points and seven new resolution/retirement points, including transaction rollback,
-pinned evidence, repeated decisions, cleanup receipts, competing version exports,
-lineage/index/SQLite integrity, unsafe paths, relocation and storage accounting.
-All fixtures use temporary vaults and private state, never production notes.
-SIGKILL testing does **not** establish physical power-loss durability. Linux
-restoration, disk-full/flush/hardware fault qualification and cross-platform CI
-remain unqualified. Existing SwiftPM dependency/host SQLite deployment warnings
-are not restoration platform qualification.
+`swift build` and `swift test` pass on the macOS/APFS development host with
+**34 tests** (31 prior plus three watcher tests). The new tests exercise
+live FSEvents edit/move/creation/deletion, scheduled snapshot promotion,
+periodic full scans, SIGKILL downtime and startup re-observation.
+Prior journal/recovery SIGKILL tests remain in the suite. Additional watcher
+smoke tests use only temporary vaults and preserve source bytes.
 
-Next: introduce serialized continuous monitoring beginning with macOS FSEvents
-(full rescan on overflow/lost events), then Linux inotify. Keep the same
-reconciliation, immutable-capture and quarantine boundaries; no watcher should
-implicitly resolve a conflict or retire an artifact. Linux restoration needs a
-separate metadata/durability implementation and test qualification, not a rename
-fallback. HTTP APIs, authentication, remote sync and broad GC remain out of scope.
+Next: Linux inotify with the same scan/loss-recovery boundaries, fault
+qualification for file-event storms and unsupported filesystems, and a
+read-only API so clients can inspect the catalog while the exclusive watcher
+process owns it. HTTP mutations, remote sync, physical power-loss qualification
+and object garbage collection remain separate milestones.
