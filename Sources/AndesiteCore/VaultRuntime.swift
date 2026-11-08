@@ -56,6 +56,24 @@ public final class VaultRuntime {
     private var processLock: ProcessLock?
     private let configuration: VaultConfiguration
     public let vaultID: Data
+
+    /// Derived, disposable in-memory data. Only the VaultRuntime owner
+    /// touches it, never an FSEvents callback, NIO task or separate SQLite
+    /// connection. Reconciliation invalidates the published generation.
+    private var linkSnapshot: VaultLinkGraph.Snapshot?
+    private var linkCacheReady = false
+    private var linkCacheError: VaultLinkGraphError?
+    private var linkCacheBuildCount = 0
+
+    public struct LinkCacheReport: Sendable {
+        public let parsedDocuments: Int
+        public let reusedDocuments: Int
+        public let graphChanged: Bool
+        public let generation: Int
+    }
+
+    public var linksIndexed: Bool { linkCacheReady }
+    public var linkCacheGeneration: Int { linkCacheBuildCount }
     // Internal deterministic hooks for tests; never supplied by vault contents.
     var mutationFault: ((String) throws -> Void)?
     private func journal() throws -> MutationJournal {
@@ -156,11 +174,17 @@ public final class VaultRuntime {
     /// leave durable revisions from which scheduling resumes on reconciliation.
     public func shutdown(at date: Date = Date()) throws {
         guard resources != nil else { return }
-        defer { resources = nil; processLock = nil }
+        defer {
+            linkSnapshot = nil
+            linkCacheReady = false
+            linkCacheError = nil
+            resources = nil
+            processLock = nil
+        }
         if try !journal().hasUnfinished() { _ = try flushSnapshots(at: date) }
     }
 
-    deinit { resources = nil; processLock = nil }
+    deinit { linkSnapshot = nil; resources = nil; processLock = nil }
 
     public func status() throws -> VaultStatus {
         guard let r = resources else { throw VaultRuntimeError.closed }
@@ -210,8 +234,57 @@ public final class VaultRuntime {
         return try DocumentCatalog.content(objects: r.objects, document: document, maximumBytes: maximumBytes)
     }
 
+    /// Background-maintenance entrypoint. Parse only changed immutable head
+    /// revisions, then atomically publish the forward/backlink arrays.
+    /// Never call this from a GET handler; the watcher schedules it after
+    /// a successful scan, at lower priority than filesystem reconciliation.
+    @discardableResult
+    public func refreshLinkCache() throws -> LinkCacheReport {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
+        try journal().assertResolved()
+        do {
+            let result = try VaultLinkGraph.prepare(db: r.db, objects: r.objects,
+                                                    vaultID: vaultID, previous: linkSnapshot)
+            linkSnapshot = result.snapshot
+            linkCacheError = nil
+            linkCacheReady = true
+            if result.changed { linkCacheBuildCount += 1 }
+            return LinkCacheReport(parsedDocuments: result.parsed,
+                                   reusedDocuments: result.reused,
+                                   graphChanged: result.changed,
+                                   generation: linkCacheBuildCount)
+        } catch let graphError as VaultLinkGraphError {
+            linkCacheReady = false
+            linkCacheError = graphError
+            throw graphError
+        } catch {
+            linkCacheReady = false
+            linkCacheError = .inconsistentCatalog
+            throw error
+        }
+    }
+
+    /// Cheap, page-only lookup of an already-published in-memory graph.
+    /// Never scans, parses or reads the object store on the request path.
+    public func links(_ documentID: Data, direction: VaultLinkDirection,
+                      limit: Int = 50, offset: Int = 0) throws -> VaultLinkPage {
+        guard resources != nil else { throw VaultRuntimeError.closed }
+        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
+        try journal().assertResolved()
+        guard linkCacheReady, let snapshot = linkSnapshot else {
+            throw linkCacheError ?? .cacheNotReady
+        }
+        return try snapshot.query(documentID: documentID, direction: direction,
+                                  limit: limit, offset: offset)
+    }
+
     public func reconcile(at date: Date = Date()) throws -> ReconciliationReport {
         guard let r = resources else { throw VaultRuntimeError.closed }
+        // The prior snapshot can be reused incrementally after this scan,
+        // but must not be served until its namespace has been reconciled.
+        linkCacheReady = false
+        linkCacheError = nil
         try journal().recover()
         try journal().assertResolved()
         try RecoverySnapshots.validateTime(date)

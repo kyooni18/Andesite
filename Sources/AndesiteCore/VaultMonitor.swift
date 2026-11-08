@@ -89,69 +89,79 @@ public final class VaultMonitor {
         let initial = try runtime.reconcile()
         report("watch-ready discovered=\(initial.discovered) revisions=\(initial.revisionsCreated) snapshots=\(initial.snapshotsCreated)")
         var lastGeneration: UInt64 = 0
-        var dirtySince: TimeInterval?
-        var lastChange: TimeInterval = 0
-        var nextAllowedScan: TimeInterval = 0
-        var nextFallback = ProcessInfo.processInfo.systemUptime + settings.fallbackRescan
-        var nextSnapshot = ProcessInfo.processInfo.systemUptime + settings.snapshotTick
-        var consecutiveFailures = 0
+        var scheduler = VaultWorkScheduler(
+            now: ProcessInfo.processInfo.systemUptime,
+            debounce: settings.debounce,
+            maximumCoalescing: settings.maximumCoalescing,
+            fallbackRescan: settings.fallbackRescan,
+            snapshotTick: settings.snapshotTick,
+            retryDelay: settings.retryDelay)
+        scheduler.reconciled(at: ProcessInfo.processInfo.systemUptime)
 
         while !shouldStop() {
             let now = ProcessInfo.processInfo.systemUptime
             let events = try drain()
-            if events.generation != lastGeneration {
+            if events.generation != lastGeneration || events.recovery_flags != 0 {
                 lastGeneration = events.generation
-                if dirtySince == nil { dirtySince = now }
-                lastChange = now
+                scheduler.observedChange(at: now)
                 if events.recovery_flags != 0 {
                     report("watch-rescan-required flags=0x\(String(events.recovery_flags, radix: 16)) eventID=\(events.last_event_id)")
                 }
-            } else if events.recovery_flags != 0 {
-                // Even if generation saturates, recovery flags still force a scan.
-                if dirtySince == nil { dirtySince = now }
-                lastChange = now
-                report("watch-rescan-required flags=0x\(String(events.recovery_flags, radix: 16))")
             }
 
-            let eventDue = dirtySince.map {
-                now - lastChange >= settings.debounce || now - $0 >= settings.maximumCoalescing
-            } ?? false
-            let scheduledDue = now >= nextFallback
-            if (eventDue || scheduledDue) && now >= nextAllowedScan {
-                do {
-                    let result = try runtime.reconcile()
-                    report("watch-scan cause=\(scheduledDue ? "periodic" : "event") discovered=\(result.discovered) revisions=\(result.revisionsCreated) deleted=\(result.deleted) renamed=\(result.renamed) snapshots=\(result.snapshotsCreated)")
-                    consecutiveFailures = 0
-                    dirtySince = nil
-                    nextAllowedScan = 0
-                    nextFallback = ProcessInfo.processInfo.systemUptime + settings.fallbackRescan
-                    // Events arriving during reconciliation remain in the C
-                    // generation and are consumed by the next loop iteration.
-                } catch {
-                    // No fallback to a stale index, inferred deletion or
-                    // automatic journal action. Retain dirty work for retry.
-                    consecutiveFailures += 1
-                    report("watch-scan-failed attempt=\(consecutiveFailures) error=\(error)")
-                    if dirtySince == nil { dirtySince = now }
-                    lastChange = now - settings.debounce
-                    nextAllowedScan = now + min(30, settings.retryDelay * Double(min(consecutiveFailures, 30)))
-                    nextFallback = nextAllowedScan
+            if let job = scheduler.next(at: now) {
+                switch job {
+                case .reconcile(let cause):
+                    do {
+                        let result = try runtime.reconcile()
+                        scheduler.reconciled(at: ProcessInfo.processInfo.systemUptime)
+                        report("watch-scan cause=\(cause == .periodic ? "periodic" : "event") discovered=\(result.discovered) revisions=\(result.revisionsCreated) deleted=\(result.deleted) renamed=\(result.renamed) snapshots=\(result.snapshotsCreated)")
+                    } catch {
+                        let attempt = scheduler.scanFailed(at: ProcessInfo.processInfo.systemUptime)
+                        report("watch-scan-failed attempt=\(attempt) error=\(error)")
+                    }
+
+                case .snapshots:
+                    do {
+                        let count = try runtime.scheduleDueSnapshots()
+                        if count > 0 { report("watch-snapshots-created count=\(count)") }
+                    } catch {
+                        report("watch-snapshot-schedule-failed error=\(error)")
+                    }
+                    scheduler.snapshotsFinished(at: ProcessInfo.processInfo.systemUptime)
+
+                case .refreshLinks:
+                    do {
+                        let result = try runtime.refreshLinkCache()
+                        scheduler.refreshedLinks()
+                        report("watch-link-cache generation=\(result.generation) parsed=\(result.parsedDocuments) reused=\(result.reusedDocuments) changed=\(result.graphChanged)")
+                    } catch VaultLinkGraphError.graphTooLarge {
+                        scheduler.refreshFailed(at: ProcessInfo.processInfo.systemUptime,
+                                                retry: false)
+                        report("watch-link-cache-unavailable reason=graphTooLarge")
+                    } catch {
+                        scheduler.refreshFailed(at: ProcessInfo.processInfo.systemUptime,
+                                                retry: true)
+                        report("watch-link-cache-failed error=\(error)")
+                    }
                 }
             }
 
-            if now >= nextSnapshot {
-                do {
-                    let n = try runtime.scheduleDueSnapshots()
-                    if n > 0 { report("watch-snapshots-created count=\(n)") }
-                } catch {
-                    report("watch-snapshot-schedule-failed error=\(error)")
+            // An event can arrive while a scan or cache refresh executes.
+            // Check the generation once more before serving any HTTP GET,
+            // so newly pending changes invalidate indexed reads promptly.
+            let afterWork = try drain()
+            if afterWork.generation != lastGeneration || afterWork.recovery_flags != 0 {
+                lastGeneration = afterWork.generation
+                scheduler.observedChange(at: ProcessInfo.processInfo.systemUptime)
+                if afterWork.recovery_flags != 0 {
+                    report("watch-rescan-required flags=0x\(String(afterWork.recovery_flags, radix: 16)) eventID=\(afterWork.last_event_id)")
                 }
-                nextSnapshot = ProcessInfo.processInfo.systemUptime + settings.snapshotTick
             }
-            // HTTP is polled on this same thread, after all due reconciliation
-            // work. Never expose the indexed view while a dirty/rescan hint
-            // remains unresolved. The HTTP transport owns no SQLite handle.
-            try onIdle(dirtySince == nil)
+
+            // Only one scheduled operation runs per tick. The private HTTP
+            // reader then services requests without a second SQLite owner.
+            try onIdle(scheduler.indexedReadable)
             Thread.sleep(forTimeInterval: settings.polling)
         }
         report("watch-stopping")

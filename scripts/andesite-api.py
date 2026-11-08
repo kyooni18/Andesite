@@ -53,6 +53,11 @@ def main() -> int:
     document.add_argument("id")
     document_content = sub.add_parser("document-content")
     document_content.add_argument("id")
+    for command in ("links", "backlinks"):
+        link = sub.add_parser(command)
+        link.add_argument("id")
+        link.add_argument("--limit", type=int, default=50)
+        link.add_argument("--offset", type=int, default=0)
     search = sub.add_parser("search")
     search.add_argument("phrase")
     search.add_argument("--limit", type=int, default=50)
@@ -78,6 +83,10 @@ def main() -> int:
             url = "/v1/documents/" + args.id
         elif args.command == "document-content":
             url = "/v1/documents/" + args.id + "/content"
+        elif args.command in ("links", "backlinks"):
+            url = "/v1/documents/" + args.id + "/" + args.command + "?" + urlencode({
+                "limit": args.limit, "offset": args.offset
+            })
         elif args.command == "search":
             url = "/v1/search?" + urlencode({"q": args.phrase, "limit": args.limit})
         elif args.command == "snapshots":

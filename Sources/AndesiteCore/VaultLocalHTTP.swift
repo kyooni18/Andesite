@@ -203,6 +203,20 @@ public final class VaultLocalHTTP {
         return detail
     }
 
+    private func linkJSON(_ link: VaultLinkMention) -> [String: Any] {
+        [
+            "source": hex(link.sourceID), "sourcePath": link.sourcePath,
+            "syntax": link.syntax, "target": link.target,
+            "fragment": link.fragment.map { $0 as Any } ?? NSNull(),
+            "display": link.display.map { $0 as Any } ?? NSNull(),
+            "embed": link.embed, "status": link.status,
+            "document": link.documentID.map { hex($0) as Any } ?? NSNull(),
+            "path": link.documentPath.map { $0 as Any } ?? NSNull(),
+            "fragmentStatus": link.fragmentStatus,
+            "aliasSuggestions": link.aliasSuggestions
+        ]
+    }
+
     private func queryParameters(_ raw: String) -> [String: String]? {
         if raw.isEmpty { return [:] }
         var parameters: [String: String] = [:]
@@ -285,6 +299,8 @@ public final class VaultLocalHTTP {
                     "openIncidents": status.openIncidents,
                     "unfinishedMutations": status.unfinishedMutations,
                     "indexedReadable": indexReady && status.state == "ready",
+                    "linksIndexed": indexReady && runtime.linksIndexed,
+                    "linkCacheGeneration": runtime.linkCacheGeneration,
                     "source": "last_completed_reconciliation"
                 ])
             }
@@ -327,14 +343,44 @@ public final class VaultLocalHTTP {
             let documentPath = path.split(separator: "/", omittingEmptySubsequences: false)
             if documentPath.count >= 4 && documentPath.count <= 5 &&
                documentPath[1] == "v1" && documentPath[2] == "documents" {
-                guard args.isEmpty, let document = id(String(documentPath[3])) else {
+                guard let document = id(String(documentPath[3])) else {
                     return .error(400, "invalid_document")
                 }
                 guard indexReady else { return .error(503, "rescan_pending") }
                 if documentPath.count == 4 {
+                    guard args.isEmpty else { return .error(400, "unsupported_parameter") }
                     return .json(200, try preview(document, of: runtime.inspectDocument(document)))
                 }
+                if documentPath.count == 5 &&
+                   (documentPath[4] == "links" || documentPath[4] == "backlinks") {
+                    guard Set(args.keys).isSubset(of: ["limit", "offset"]),
+                          let count = limit(args["limit"]) else {
+                        return .error(400, "invalid_link_query")
+                    }
+                    let offset: Int
+                    if let raw = args["offset"] {
+                        guard !raw.isEmpty, raw.utf8.count <= 6,
+                              raw.utf8.allSatisfy({ (48...57).contains($0) }),
+                              let parsed = Int(raw), parsed <= 100_000 else {
+                            return .error(400, "invalid_offset")
+                        }
+                        offset = parsed
+                    } else { offset = 0 }
+                    let inbound = documentPath[4] == "backlinks"
+                    let result = try runtime.links(
+                        document, direction: inbound ? .incoming : .outgoing,
+                        limit: count, offset: offset)
+                    return .json(200, [
+                        "mentions": result.mentions.map(linkJSON),
+                        "total": result.total, "offset": result.offset,
+                        "nextOffset": result.nextOffset.map { $0 as Any } ?? NSNull(),
+                        "scope": "verified_indexed_markdown_heads_only",
+                        "unlinkedMentionsIncluded": false,
+                        "source": "last_completed_reconciliation"
+                    ])
+                }
                 if documentPath.count == 5 && documentPath[4] == "content" {
+                    guard args.isEmpty else { return .error(400, "unsupported_parameter") }
                     let content = try runtime.documentContents(document,
                                                               maximumBytes: maximumResponse)
                     return VaultHTTPResponse(status: 200, body: content,
@@ -393,6 +439,14 @@ public final class VaultLocalHTTP {
                                          contentType: "text/markdown; charset=utf-8")
             }
             return .error(404, "not_found")
+        } catch VaultLinkGraphError.invalidQuery {
+            return .error(400, "invalid_link_query")
+        } catch VaultLinkGraphError.graphTooLarge {
+            return .error(413, "link_graph_exceeds_safety_budget")
+        } catch VaultLinkGraphError.cacheNotReady {
+            return .error(503, "link_index_pending")
+        } catch VaultLinkGraphError.inconsistentCatalog {
+            return .error(503, "link_graph_inconsistent")
         } catch DocumentCatalogError.notFound {
             return .error(404, "document_not_found")
         } catch DocumentCatalogError.contentTooLarge {

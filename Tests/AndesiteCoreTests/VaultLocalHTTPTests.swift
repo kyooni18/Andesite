@@ -309,3 +309,156 @@ private final class WatchProcessFixture {
     try runtime.shutdown()
 }
 #endif
+
+#if os(macOS)
+@Test func linkHTTPResolvesBacklinksWithoutGuessingAliasOrCorruptingHistory() throws {
+    let f = try RuntimeFixture(); defer { f.clean() }
+    try f.write("Target.md", "# Section\nA block ^block-2\n")
+    try f.write("Main.md", """
+    # Source
+    [[Target#Section]]
+    [[Target#^block-2]]
+    [[Target#Absent]]
+    [[Missing]]
+    """)
+    let runtime = try VaultRuntime(configuration: f.configuration)
+    _ = try runtime.reconcile()
+    _ = try runtime.refreshLinkCache()
+    let docs = try runtime.documents().documents
+    let mainID = try #require(docs.first(where: { $0.path == "Main.md" })).id
+    let targetID = try #require(docs.first(where: { $0.path == "Target.md" })).id
+    let main = mainID.map { String(format: "%02x", $0) }.joined()
+    let target = targetID.map { String(format: "%02x", $0) }.joined()
+    let api = try VaultLocalHTTP(runtime: runtime, stateDirectory: f.state.path)
+
+    let outgoing = api.handle(request: httpRequest("/v1/documents/\(main)/links"),
+                              indexReady: true)
+    #expect(outgoing.status == 200)
+    let outgoingJSON = try #require(JSONSerialization.jsonObject(with: outgoing.body) as? [String: Any])
+    #expect(outgoingJSON["total"] as? Int == 4)
+    let refs = try #require(outgoingJSON["mentions"] as? [[String: Any]])
+    #expect(refs.contains(where: { $0["fragment"] as? String == "Section" &&
+                                   $0["fragmentStatus"] as? String == "resolved" }))
+    #expect(refs.contains(where: { $0["fragment"] as? String == "^block-2" &&
+                                   $0["fragmentStatus"] as? String == "resolved" }))
+    #expect(refs.contains(where: { $0["fragment"] as? String == "Absent" &&
+                                   $0["fragmentStatus"] as? String == "missing" }))
+    #expect(refs.contains(where: { $0["target"] as? String == "Missing" &&
+                                   $0["status"] as? String == "missing" }))
+
+    let inbound = api.handle(request: httpRequest("/v1/documents/\(target)/backlinks?limit=2"),
+                             indexReady: true)
+    #expect(inbound.status == 200)
+    let inboundJSON = try #require(JSONSerialization.jsonObject(with: inbound.body) as? [String: Any])
+    #expect(inboundJSON["total"] as? Int == 3)
+    #expect(inboundJSON["nextOffset"] as? Int == 2)
+    #expect(api.handle(request: httpRequest("/v1/documents/\(target)/backlinks?offset=-1"),
+                       indexReady: true).status == 400)
+    #expect(api.handle(request: httpRequest("/v1/documents/\(main)/links?limit=101"),
+                       indexReady: true).status == 400)
+    #expect(api.handle(request: httpRequest("/v1/documents/\(main)/links"),
+                       indexReady: false).status == 503)
+    #expect(try runtime.status().revisions == 2)
+    #expect(try runtime.documentContents(mainID) == Data("""
+    # Source
+    [[Target#Section]]
+    [[Target#^block-2]]
+    [[Target#Absent]]
+    [[Missing]]
+    """.utf8))
+    try runtime.shutdown()
+}
+#endif
+
+#if os(macOS)
+@Test func linkHTTPReturns413InsteadOfFalseEmptyBacklinksForOversizedGraph() throws {
+    let f = try RuntimeFixture(); defer { f.clean() }
+    try f.write("Target.md", "# Target\n")
+    let huge = "# Oversized\n" + String(repeating: "X", count: 270_000) + "\n[[Target]]"
+    try f.write("Huge.md", huge)
+    let runtime = try VaultRuntime(configuration: f.configuration)
+    _ = try runtime.reconcile()
+    #expect(throws: VaultLinkGraphError.graphTooLarge) {
+        try runtime.refreshLinkCache()
+    }
+    let targetID = try #require(try runtime.documents().documents.first {
+        $0.path == "Target.md"
+    }).id
+    let hexID = targetID.map { String(format: "%02x", $0) }.joined()
+    let api = try VaultLocalHTTP(runtime: runtime, stateDirectory: f.state.path)
+    let response = api.handle(
+        request: httpRequest("/v1/documents/\(hexID)/backlinks"), indexReady: true)
+    #expect(response.status == 413)
+    #expect(String(decoding: response.body, as: UTF8.self)
+        .contains("link_graph_exceeds_safety_budget"))
+    #expect(try runtime.documentContents(targetID) == Data("# Target\n".utf8))
+    try runtime.shutdown()
+}
+#endif
+
+#if os(macOS)
+@Test func watcherSchedulesCacheOncePerScanAndServesRepeatedBacklinksFromMemory() throws {
+    let f = try WatchProcessFixture(); defer { f.clean() }
+    try f.fixture.write("Target.md", "# Target\n")
+    try f.fixture.write("Caller.md", "[[Target]]\n")
+    try f.start()
+    #expect(f.awaitReady())
+
+    func status() throws -> [String: Any]? {
+        let reply = try f.curl("/v1/status")
+        guard reply.status == 200,
+              let body = reply.text.components(separatedBy: "\r\n\r\n").last?.data(using: .utf8) else {
+            return nil
+        }
+        return try JSONSerialization.jsonObject(with: body) as? [String: Any]
+    }
+
+    let deadline = Date().addingTimeInterval(9)
+    var generation = 0
+    while Date() < deadline {
+        if let reply = try status(), reply["linksIndexed"] as? Bool == true,
+           let value = reply["linkCacheGeneration"] as? Int, value > 0 {
+            generation = value
+            break
+        }
+        Thread.sleep(forTimeInterval: 0.10)
+    }
+    #expect(generation > 0)
+
+    let documents = try f.curl("/v1/documents")
+    #expect(documents.status == 200)
+    let documentJSON = try #require(
+        documents.text.components(separatedBy: "\r\n\r\n").last?.data(using: .utf8))
+    let payload = try #require(JSONSerialization.jsonObject(with: documentJSON) as? [String: Any])
+    let entries = try #require(payload["documents"] as? [[String: Any]])
+    let target = try #require(entries.first(where: { $0["path"] as? String == "Target.md" }))
+    let identifier = try #require(target["document"] as? String)
+    for _ in 0..<25 {
+        let result = try f.curl("/v1/documents/\(identifier)/backlinks")
+        #expect(result.status == 200 && result.text.contains("\"total\":1"))
+    }
+    #expect(try status()?["linkCacheGeneration"] as? Int == generation)
+
+    // The source editor writes directly and does not wait for the background
+    // catalog/index/cache jobs.
+    try f.fixture.write("Caller.md", "[[Missing]]\n")
+    let newDeadline = Date().addingTimeInterval(9)
+    var updated = false
+    while Date() < newDeadline {
+        if let reply = try status(), reply["linksIndexed"] as? Bool == true,
+           let value = reply["linkCacheGeneration"] as? Int, value > generation {
+            let links = try f.curl("/v1/documents/\(identifier)/backlinks")
+            if links.status == 200 && links.text.contains("\"total\":0") {
+                updated = true
+                break
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+    }
+    #expect(updated)
+    let logs = try String(contentsOf: f.log, encoding: .utf8)
+    #expect(logs.contains("watch-link-cache"))
+    #expect(logs.contains("parsed=1"))
+    f.stop(SIGTERM)
+}
+#endif
