@@ -2,7 +2,7 @@
 """Select, open, inspect or close one macOS Vault session.
 
 Selection only writes <vault>/.andesite/vault.json. Opening explicitly starts
-the existing backend and FSEvents reader via a per-user launchd service.
+`andesite-server watch` for the Vault as a per-user launchd service.
 Closing unloads the service and flushes pending snapshots; no vault contents
 or history are deleted.
 """
@@ -10,7 +10,6 @@ import argparse
 import hashlib
 import os
 import plistlib
-import socket
 import re
 import stat
 import subprocess
@@ -78,30 +77,14 @@ def existing_plist(path: Path, label: str):
         data = plistlib.load(stream)
     args = data.get("ProgramArguments", [])
     if (data.get("Label") != label or len(args) != 3 or
-            args[1] != "vault-watch" or Path(args[0]).name != "andesite-server"):
+            args[1] != "watch" or Path(args[0]).name != "andesite-server"):
         fail(f"agent file is not an Andesite Vault session: {path}")
     return data
 
 
-def socket_replies(endpoint: str) -> bool:
-    # The socket is created before the startup scan; require a complete,
-    # functioning HTTP response instead of equating a bound path with ready.
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(0.6)
-            client.connect(endpoint)
-            client.sendall(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            received = bytearray()
-            while len(received) < 8192:
-                data = client.recv(4096)
-                if not data:
-                    break
-                received.extend(data)
-                if b"\r\n\r\n" in received:
-                    break
-            return received.startswith(b"HTTP/1.1 200 ")
-    except OSError:
-        return False
+def running(service: str) -> bool:
+    result = launchctl("print", service)
+    return result.returncode == 0 and "state = running" in result.stdout
 
 
 def ensure_agent_paths():
@@ -148,15 +131,15 @@ def main() -> int:
         vault = physical_vault(args.vault)
         binary = binary_path()
         if args.action == "select":
-            print(command(binary, "vault-add", str(vault)))
+            print(command(binary, "add", str(vault)))
             return 0
         if args.action == "info":
-            print(command(binary, "vault-info", str(vault)))
+            print(command(binary, "info", str(vault)))
             return 0
 
         # Read the physical-identity-derived external state path without
         # creating it or changing the Vault marker.
-        state = command(binary, "vault-state", str(vault))
+        state = command(binary, "state", str(vault))
         label, domain, service = service_identity(state)
         agents = Path.home() / "Library/LaunchAgents"
         destination = agents / (label + ".plist")
@@ -167,25 +150,20 @@ def main() -> int:
             else:
                 print(f"Vault is not open: {vault}")
             return 0
-        endpoint = state + "/andesite-read.sock"
-        if len(os.fsencode(endpoint)) >= 104:
-            endpoint = (f"/private/tmp/andesite-http-{os.geteuid()}/" +
-                        hashlib.sha256(os.fsencode(state)).hexdigest()[:24] + ".sock")
         if args.action == "status":
-            result = launchctl("print", service)
-            responding = result.returncode == 0 and socket_replies(endpoint)
+            installed = launchctl("print", service).returncode == 0
             print(f"Vault: {vault}")
             print(f"State: {state}")
-            print("Session: " + ("open" if responding else
-                  "unavailable" if result.returncode == 0 else "closed"))
+            print("Session: " + ("open" if running(service) else
+                  "unavailable" if installed else "closed"))
             return 0
 
         if launchctl("print", service).returncode == 0:
             data = existing_plist(destination, label)
             if data is None or data["ProgramArguments"][2] != str(vault):
                 fail("an existing watcher uses this directory identity at another path; close it before moving")
-            if not socket_replies(endpoint):
-                fail("session is installed but unresponsive; inspect logs and close it before retrying")
+            if not running(service):
+                fail("session is installed but not running; inspect logs and close it before retrying")
             print(f"Vault session already open: {vault}")
             return 0
         if existing_plist(destination, label) is not None:
@@ -194,11 +172,11 @@ def main() -> int:
         # Connect, reconcile and shut down before writing the launchd plist.
         # This must succeed; a failed scan must never become a background
         # service repeatedly restarting against unsafe user files.
-        opened = command(binary, "vault-open", str(vault))
+        opened = command(binary, "open", str(vault))
         agents, logs = ensure_agent_paths()
         spec = {
             "Label": label,
-            "ProgramArguments": [str(binary), "vault-watch", str(vault)],
+            "ProgramArguments": [str(binary), "watch", str(vault)],
             "RunAtLoad": True,
             "KeepAlive": {"SuccessfulExit": False},
             "ThrottleInterval": 20,
@@ -225,12 +203,12 @@ def main() -> int:
         if result.returncode != 0:
             fail(f"launchctl bootstrap failed: {result.stderr.strip()}; remove verified plist with close")
 
-        # Report an open session only when the watcher has actually started
-        # its first successful reconciliation and exposed its socket.
+        # Report an open session only once the watcher logged its first scan.
+        log = logs / (label + ".out.log")
         deadline = time.monotonic() + 10
         ready = False
         while time.monotonic() < deadline:
-            if Path(endpoint).is_socket() and socket_replies(endpoint):
+            if running(service) and log.exists() and "watch-ready" in log.read_text(errors="replace"):
                 ready = True
                 break
             if launchctl("print", service).returncode != 0:
@@ -239,8 +217,7 @@ def main() -> int:
         if not ready:
             fail(f"watcher not ready: inspect {logs / (label + '.err.log')}; close to stop")
         print(opened)
-        print(f"Opened Vault with FSEvents: {vault}")
-        print(f"Read-only Unix socket: {endpoint}")
+        print(f"Opened Vault: {vault}")
         print(f"Close with: python3 scripts/andesite-vault.py close '{vault}'")
         return 0
     except (OSError, ValueError, plistlib.InvalidFileException) as error:

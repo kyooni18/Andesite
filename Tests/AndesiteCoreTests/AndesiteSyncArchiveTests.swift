@@ -167,18 +167,3 @@ import Testing
     }
 }
 
-@Test func embeddedSessionBackendDoesNotStartAnHTTPServerOrExtraOwner() throws {
-    let f = try RuntimeFixture(); defer { f.clean() }
-    try f.write("embedded.md", "# Embedded\ntyped-backend\n")
-    let session = try VaultSession(
-        vaultDirectory: f.vault.path, stateDirectory: f.state.path)
-    _ = try session.reconcile()
-    let backend = try session.backend
-    let page = try backend.documents()
-    #expect(page.total == 1 && page.documents[0].path == "embedded.md")
-    #expect(try backend.documentContents(page.documents[0].id)
-            == Data("# Embedded\ntyped-backend\n".utf8))
-    #expect(try backend.syncChanges(after: 0).changes.count == 1)
-    try session.close()
-    #expect(throws: VaultRuntimeError.closed) { try backend.documents() }
-}

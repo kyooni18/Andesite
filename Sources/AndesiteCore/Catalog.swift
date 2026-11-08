@@ -186,7 +186,7 @@ public struct Revision: Sendable, Equatable {
 }
 
 extension Data {
-    init?(hex: String) {
+    public init?(hex: String) {
         guard hex.utf8.count % 2 == 0 else { return nil }
         var bytes = [UInt8]()
         bytes.reserveCapacity(hex.utf8.count / 2)
@@ -200,5 +200,5 @@ extension Data {
         self.init(bytes)
     }
 
-    var hex: String { map { String(format: "%02x", $0) }.joined() }
+    public var hex: String { map { String(format: "%02x", $0) }.joined() }
 }

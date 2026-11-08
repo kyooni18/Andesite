@@ -137,7 +137,7 @@ import Testing
 }
 
 #if os(macOS)
-@Test func metadataHTTPHandlesPropertiesTagsFiltersAndInvalidRequests() throws {
+@Test func metadataHTTPHandlesPropertiesTagsFiltersAndInvalidRequests() async throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("one.md", """
     ---
@@ -148,46 +148,26 @@ import Testing
     search-for-property-uniquely
     """)
     try f.write("two.md", "# Two\n#program/Swift\n")
-    let runtime = try VaultRuntime(configuration: f.configuration)
-    _ = try runtime.reconcile()
-    let id = try #require(try runtime.documents().documents.first(where: { $0.path == "one.md" }))
-        .id.map { String(format: "%02x", $0) }.joined()
-    let api = try VaultLocalHTTP(runtime: runtime, stateDirectory: f.state.path)
-    func request(_ path: String, ready: Bool = true) -> VaultHTTPResponse {
-        api.handle(request: Data("GET \(path) HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8),
-                   indexReady: ready)
-    }
-    let detail = request("/v1/documents/\(id)/properties")
-    #expect(detail.status == 200)
-    let info = try #require(JSONSerialization.jsonObject(with: detail.body) as? [String: Any])
-    #expect(info["state"] as? String == "valid")
-    #expect((info["properties"] as? [[String: Any]])?.count == 2)
-    #expect(request("/v1/tags").status == 200)
-    #expect(request("/v1/properties").status == 200)
-    let match = request("/v1/documents?tag=program&property=rating&value=5")
-    #expect(match.status == 200)
-    let listing = try #require(JSONSerialization.jsonObject(with: match.body) as? [String: Any])
-    #expect(listing["total"] as? Int == 1)
-    let operatorSearch = request("/v1/search?q=tag:%23program")
-    #expect(operatorSearch.status == 200)
-    let operatorJSON = try #require(
-        JSONSerialization.jsonObject(with: operatorSearch.body) as? [String: Any])
-    #expect((operatorJSON["hits"] as? [[String: Any]])?.count == 2)
-    let propertySearch = request("/v1/search?q=%5Brating:5%5D")
-    #expect(propertySearch.status == 200)
-    let propertyJSON = try #require(
-        JSONSerialization.jsonObject(with: propertySearch.body) as? [String: Any])
-    #expect((propertyJSON["hits"] as? [[String: Any]])?.count == 1)
-    #expect(request("/v1/search?q=%5Brating:%3E5%5D").status == 400)
-    let search = request("/v1/search?q=search-for-property-uniquely&tag=program")
-    #expect(search.status == 200)
-    #expect(String(data: search.body, encoding: .utf8)?.contains("one.md") == true)
-    #expect(request("/v1/documents?tag=1984").status == 400)
-    #expect(request("/v1/documents?value=5").status == 400)
-    #expect(request("/v1/documents?property=rating&value=5&tag=program",
-                    ready: false).status == 503)
-    #expect(request("/v1/tags?offset=-1").status == 400)
-    #expect(request("/v1/documents/\(id)/properties?evil=1").status == 400)
-    try runtime.shutdown()
+    let session = try VaultSession(vaultDirectory: f.vault.path, stateDirectory: f.state.path)
+    try session.reconcile()
+    let server = try await TestServer(session)
+    func get(_ path: String) async throws -> (status: Int, value: [String: Any]) { try await server.json("GET", path) }
+    let detail = try await get("/v1/metadata?path=one.md")
+    #expect(detail.status == 200 && detail.value["state"] as? String == "valid")
+    #expect((detail.value["properties"] as? [[String: Any]])?.count == 2)
+    #expect(try await get("/v1/tags").status == 200)
+    #expect(try await get("/v1/properties").status == 200)
+    let match = try await get("/v1/documents?tag=program&property=rating&value=5")
+    #expect(match.status == 200 && match.value["total"] as? Int == 1)
+    #expect((try await get("/v1/search?q=tag:%23program").value["hits"] as? [[String: Any]])?.count == 2)
+    #expect((try await get("/v1/search?q=%5Brating:5%5D").value["hits"] as? [[String: Any]])?.count == 1)
+    #expect(try await get("/v1/search?q=%5Brating:%3E5%5D").status == 400)
+    let search = try await server.request("GET", "/v1/search?q=search-for-property-uniquely&tag=program")
+    #expect(search.status == 200 && String(decoding: search.body, as: UTF8.self).contains("one.md"))
+    #expect(try await get("/v1/documents?tag=1984").status == 400)
+    #expect(try await get("/v1/documents?value=5").status == 400)
+    #expect(try await get("/v1/tags?offset=-1").status == 400)
+    await server.stop()
+    try session.close()
 }
 #endif

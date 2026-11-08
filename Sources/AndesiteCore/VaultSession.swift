@@ -13,31 +13,24 @@ public enum VaultSessionError: Error, Equatable {
     case systemCall(String, Int32)
 }
 
-/// Opening a selected Vault connects the existing backend explicitly.
-/// Merely registering the path never scans notes or initializes SQLite.
+/// An open Vault and the one serial queue that owns it.
 ///
-/// A path-only marker remains at <vault>/.andesite/vault.json. Backend state
-/// stays outside the Vault, keyed by physical directory identity rather
-/// than its pathname. Same-volume renames reuse the same catalog; copies to
-/// another volume cannot be assumed to be identical and fail closed.
-public final class VaultSession {
+/// Every backend call runs on that queue: `run` blocks the caller,
+/// `perform` suspends it. Watching, HTTP requests and sync work interleave
+/// on the queue between calls, so there is exactly one SQLite owner and
+/// networking never runs on it.
+///
+/// A path-only marker is kept at <vault>/.andesite/vault.json. Backend state
+/// lives outside the Vault, keyed by the directory's physical identity, so
+/// same-volume renames keep their history and copies fail closed.
+public final class VaultSession: @unchecked Sendable {
     public let vaultDirectory: String
     public let stateDirectory: String
-    private let marker: VaultPathRegistry
+    private let queue = DispatchQueue(label: "andesite.vault")
+    // Accessed only on `queue`.
     private var owner: VaultRuntime?
-
-    public var runtime: VaultRuntime {
-        get throws {
-            guard let owner else { throw VaultSessionError.closed }
-            return owner
-        }
-    }
-
-    /// In-process, transport-free backend facade for an embedded app.
-    /// It shares the session's single owner and cannot outlive the session.
-    public var backend: AndesiteBackend {
-        get throws { try runtime }
-    }
+    private var watcher: VaultWatcher?
+    private var timer: DispatchSourceTimer?
 
     public static var defaultStateRoot: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -48,9 +41,9 @@ public final class VaultSession {
         #endif
     }
 
-    /// Pure path resolution: no SQLite, filesystem writes or scanner.
-    /// Require directory birth time on macOS to avoid accidental reuse of a
-    /// previous Vault's state after its inode number is recycled.
+    /// Pure path resolution: no SQLite, filesystem writes or scanning. The
+    /// key is the directory's identity (device, inode and, on macOS, birth
+    /// time) so a recycled inode number cannot inherit another Vault's state.
     public static func plannedStateDirectory(vaultDirectory: String,
                                              stateRoot: String? = nil) throws -> String {
         _ = try VaultPathRegistry(vaultDirectory: vaultDirectory)
@@ -62,25 +55,23 @@ public final class VaultSession {
         #if os(macOS)
         guard info.st_birthtimespec.tv_sec > 0 else { throw VaultSessionError.identityUnavailable }
         let identity = "vault-state-v1:\(info.st_dev):\(info.st_ino):\(info.st_birthtimespec.tv_sec):\(info.st_birthtimespec.tv_nsec)"
-        let key = ObjectStore.hash(Data(identity.utf8))
+        #else
+        // Linux exposes no portable birth time; device and inode identify the
+        // directory (a recycled inode could inherit state; pass --state to pin it).
+        let identity = "vault-state-v1:\(info.st_dev):\(info.st_ino)"
+        #endif
         let base = stateRoot ?? defaultStateRoot
         guard base.hasPrefix("/"), base != "/", !base.hasSuffix("/"),
               !base.contains("//"), !base.contains("\0"), !base.contains("\\"),
               !base.dropFirst().split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) else {
             throw VaultSessionError.unsafeStateDirectory
         }
-        return base + "/v1-" + key
-        #else
-        throw VaultSessionError.identityUnavailable
-        #endif
+        return base + "/v1-" + ObjectStore.hash(Data(identity.utf8))
     }
 
-    /// Opening is the only step allowed to create state. Passing an explicit
-    /// state directory reuses the old manual CLI storage rather than starting
-    /// a fresh history in the automatic location.
-    ///
-    /// If a moved Vault has no state at its computed identity, refuse a new
-    /// empty index: it may have been copied to another disk with old history.
+    /// Opening is the only step allowed to create state. An explicit state
+    /// directory reuses existing storage. A moved Vault without state at its
+    /// computed identity is refused: it may be a copy with stale history.
     public init(vaultDirectory: String, stateRoot: String? = nil,
                 stateDirectory explicitState: String? = nil) throws {
         let marker = try VaultPathRegistry(vaultDirectory: vaultDirectory)
@@ -96,41 +87,65 @@ public final class VaultSession {
             }
             try Self.createPrivateStateDirectory(state)
         }
-        let backend = try VaultRuntime(configuration: VaultConfiguration(
+        let runtime = try VaultRuntime(configuration: VaultConfiguration(
             vaultDirectory: vaultDirectory, stateDirectory: state))
-        // Identity and any same-volume rebind have succeeded. Only now
-        // update the marker; its contents remain the single absolute path.
         try marker.register()
         self.vaultDirectory = vaultDirectory
         self.stateDirectory = state
-        self.marker = marker
-        self.owner = backend
+        self.owner = runtime
+    }
+
+    /// Runs `body` on the owner queue and waits for its result. Never call
+    /// it from inside another `run` or `perform` body.
+    public func run<T>(_ body: (AndesiteBackend) throws -> T) throws -> T {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        return try queue.sync {
+            guard let owner else { throw VaultSessionError.closed }
+            return try body(owner)
+        }
+    }
+
+    /// Runs `body` on the owner queue without blocking the calling thread.
+    public func perform<T: Sendable>(_ body: @escaping @Sendable (AndesiteBackend) throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                guard let owner = self.owner else { return continuation.resume(throwing: VaultSessionError.closed) }
+                continuation.resume(with: Result { try body(owner) })
+            }
+        }
     }
 
     @discardableResult
-    public func reconcile() throws -> ReconciliationReport {
-        try runtime.reconcile()
+    public func reconcile() throws -> ReconciliationReport { try run { try $0.reconcile() } }
+
+    /// Starts monitoring the Vault: an initial scan, then filesystem events
+    /// and periodic rescans, all as short jobs on the owner queue.
+    public func startWatching(settings: VaultMonitorSettings = VaultMonitorSettings(),
+                              report: @escaping @Sendable (String) -> Void = { _ in }) throws {
+        try run { owner in
+            guard self.timer == nil else { return }
+            let watcher = try VaultWatcher(runtime: owner, vaultDirectory: self.vaultDirectory,
+                                           settings: settings, report: report)
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now() + settings.polling, repeating: settings.polling)
+            timer.setEventHandler { [weak self] in self?.watcher?.tick() }
+            self.watcher = watcher
+            self.timer = timer
+            timer.resume()
+        }
     }
 
-    #if os(macOS)
-    /// One synchronous owner handles the watcher and same-user HTTP reads.
-    /// The caller closes this session to flush snapshots and release locks.
-    public func watch(shouldStop: () -> Bool = { VaultMonitor.stopRequested },
-                      report: (String) -> Void = { _ in }) throws {
-        let backend = try runtime
-        let monitor = try VaultMonitor(runtime: backend, vaultDirectory: vaultDirectory)
-        let api = try VaultLocalHTTP(runtime: backend, stateDirectory: stateDirectory)
-        report("vault-api socket=\(api.socketPath) transport=unix-http access=same-user")
-        try monitor.run(shouldStop: shouldStop, onIdle: { ready in
-            try api.poll(indexReady: ready)
-        }, report: report)
-    }
-    #endif
-
+    /// Stops watching, flushes due snapshots and releases the state lock.
     public func close() throws {
-        guard let backend = owner else { return }
-        defer { owner = nil }
-        try backend.shutdown()
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        try queue.sync {
+            timer?.cancel()
+            timer = nil
+            watcher = nil
+            guard let owner else { return }
+            defer { self.owner = nil }
+            try owner.shutdown()
+        }
     }
 
     private static func createPrivateStateDirectory(_ path: String) throws {

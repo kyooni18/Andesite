@@ -138,7 +138,6 @@ extension VaultRuntime {
 
     func run(_ plan: MutationPlan) throws {
         try journal().recover()
-        foregroundMutationGeneration &+= 1
         do {
             try journal().run(plan)
         } catch VaultError.conflict {

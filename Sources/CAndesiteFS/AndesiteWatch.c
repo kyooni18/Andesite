@@ -4,7 +4,6 @@
 #include <dispatch/dispatch.h>
 #include <errno.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,24 +17,6 @@ struct andesite_fsevents_watch {
     uint64_t last_event_id;
     uint32_t recovery_flags;
 };
-
-static volatile sig_atomic_t stop_requested = 0;
-
-static void handle_stop(int signum) {
-    (void)signum;
-    stop_requested = 1;
-}
-
-void andesite_monitor_install_stop_handlers(void) {
-    stop_requested = 0;
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    action.sa_handler = handle_stop;
-    sigemptyset(&action.sa_mask);
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
-}
-int andesite_monitor_stop_requested(void) { return stop_requested != 0; }
 
 static void queue_barrier(void *unused) { (void)unused; }
 

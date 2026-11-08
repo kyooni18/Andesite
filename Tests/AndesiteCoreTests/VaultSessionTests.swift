@@ -17,8 +17,8 @@ import Testing
     #expect(FileManager.default.fileExists(atPath: planned + "/catalog.sqlite"))
     let first = try session.reconcile()
     #expect(first.discovered == 1 && first.revisionsCreated == 1)
-    let id = try session.runtime.vaultID
-    #expect(try session.runtime.search("firstunique").count == 1)
+    let id = try session.run { $0.vaultID }
+    #expect(try session.run { try $0.search("firstunique").count } == 1)
     #expect(throws: ProcessLockError.unavailable) {
         try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
     }
@@ -28,9 +28,9 @@ import Testing
     #expect(throws: VaultSessionError.closed) { try session.reconcile() }
 
     let reopened = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
-    #expect(try reopened.runtime.vaultID == id)
+    #expect(try reopened.run { $0.vaultID } == id)
     #expect(try reopened.reconcile().revisionsCreated == 0)
-    #expect(try reopened.runtime.status().revisions == 1)
+    #expect(try reopened.run { try $0.status().revisions } == 1)
     try reopened.close()
     #expect(try marker.storedPath() == f.vault.path)
     #expect(try String(contentsOf: f.vault.appendingPathComponent("note.md"), encoding: .utf8) ==
@@ -42,10 +42,10 @@ import Testing
     try f.write("note.md", "# History\nfirstrevision\n")
     let root = f.root.appendingPathComponent("automatic-state").path
     let session = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
-    let id = try session.runtime.vaultID
+    let id = try session.run { $0.vaultID }
     let sourceState = session.stateDirectory
     #expect(try session.reconcile().revisionsCreated == 1)
-    let first = try #require(session.runtime.snapshots(path: "note.md").first)
+    let first = try #require(session.run { try $0.snapshots(path: "note.md").first })
     try session.close()
 
     let moved = f.root.appendingPathComponent("moved-vault")
@@ -56,18 +56,18 @@ import Testing
 
     let restored = try VaultSession(vaultDirectory: moved.path, stateRoot: root)
     #expect(restored.stateDirectory == sourceState)
-    #expect(try restored.runtime.vaultID == id)
+    #expect(try restored.run { $0.vaultID } == id)
     #expect(try restored.reconcile().revisionsCreated == 0)
-    #expect(try restored.runtime.snapshots(path: "note.md").first?.id == first.id)
+    #expect(try restored.run { try $0.snapshots(path: "note.md").first?.id } == first.id)
     #expect(try selected.storedPath() == moved.path)
     try Data("# History\nsecondrevision\n".utf8).write(to: moved.appendingPathComponent("note.md"))
     #expect(try restored.reconcile().revisionsCreated == 1)
-    #expect(try restored.runtime.status().revisions == 2)
+    #expect(try restored.run { try $0.status().revisions } == 2)
     try restored.close()
 
     let again = try VaultSession(vaultDirectory: moved.path, stateRoot: root)
-    #expect(try again.runtime.vaultID == id)
-    #expect(try again.runtime.status().revisions == 2)
+    #expect(try again.run { $0.vaultID } == id)
+    #expect(try again.run { try $0.status().revisions } == 2)
     try again.close()
 }
 
@@ -109,33 +109,27 @@ import Testing
     let moved = f.root.appendingPathComponent("renamed")
     try FileManager.default.moveItem(at: f.vault, to: moved)
     let session = try VaultSession(vaultDirectory: moved.path, stateDirectory: f.state.path)
-    #expect(try session.runtime.vaultID == previousID)
+    #expect(try session.run { $0.vaultID } == previousID)
     #expect(try session.reconcile().revisionsCreated == 0)
-    #expect(try session.runtime.search("keepthese").count == 1)
+    #expect(try session.run { try $0.search("keepthese").count } == 1)
     try session.close()
     #expect(try VaultPathRegistry(vaultDirectory: moved.path).storedPath() == moved.path)
 }
 
 #if os(macOS)
-@Test func sessionWatchOpensThenStopsWithoutLeakingStateLockOrSocket() throws {
+@Test func sessionWatchStartsThenClosesWithoutLeakingStateLock() throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("note.md", "# Watched\nwatchuniquetoken\n")
     let root = f.root.appendingPathComponent("states").path
     let session = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
-    var ready = false
-    var reports: [String] = []
-    try session.watch(shouldStop: { ready }, report: { event in
-        reports.append(event)
-        if event.hasPrefix("watch-ready") { ready = true }
-    })
-    #expect(ready)
-    #expect(reports.contains(where: { $0.hasPrefix("vault-api socket=") }))
-    #expect(try session.runtime.status().revisions == 1)
-    let socket = try VaultLocalHTTP.socketPath(for: session.stateDirectory)
-    #expect(!FileManager.default.fileExists(atPath: socket))
+    let reports = Reports()
+    try session.startWatching(report: reports.add)
+    #expect(eventually { reports.contains("watch-ready") })
+    #expect(try session.run { try $0.status().revisions } == 1)
     try session.close()
+    #expect(throws: VaultSessionError.closed) { try session.run { _ in } }
     let again = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
-    #expect(try again.runtime.status().revisions == 1)
+    #expect(try again.run { try $0.status().revisions } == 1)
     try again.close()
 }
 #endif

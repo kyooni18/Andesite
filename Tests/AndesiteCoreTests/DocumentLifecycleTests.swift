@@ -207,7 +207,7 @@ private extension RuntimeFixture {
             }
             let child = Process()
             child.executableURL = binary
-            child.arguments = [arguments[0], "--vault", f.vault.path, "--state", f.state.path] + arguments.dropFirst()
+            child.arguments = [arguments[0], f.vault.path] + arguments.dropFirst() + ["--state", f.state.path]
             var environment = ProcessInfo.processInfo.environment
             environment["ANDESITE_TEST_FAULTS"] = "1"
             environment["ANDESITE_TEST_KILL_POINT"] = point

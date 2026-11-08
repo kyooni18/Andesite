@@ -56,37 +56,3 @@ import Testing
     try runtime.shutdown()
 }
 
-@Test func localStatusReportsPendingCacheProgressWithoutServingPartialBacklinks() throws {
-    let f = try RuntimeFixture(); defer { f.clean() }
-    for i in 0..<18 { try f.write("Note-\(i).md", "# Note \(i)\n[[Note-0]]") }
-    let runtime = try VaultRuntime(configuration: f.configuration)
-    _ = try runtime.reconcile()
-    let document = try #require(try runtime.documents(limit: 50).documents.first {
-        $0.path == "Note-0.md"
-    }).id
-    let id = document.map { String(format: "%02x", $0) }.joined()
-    let api = try VaultLocalHTTP(runtime: runtime, stateDirectory: f.state.path)
-
-    #expect(try runtime.advanceLinkCache(maxDocuments: 3, maxBytes: 1024) == nil)
-    let response = api.handle(request: Data(
-        "GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8), indexReady: true)
-    #expect(response.status == 200)
-    let status = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
-    let progress = try #require(status["linkCacheProgress"] as? [String: Int])
-    #expect(progress["processedHeads"] == 3)
-    #expect(progress["totalHeads"] == 18)
-    #expect(progress["resolvedHeads"] == 0)
-    #expect(status["linksIndexed"] as? Bool == false)
-    let links = api.handle(request: Data(
-        "GET /v1/documents/\(id)/backlinks HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8),
-        indexReady: true)
-    #expect(links.status == 503)
-
-    _ = try runtime.refreshLinkCache()
-    let ready = api.handle(request: Data(
-        "GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8), indexReady: true)
-    let readyStatus = try #require(JSONSerialization.jsonObject(with: ready.body) as? [String: Any])
-    #expect(readyStatus["linksIndexed"] as? Bool == true)
-    #expect(readyStatus["linkCacheProgress"] is NSNull)
-    try runtime.shutdown()
-}

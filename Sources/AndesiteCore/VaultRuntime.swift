@@ -75,10 +75,6 @@ public final class VaultRuntime {
 
     public var linksIndexed: Bool { linkCacheReady }
     public var linkCacheGeneration: Int { linkCacheBuildCount }
-    /// Incremented for every successfully committed foreground mutation.
-    /// The watcher observes this on its owner thread and enqueues a scan
-    /// without depending solely on delivery timing of FSEvents.
-    public internal(set) var foregroundMutationGeneration: UInt64 = 0
     /// Progress applies only to a pending low-priority generation.
     public var linkCacheProgress: (processedHeads: Int, totalHeads: Int, resolvedHeads: Int)? {
         guard let builder = linkBuilder else { return nil }

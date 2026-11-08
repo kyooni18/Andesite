@@ -68,6 +68,9 @@ final class Journal {
         let environment = ProcessInfo.processInfo.environment
         if environment["ANDESITE_TEST_FAULTS"] == "1", environment["ANDESITE_TEST_KILL_POINT"] == point {
             kill(getpid(), SIGKILL)
+            // The signalling thread may otherwise run on briefly before the
+            // process is torn down; never let it perform another step.
+            while true { pause() }
         }
     }
 
