@@ -345,8 +345,11 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
             #expect(try recovered.inspectMutation(id).outcome == "pending")
             #expect(try f.contents() == Data("a later external edit must not be overwritten".utf8))
             let export = f.root.appendingPathComponent("intent-version")
-            try recovered.exportMutationVersion(id, role: "current", to: export.path)
+            try recovered.exportMutationVersion(id, role: "sha256:" + ObjectStore.hash(Data("# Chosen\nchosenrecoverytoken".utf8)), to: export.path)
             #expect(try Data(contentsOf: export) == Data("# Chosen\nchosenrecoverytoken".utf8))
+            let liveExport = f.root.appendingPathComponent("live-after-intent")
+            try recovered.exportMutationVersion(id, role: "current", to: liveExport.path)
+            #expect(try Data(contentsOf: liveExport) == f.contents())
         } else {
             _ = try recovered.resolveMutation(id, strategy: "preserve-current")
             _ = try recovered.resolveMutation(id, strategy: "preserve-current")
@@ -372,6 +375,12 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
         _ = try runtime.cleanupMutationArtifacts(dryRun: true)
         #expect(try f.contents(operation.artifact) == runtime.snapshotContents(operation.preimageID))
         try runtime.shutdown()
+        if point == "retirement-intent" {
+            let legacy = try f.catalog()
+            for table in ["mutation_decision_history", "mutation_versions", "mutation_retirements", "mutation_decisions"] { try legacy.execute("DROP TABLE " + table) }
+            try legacy.execute("ALTER TABLE mutation_journal DROP COLUMN owned_hint")
+            try legacy.execute("PRAGMA user_version=6")
+        }
         try killMaintenance(f, command: "mutation-cleanup", arguments: ["--retire"], at: point)
         let recovered = try VaultRuntime(configuration: f.configuration)
         if point != "retirement-completed" { #expect(throws: MutationError.self) { try recovered.reconcile() } }
@@ -397,7 +406,7 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
 }
 
 @Test func retirementRefusesUnsafeOrUnfinishedEvidence() throws {
-    for mode in ["active", "quarantined", "inode-replacement", "symlink", "missing", "parent-replacement", "racing-replacement"] {
+    for mode in ["active", "quarantined", "inode-replacement", "symlink", "missing", "parent-replacement", "racing-replacement", "racing-symlink"] {
         let f = try RuntimeFixture(); defer { f.clean() }
         let (runtime, snapshot) = try f.seeded()
         if mode == "active" {
@@ -423,13 +432,18 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
             try FileManager.default.moveItem(at: f.vault, to: f.root.appendingPathComponent("original-vault"))
             try FileManager.default.createDirectory(at: f.vault, withIntermediateDirectories: false)
             try f.write(operation.artifact, "unrelated parent")
+        case "racing-symlink":
+            runtime.mutationFault = { if $0 == "retirement-before-unlink" {
+                try FileManager.default.removeItem(at: artifact)
+                try FileManager.default.createSymbolicLink(at: artifact, withDestinationURL: outside)
+            } }
         case "racing-replacement":
             runtime.mutationFault = { if $0 == "retirement-before-unlink" { try original.write(to: artifact, options: .atomic) } }
         default: break
         }
-        if mode == "racing-replacement" {
+        if mode == "racing-replacement" || mode == "racing-symlink" {
             #expect(throws: MutationError.self) { try runtime.cleanupMutationArtifacts(dryRun: false) }
-            #expect(try f.contents(operation.artifact) == original)
+            #expect(try f.contents(operation.artifact) == (mode == "racing-symlink" ? Data("unrelated bytes".utf8) : original))
         } else {
             let report = try runtime.cleanupMutationArtifacts(dryRun: false)
             #expect(report.allSatisfy { !$0.eligible })
@@ -441,21 +455,22 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
 }
 
 @Test func relocatedRecoveryUsesInodesNotNamesOrHashes() throws {
-    for mode in ["file", "case", "unicode", "parent", "nested"] {
+    for mode in ["file", "case", "unicode", "parent", "nested", "completed-parent"] {
         let f = try RuntimeFixture(); defer { f.clean() }
         let (initial, snapshot) = try f.seeded()
         try FileManager.default.createDirectory(at: f.vault.appendingPathComponent("a/deep"), withIntermediateDirectories: true)
         try FileManager.default.moveItem(at: f.vault.appendingPathComponent("note.md"), to: f.vault.appendingPathComponent("a/deep/note.md"))
         _ = try initial.reconcile()
+        if mode == "completed-parent" { _ = try initial.restoreSnapshot(snapshot.id) }
         try initial.shutdown()
-        try killRestore(f, snapshot: snapshot, at: "exchanged")
+        if mode != "completed-parent" { try killRestore(f, snapshot: snapshot, at: "exchanged") }
         let db = try f.catalog()
         guard case .text(let artifact) = try db.queryValues("SELECT artifact FROM mutation_journal")[0][0] else { throw VaultRuntimeError.inconsistentCatalog }
         // Force explicit review even on a case-insensitive volume.
-        try f.write("a/deep/" + artifact, "competing relocated bytes")
+        if mode != "completed-parent" { try f.write("a/deep/" + artifact, "competing relocated bytes") }
         var parent = "a/deep/", name = "note.md"
         switch mode {
-        case "parent":
+        case "parent", "completed-parent":
             try FileManager.default.moveItem(at: f.vault.appendingPathComponent("a"), to: f.vault.appendingPathComponent("renamed")); parent = "renamed/deep/"
         case "nested":
             try FileManager.default.createDirectory(at: f.vault.appendingPathComponent("other"), withIntermediateDirectories: false)
@@ -471,9 +486,12 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
         let runtime = try VaultRuntime(configuration: f.configuration)
         let id = try #require(runtime.mutationOperations().first).id
         let inspection = try runtime.inspectMutation(id)
-        #expect(inspection.operation.state == "quarantined")
-        #expect(inspection.choices.contains("complete-published"))
-        _ = try runtime.resolveMutation(id, strategy: "complete-published")
+        if mode == "completed-parent" { #expect(inspection.operation.state == "completed") }
+        else {
+            #expect(inspection.operation.state == "quarantined")
+            #expect(inspection.choices.contains("complete-published"))
+            _ = try runtime.resolveMutation(id, strategy: "complete-published")
+        }
         #expect(try f.contents(parent + name) == runtime.snapshotContents(snapshot.id))
         if mode != "case" { #expect(try f.contents("a/deep/note.md") == Data("unrelated path reuse".utf8)) }
         _ = try runtime.cleanupMutationArtifacts(dryRun: false)

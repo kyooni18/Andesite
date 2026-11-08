@@ -95,7 +95,7 @@ do {
                 guard ["--dry-run", "--retire"].contains(args[5]) else { throw CLIError.usage }
                 artifacts = try runtime.cleanupMutationArtifacts(dryRun: args[5] == "--dry-run")
             } else { artifacts = try runtime.mutationArtifacts() }
-            for a in artifacts { print("operation=\(hex(a.operationID)) path=\(a.path) status=\(a.status) logicalBytes=\(a.logicalBytes) allocatedBytes=\(a.allocatedBytes) eligible=\(a.eligible) diagnostic=\(a.diagnostic)") }
+            for a in artifacts { print("operation=\(hex(a.operationID)) path=\(a.path) status=\(a.status) logicalBytes=\(a.status == "uncertain" ? "unknown" : String(a.logicalBytes)) allocatedBytes=\(a.status == "uncertain" ? "unknown" : String(a.allocatedBytes)) eligible=\(a.eligible) diagnostic=\(a.diagnostic)") }
             print("artifactAllocatedBytes=\(artifacts.reduce(0) { $0 + $1.allocatedBytes }) retirementEligibleAllocatedBytes=\(artifacts.filter(\.eligible).reduce(0) { $0 + $1.allocatedBytes }) retainedAllocatedBytes=\(artifacts.filter { !$0.eligible }.reduce(0) { $0 + $1.allocatedBytes }) uncertain=\(artifacts.filter { $0.status == "uncertain" }.count)")
         case "mutation-journal":
             let operations = try runtime.mutationOperations()
@@ -103,6 +103,8 @@ do {
                 print("operation=\(hex(op.id)) document=\(hex(op.entryID)) path=\(op.path) snapshot=\(hex(op.snapshotID)) preimage=\(hex(op.preimageID)) revision=\(hex(op.revisionID)) state=\(op.state) artifact=\(op.artifact) diagnostic=\(op.diagnostic)")
             }
             print("operations=\(operations.count) unfinished=\(operations.filter { !["completed", "cancelled"].contains($0.state) }.count)")
+            let maintenance = try runtime.status()
+            print("vaultState=\(maintenance.state) maintenanceUnfinished=\(maintenance.unfinishedMutations)")
         case "snapshot-config":
             guard let interval = Double(args[5]), let retention = Double(args[6]) else { throw CLIError.invalidPolicy }
             try runtime.configureSnapshots(SnapshotPolicy(minimumInterval: interval, retentionSeconds: retention))
@@ -110,7 +112,7 @@ do {
         case "snapshot-storage":
             let storage = try runtime.snapshotStorage()
             print("minimumIntervalSeconds=\(storage.policy.minimumInterval) retentionSeconds=\(storage.policy.retentionSeconds) snapshots=\(storage.snapshots) expirationEligible=\(storage.expirationEligible) pendingDocuments=\(storage.pendingDocuments) logicalBytes=\(storage.logicalBytes) uniqueSnapshotBytes=\(storage.uniqueSnapshotBytes) registeredObjectBytes=\(storage.registeredObjectBytes) automaticPruning=false")
-            print("immutableObjectLogicalBytes=\(storage.immutableObjectLogicalBytes) physicalObjectAllocatedBytes=\(storage.physicalObjectAllocatedBytes) temporaryObjectAllocatedBytes=\(storage.temporaryObjectAllocatedBytes) journalArtifactAllocatedBytes=\(storage.artifactAllocatedBytes) retirementEligibleAllocatedBytes=\(storage.retirementEligibleAllocatedBytes) unresolvedArtifactAllocatedBytes=\(storage.unresolvedArtifactAllocatedBytes) uncertainArtifacts=\(storage.uncertainArtifacts) physicalNumbersAreAllocatedBlockEstimates=true snapshotLogicalBytesAreNotAdditionalPhysicalUsage=true")
+            print("immutableObjectLogicalBytes=\(storage.immutableObjectLogicalBytes) physicalObjectAllocatedBytes=\(storage.physicalObjectAllocatedBytes) temporaryObjectAllocatedBytes=\(storage.temporaryObjectAllocatedBytes) journalArtifactAllocatedBytes=\(storage.artifactAllocatedBytes) retirementEligibleAllocatedBytes=\(storage.retirementEligibleAllocatedBytes) unresolvedArtifactAllocatedBytes=\(storage.unresolvedArtifactAllocatedBytes) uncertainArtifacts=\(storage.uncertainArtifacts) artifactAccountingComplete=\(storage.uncertainArtifacts == 0) physicalNumbersAreAllocatedBlockEstimates=true snapshotLogicalBytesAreNotAdditionalPhysicalUsage=true")
             for object in storage.objects {
                 print("\(object.contentHash) bytes=\(object.byteLength) snapshots=\(object.snapshots) revisions=\(object.revisions) incidents=\(object.incidents) mutationVersions=\(object.mutationVersions)")
             }

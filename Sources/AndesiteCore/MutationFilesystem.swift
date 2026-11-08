@@ -12,8 +12,8 @@ public enum MutationError: Error, CustomStringConvertible {
     case unsupportedPlatform
     public var description: String {
         switch self {
-        case .conflict(let message): return "Restoration conflict: \(message). Inspect mutation-journal; preserve journal artifacts and use snapshot-export for manual recovery."
-        case .unfinished: return "Unresolved mutation journal; ordinary reconciliation/restoration is blocked. Inspect mutation-journal and export snapshots; do not remove retained artifacts."
+        case .conflict(let message): return "Restoration conflict: \(message). Inspect mutation-inspect; preserve versions with mutation-export and select only an offered resolution strategy."
+        case .unfinished: return "Unresolved mutation or pending artifact retirement; reconciliation/restoration is blocked. Inspect mutation-journal and mutation-artifacts, export recoverable versions, then explicitly resolve or resume cleanup. Do not remove artifacts manually."
         case .unsupportedPlatform: return "In-place restoration requires local macOS/APFS vault and state with qualified metadata/exchange semantics; use snapshot-export on this platform."
         }
     }

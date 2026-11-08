@@ -342,7 +342,9 @@ public final class VaultRuntime {
 
     @discardableResult
     public func resolveMutation(_ id: Data, strategy: String) throws -> MutationOperation {
-        let result = try journal().resolve(id, strategy: strategy)
+        let j = try journal()
+        try j.recover()
+        let result = try j.resolve(id, strategy: strategy)
         try setState(try journal().hasUnfinished() ? "quarantined" : "scanRequired")
         return result
     }

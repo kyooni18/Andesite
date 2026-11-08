@@ -71,7 +71,7 @@ public enum CatalogSchema {
                 try db.execute("""
                     CREATE TABLE mutation_decisions (
                       vault_id BLOB NOT NULL, operation_id BLOB NOT NULL, strategy TEXT NOT NULL,
-                      evidence BLOB NOT NULL, outcome TEXT NOT NULL, created_at REAL NOT NULL, base_revision BLOB NOT NULL, outcome_revision BLOB,
+                      evidence BLOB NOT NULL, outcome TEXT NOT NULL, created_at REAL NOT NULL, base_revision BLOB NOT NULL, outcome_revision BLOB, refusal TEXT NOT NULL,
                       PRIMARY KEY(vault_id,operation_id),
                       FOREIGN KEY(vault_id,operation_id) REFERENCES mutation_journal(vault_id,id)
                     ) WITHOUT ROWID
@@ -96,7 +96,7 @@ public enum CatalogSchema {
                 try db.execute("""
                     CREATE TABLE mutation_decision_history (
                       id INTEGER PRIMARY KEY, vault_id BLOB NOT NULL, operation_id BLOB NOT NULL,
-                      strategy TEXT NOT NULL, evidence BLOB NOT NULL, outcome TEXT NOT NULL, created_at REAL NOT NULL, base_revision BLOB NOT NULL, outcome_revision BLOB,
+                      strategy TEXT NOT NULL, evidence BLOB NOT NULL, outcome TEXT NOT NULL, created_at REAL NOT NULL, base_revision BLOB NOT NULL, outcome_revision BLOB, refusal TEXT NOT NULL,
                       FOREIGN KEY(vault_id,operation_id) REFERENCES mutation_journal(vault_id,id)
                     )
                     """)

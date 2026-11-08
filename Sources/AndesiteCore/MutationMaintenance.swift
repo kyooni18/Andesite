@@ -94,7 +94,7 @@ extension MutationJournal {
         return try Retirement(path: path, hint: JSONDecoder().decode(FileFingerprint.self, from: hint), hash: hash, state: state)
     }
     func decision(_ r: Record) throws -> [SQLiteValue]? {
-        try db.queryValues("SELECT strategy,evidence,outcome,base_revision,outcome_revision FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r)).first
+        try db.queryValues("SELECT strategy,evidence,outcome,base_revision,outcome_revision,refusal FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r)).first
     }
     func decisionFinished(_ r: Record) throws -> Bool {
         guard let d = try decision(r) else { return false }; return d[2] == .text("completed")
@@ -151,6 +151,9 @@ extension MutationJournal {
         return (MutationVersion(role: role, path: located.path, hash: ObjectStore.hash(observed.bytes), fingerprint: observed.fingerprint, bytes: observed.bytes.count), observed.bytes)
     }
     func evidence(_ r: Record) throws -> [(MutationVersion, Data)] {
+        let source = try snapshot(r.operation.snapshotID).0, before = try snapshot(r.operation.preimageID).0
+        guard source.entryID == r.operation.entryID, before.entryID == r.operation.entryID,
+              before.revisionID == r.parent else { throw MutationError.conflict("journal snapshot identity or preimage lineage mismatch") }
         var versions: [(MutationVersion, Data)] = []
         for (role, id) in [("intended", r.operation.snapshotID), ("preimage", r.operation.preimageID)] {
             let (s, bytes) = try snapshot(id)
@@ -181,11 +184,11 @@ extension MutationJournal {
                 if let fp = v.fingerprint, try !isOwned(ObservedFile(fingerprint: fp, bytes: Data()), r) { diagnostics.append("\(role): UNVERIFIED ownership; no resolution or retirement authority") }
             } catch { diagnostics.append("\(role): \(error)") }
         }
-        if let e = try? evidence(r), let candidate = e.first(where: { $0.0.role == "current" }),
+        if r.operation.state == "quarantined", let e = try? evidence(r), let candidate = e.first(where: { $0.0.role == "current" }),
            candidate.0.path.lowercased().hasSuffix(".md"), String(data: candidate.1, encoding: .utf8) != nil {
             choices = ["accept-current", "preserve-current"]
             let current = e.first { $0.0.role == "current" }!
-            if current.0.fingerprint?.sameInode(as: r.original) == true, current.1 == (try snapshot(r.operation.preimageID).1),
+            if Array(current.0.path.utf8) == Array(r.operation.path.utf8), current.0.fingerprint?.sameInode(as: r.original) == true, current.1 == (try snapshot(r.operation.preimageID).1),
                try db.queryValues("SELECT head_revision FROM entries WHERE vault_id=? AND id=?", bindings: [.blob(vaultID), .blob(r.operation.entryID)]) == [[.blob(r.parent)]] { choices.append("cancel-unpublished") }
             if current.0.fingerprint?.sameInode(as: r.stage ?? r.original) == true, r.stage != nil,
                current.1 == (try snapshot(r.operation.snapshotID).1) { choices.append("complete-published") }
@@ -205,12 +208,28 @@ extension MutationJournal {
         if let current = versions.first(where: { $0.role == "current" }), current.hash != versions.first(where: { $0.role == "intended" })?.hash {
             diagnostics.append("Current content differs from intended restoration; accepting it creates/preserves external revision lineage")
         }
+        if let artifact = versions.first(where: { $0.role == "artifact" }),
+           !versions.filter({ ["preimage", "intended"].contains($0.role) }).contains(where: { $0.hash == artifact.hash }) {
+            diagnostics.append("Artifact differs from both immutable versions and may contain unique user bytes; preserve/export before resolving")
+        }
         let d = try decision(r)
+        if d?[2] == .text("pending"), case .blob(let encoded) = d?[1], let now = try? evidence(r),
+           try JSONDecoder().decode([MutationVersion].self, from: encoded) != now.map(\.0) {
+            choices = []
+            diagnostics.append("Pending selection pins earlier evidence. It cannot adopt subsequent edits; export preserved hashes and live versions for manual review")
+        }
+        if let current = versions.first(where: { $0.role == "current" }) {
+            let key = try VaultPath(current.path).portabilityKey
+            if try !db.queryValues("SELECT id FROM entries WHERE vault_id=? AND path_key=? AND state='live' AND id<>?", bindings: [.blob(vaultID), .text(key), .blob(r.operation.entryID)]).isEmpty {
+                choices = []
+                diagnostics.append("Current path conflicts with another catalog document; namespace resolution required")
+            }
+        }
         let strategy: String?; if case .text(let s) = d?[0] { strategy = s } else { strategy = nil }
         let outcome: String?; if case .text(let s) = d?[2] { outcome = s } else { outcome = nil }
-        let archived = try db.queryValues("SELECT strategy,outcome,lower(hex(base_revision)),lower(hex(outcome_revision)),created_at FROM mutation_decision_history WHERE vault_id=? AND operation_id=? ORDER BY id", bindings: bindings(r))
-        let active = try db.queryValues("SELECT strategy,outcome,lower(hex(base_revision)),lower(hex(outcome_revision)),created_at FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
-        let audit = (archived + active).map { "strategy=\($0[0]) outcome=\($0[1]) baseRevision=\($0[2]) resultRevision=\($0[3]) createdAt=\($0[4])" }
+        let archived = try db.queryValues("SELECT strategy,outcome,lower(hex(base_revision)),lower(hex(outcome_revision)),created_at,refusal FROM mutation_decision_history WHERE vault_id=? AND operation_id=? ORDER BY id", bindings: bindings(r))
+        let active = try db.queryValues("SELECT strategy,outcome,lower(hex(base_revision)),lower(hex(outcome_revision)),created_at,refusal FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
+        let audit = (archived + active).map { "strategy=\($0[0]) outcome=\($0[1]) baseRevision=\($0[2]) resultRevision=\($0[3]) createdAt=\($0[4]) automaticRefusal=\($0[5])" }
         return MutationInspection(operation: r.operation, parentRevision: r.parent, expectedOriginal: r.original, expectedStage: r.stage, previousDecisions: try db.queryValues("SELECT id FROM mutation_decision_history WHERE vault_id=? AND operation_id=?", bindings: bindings(r)).count, audit: audit, versions: versions, diagnostics: diagnostics.filter { !$0.isEmpty }, choices: choices, strategy: strategy, outcome: outcome)
     }
     func preserve(_ versions: [(MutationVersion, Data)], record r: Record) throws {
@@ -245,14 +264,14 @@ extension MutationJournal {
         try preserve(e, record: r)
         try db.transaction {
             if let d = try decision(r), d[2] == .text("completed") {
-                try db.executeValues("INSERT INTO mutation_decision_history(vault_id,operation_id,strategy,evidence,outcome,created_at,base_revision,outcome_revision) SELECT vault_id,operation_id,strategy,evidence,outcome,created_at,base_revision,outcome_revision FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
+                try db.executeValues("INSERT INTO mutation_decision_history(vault_id,operation_id,strategy,evidence,outcome,created_at,base_revision,outcome_revision,refusal) SELECT vault_id,operation_id,strategy,evidence,outcome,created_at,base_revision,outcome_revision,refusal FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
                 try db.executeValues("DELETE FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
             }
             if let d = try decision(r) {
                 let previous = try JSONDecoder().decode([MutationVersion].self, from: { if case .blob(let b) = d[1] { return b }; return Data() }())
                 guard previous == e.map(\.0) else { throw MutationError.conflict("evidence changed since the durable resolution intent; quarantine retained") }
             } else {
-                try db.executeValues("INSERT INTO mutation_decisions VALUES(?,?,?,?,?,?,?,NULL)", bindings: bindings(r) + [.text(strategy), .blob(encoded), .text("pending"), .real(Date().timeIntervalSince1970), base[0][0]])
+                try db.executeValues("INSERT INTO mutation_decisions VALUES(?,?,?,?,?,?,?,NULL,?)", bindings: bindings(r) + [.text(strategy), .blob(encoded), .text("pending"), .real(Date().timeIntervalSince1970), base[0][0], .text(r.operation.diagnostic)])
             }
         }
         try fault("resolution-intent")
@@ -269,7 +288,7 @@ extension MutationJournal {
             // Explicit namespace collision check, including case/Unicode aliases.
             guard try db.queryValues("SELECT id FROM entries WHERE vault_id=? AND path_key=? AND state='live' AND id<>?", bindings: [.blob(vaultID), .text(p.path.portabilityKey), .blob(r.operation.entryID)]).isEmpty else { throw MutationError.conflict("relocated path belongs to another catalog document") }
             if strategy == "cancel-unpublished" {
-                guard heads == [[.blob(r.parent)]], location.path == r.operation.path else { throw MutationError.conflict("cancellation requires the unchanged original catalog path") }
+                guard heads == [[.blob(r.parent)]], Array(location.path.utf8) == Array(r.operation.path.utf8) else { throw MutationError.conflict("cancellation requires the unchanged original catalog path") }
             }
             do {
                 let restoring: Data? = strategy == "complete-published" && heads == [[.blob(r.parent)]] ? r.operation.revisionID : nil
@@ -295,15 +314,20 @@ extension MutationJournal {
             guard preserved.contains([.text(hash)]) else { throw MutationError.conflict("hash is not preserved by this operation") }
             bytes = try objects.get(hash, maximumBytes: maximumBytes)
         }
-        // Prefer durable decision evidence: this still works after retirement.
+        // Live representations first; preserved hashes identify earlier observations.
+        if role == "current", let l = try? currentLocation(r), let live = try? version(role, l) { bytes = live.1 }
+        if role == "artifact", let l = try? artifactLocation(r), let live = try? version(role, l) { bytes = live.1 }
+        // Durable decision evidence remains available after retirement.
         if bytes == nil, let d = try decision(r), case .blob(let encoded) = d[1],
            let v = try JSONDecoder().decode([MutationVersion].self, from: encoded).first(where: { $0.role == role }) {
             bytes = try objects.get(v.hash, maximumBytes: maximumBytes)
-        } else if role == "intended" || role == "preimage" {
+        }
+        if bytes == nil, role == "intended" || role == "preimage" {
             bytes = try snapshot(role == "intended" ? r.operation.snapshotID : r.operation.preimageID).1
-        } else if role == "current" { bytes = try version(role, currentLocation(r)).1 }
-        else if role == "artifact" { bytes = try version(role, artifactLocation(r)).1 }
-        else if role == "path-occupant" { bytes = try filesystem(path: r.operation.path).observe(VaultPath(r.operation.path).components.last!, maximumBytes: maximumBytes).bytes }
+        }
+        if bytes == nil, role == "current" { bytes = try version(role, currentLocation(r)).1 }
+        if bytes == nil, role == "artifact" { bytes = try version(role, artifactLocation(r)).1 }
+        if role == "path-occupant" { bytes = try filesystem(path: r.operation.path).observe(VaultPath(r.operation.path).components.last!, maximumBytes: maximumBytes).bytes }
         if role == "retirement", let t = try retirement(r) { bytes = try objects.get(t.hash, maximumBytes: maximumBytes) }
         guard let bytes else { throw MutationError.conflict("version is unavailable") }
         try SnapshotExport.publish(bytes, to: destination, excluding: [root, stateRoot])
