@@ -25,5 +25,10 @@ long andesite_local_http_read_headers(int client, char *buffer, unsigned long ca
 void andesite_local_http_close(andesite_local_http *server);
 void andesite_monitor_install_stop_handlers(void);
 int andesite_monitor_stop_requested(void);
-#endif
+/* Bounded, local-only read-only HTTP relay; 0 on success, -1 on failure.
+   The response is the entire HTTP/1.1 response, capped by capacity. */
+int andesite_http_relay_get(const char *socket_path, const char *target,
+                           unsigned char *out, unsigned long capacity,
+                           unsigned long *length);
+#endif /* __APPLE__ */
 #endif /* ANDESITE_FS_H */

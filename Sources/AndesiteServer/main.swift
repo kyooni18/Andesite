@@ -1,7 +1,7 @@
 import Foundation
 import AndesiteCore
 
-// Local-only CLI. Only watch starts a private same-user Unix-domain HTTP socket.
+// Local-first CLI. The opt-in Hummingbird API serves only 127.0.0.1 with bearer auth.
 enum CLIError: Error { case usage; case invalidIdentifier; case invalidPolicy }
 func hex(_ bytes: Data) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
 func identifier(_ text: String) throws -> Data {
@@ -26,6 +26,8 @@ Usage: andesite-server <command> --vault /absolute/vault --state /absolute/priva
                                    (connect, reconcile and close gracefully)
   vault-watch /absolute/vault [--state /absolute/private-state]
                                    (connect, reconcile, then continuously monitor until stopped)
+  api-serve /absolute/vault [--port 8788] [--state /absolute/private-state]
+                                   (Hummingbird authenticated loopback read-only HTTP proxy)
   init | reconcile | status | search <phrase>
   watch    (macOS FSEvents plus read-only HTTP on state/andesite-read.sock; SIGINT/SIGTERM to stop)
   snapshots [document-id-or-historical-path]
@@ -57,6 +59,34 @@ do {
         default:
             print(try registry.unregister() ? "Removed saved path: \(args[1])" : "Not registered: \(args[1])")
         }
+    } else if args.first == "api-serve" {
+        #if os(macOS)
+        guard args.count >= 2 else { throw CLIError.usage }
+        let vault = args[1]
+        var port = 8788
+        var state: String?
+        var index = 2
+        while index < args.count {
+            guard index + 1 < args.count else { throw CLIError.usage }
+            switch args[index] {
+            case "--port":
+                guard let candidate = Int(args[index + 1]) else { throw CLIError.usage }
+                port = candidate
+            case "--state":
+                state = args[index + 1]
+            default:
+                throw CLIError.usage
+            }
+            index += 2
+        }
+        if #available(macOS 14.0, *) {
+            try await AndesiteHTTPAPI.run(vault: vault, state: state, port: port)
+        } else {
+            throw CLIError.usage
+        }
+        #else
+        throw CLIError.usage
+        #endif
     } else if let command = args.first,
               ["vault-open", "vault-watch", "vault-state"].contains(command) {
         if command == "vault-state" {

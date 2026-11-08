@@ -222,3 +222,31 @@ private final class WatchProcessFixture {
     f.stop(SIGTERM)
 }
 #endif
+
+#if os(macOS)
+@Test func unixHTTPRelayReadsVerifiedCatalogAndFailsClosedAfterShutdown() async throws {
+    let f = try WatchProcessFixture(); defer { f.clean() }
+    try f.fixture.write("note.md", "# Relay\nrelayunique\n")
+    try f.start()
+    #expect(f.awaitReady())
+
+    let relay = VaultHTTPRelay(socketPath: f.socket)
+    let result = await relay.get("/v1/search?q=relayunique")
+    #expect(result.status == 200)
+    #expect(result.contentType == "application/json; charset=utf-8")
+    #expect(String(decoding: result.body, as: UTF8.self).contains("Relay"))
+    let metadata = await relay.get("/v1/snapshots?path=note.md")
+    #expect(metadata.status == 200)
+    #expect(String(decoding: metadata.body, as: UTF8.self).contains("snapshots"))
+    let rejected = await relay.get("/v1/search?q=%0aHTTP%2F1.1")
+    #expect(rejected.status == 400 || rejected.status == 200)
+    let unsafe = await relay.get("/v1/status\r\nX-Injected: yes")
+    #expect(unsafe.status == 400)
+    let outOfScope = await relay.get("/v2/admin")
+    #expect(outOfScope.status == 400)
+
+    f.stop(SIGTERM)
+    let unavailable = await relay.get("/v1/status")
+    #expect(unavailable.status == 503)
+}
+#endif
