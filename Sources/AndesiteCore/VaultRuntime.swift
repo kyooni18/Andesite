@@ -145,7 +145,7 @@ public final class VaultRuntime {
         func count(_ table: String, _ suffix: String = "") throws -> Int {
             Int(try r.db.scalarText("SELECT count(*) FROM \(table) \(suffix)") ?? "") ?? 0
         }
-        return try VaultStatus(vaultID: vaultID, state: r.db.scalarText("SELECT state FROM vaults") ?? "unknown", entries: count("entries"), revisions: count("revisions"), openIncidents: count("incidents", "WHERE status='open'"), unfinishedMutations: count("mutation_journal", "WHERE state NOT IN ('completed','cancelled')"))
+        return try VaultStatus(vaultID: vaultID, state: r.db.scalarText("SELECT state FROM vaults") ?? "unknown", entries: count("entries"), revisions: count("revisions"), openIncidents: count("incidents", "WHERE status='open'"), unfinishedMutations: count("mutation_journal", "WHERE state NOT IN ('completed','cancelled') OR id IN (SELECT operation_id FROM mutation_retirements WHERE state='pending')"))
     }
 
     /// Search refreshes canonical files first; failed/partial scans never expose

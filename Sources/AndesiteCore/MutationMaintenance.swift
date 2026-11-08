@@ -16,6 +16,11 @@ public struct MutationVersion: Codable, Sendable, Equatable {
 
 public struct MutationInspection: Sendable {
     public let operation: MutationOperation
+    public let parentRevision: Data
+    public let expectedOriginal: FileFingerprint
+    public let expectedStage: FileFingerprint?
+    public let previousDecisions: Int
+    public let audit: [String]
     public let versions: [MutationVersion]
     public let diagnostics: [String]
     public let choices: [String]
@@ -42,7 +47,10 @@ extension MutationFilesystem {
         var files: [String] = [], directories = [String](), count = 0
         let device = identities.last!.device
         func visit(_ fd: Int32, _ prefix: String, _ depth: Int) throws {
-            guard depth < 128, let stream = fdopendir(dup(fd)) else { throw MutationError.conflict("relocation census limit or descriptor failure") }
+            guard depth < 128 else { throw MutationError.conflict("relocation census depth limit") }
+            let copy = dup(fd)
+            guard copy >= 0 else { throw MutationError.conflict("relocation census descriptor failure") }
+            guard let stream = fdopendir(copy) else { close(copy); throw MutationError.conflict("relocation census stream failure") }
             defer { closedir(stream) }
             directories.append(prefix)
             while true {
@@ -86,7 +94,7 @@ extension MutationJournal {
         return try Retirement(path: path, hint: JSONDecoder().decode(FileFingerprint.self, from: hint), hash: hash, state: state)
     }
     func decision(_ r: Record) throws -> [SQLiteValue]? {
-        try db.queryValues("SELECT strategy,evidence,outcome FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r)).first
+        try db.queryValues("SELECT strategy,evidence,outcome,base_revision,outcome_revision FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r)).first
     }
     func decisionFinished(_ r: Record) throws -> Bool {
         guard let d = try decision(r) else { return false }; return d[2] == .text("completed")
@@ -173,7 +181,8 @@ extension MutationJournal {
                 if let fp = v.fingerprint, try !isOwned(ObservedFile(fingerprint: fp, bytes: Data()), r) { diagnostics.append("\(role): UNVERIFIED ownership; no resolution or retirement authority") }
             } catch { diagnostics.append("\(role): \(error)") }
         }
-        if let e = try? evidence(r) {
+        if let e = try? evidence(r), let candidate = e.first(where: { $0.0.role == "current" }),
+           candidate.0.path.lowercased().hasSuffix(".md"), String(data: candidate.1, encoding: .utf8) != nil {
             choices = ["accept-current", "preserve-current"]
             let current = e.first { $0.0.role == "current" }!
             if current.0.fingerprint?.sameInode(as: r.original) == true, current.1 == (try snapshot(r.operation.preimageID).1),
@@ -181,10 +190,28 @@ extension MutationJournal {
             if current.0.fingerprint?.sameInode(as: r.stage ?? r.original) == true, r.stage != nil,
                current.1 == (try snapshot(r.operation.snapshotID).1) { choices.append("complete-published") }
         }
+        if let fs = try? filesystem(path: r.operation.path), let observed = try? fs.observe(fs.name, maximumBytes: maximumBytes),
+           try !isOwned(observed, r) {
+            versions.append(MutationVersion(role: "path-occupant", path: r.operation.path, hash: ObjectStore.hash(observed.bytes), fingerprint: observed.fingerprint, bytes: observed.bytes.count))
+            diagnostics.append("Original path is occupied by an unrelated inode; it will never be overwritten or adopted by resolution")
+        }
+        for row in try db.queryValues("SELECT role,hash,byte_length,path,hint FROM mutation_versions WHERE vault_id=? AND operation_id=? ORDER BY role,hash", bindings: bindings(r)) {
+            guard case .text(let role) = row[0], case .blob(let hash) = row[1], case .integer(let length) = row[2], case .text(let path) = row[3] else { throw VaultRuntimeError.inconsistentCatalog }
+            let fp: FileFingerprint?
+            if case .blob(let hint) = row[4] { fp = try JSONDecoder().decode(FileFingerprint.self, from: hint) } else { fp = nil }
+            _ = try objects.get(Self.hex(hash), maximumBytes: maximumBytes)
+            versions.append(MutationVersion(role: "preserved:" + role, path: path, hash: Self.hex(hash), fingerprint: fp, bytes: Int(length)))
+        }
+        if let current = versions.first(where: { $0.role == "current" }), current.hash != versions.first(where: { $0.role == "intended" })?.hash {
+            diagnostics.append("Current content differs from intended restoration; accepting it creates/preserves external revision lineage")
+        }
         let d = try decision(r)
         let strategy: String?; if case .text(let s) = d?[0] { strategy = s } else { strategy = nil }
         let outcome: String?; if case .text(let s) = d?[2] { outcome = s } else { outcome = nil }
-        return MutationInspection(operation: r.operation, versions: versions, diagnostics: diagnostics.filter { !$0.isEmpty }, choices: choices, strategy: strategy, outcome: outcome)
+        let archived = try db.queryValues("SELECT strategy,outcome,lower(hex(base_revision)),lower(hex(outcome_revision)),created_at FROM mutation_decision_history WHERE vault_id=? AND operation_id=? ORDER BY id", bindings: bindings(r))
+        let active = try db.queryValues("SELECT strategy,outcome,lower(hex(base_revision)),lower(hex(outcome_revision)),created_at FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
+        let audit = (archived + active).map { "strategy=\($0[0]) outcome=\($0[1]) baseRevision=\($0[2]) resultRevision=\($0[3]) createdAt=\($0[4])" }
+        return MutationInspection(operation: r.operation, parentRevision: r.parent, expectedOriginal: r.original, expectedStage: r.stage, previousDecisions: try db.queryValues("SELECT id FROM mutation_decision_history WHERE vault_id=? AND operation_id=?", bindings: bindings(r)).count, audit: audit, versions: versions, diagnostics: diagnostics.filter { !$0.isEmpty }, choices: choices, strategy: strategy, outcome: outcome)
     }
     func preserve(_ versions: [(MutationVersion, Data)], record r: Record) throws {
         for (v, bytes) in versions {
@@ -193,7 +220,7 @@ extension MutationJournal {
             try db.transaction {
                 try ExternalCapture.registerObject(db: db, prepared: p, timestamp: ISO8601DateFormatter().string(from: Date()))
                 try db.executeValues("INSERT OR IGNORE INTO mutation_versions(vault_id,operation_id,role,hash,byte_length,path,hint) VALUES(?,?,?,?,?,?,?)", bindings: bindings(r) + [.text(v.role), .blob(p.hashBytes), .integer(Int64(v.bytes)), .text(v.path), try v.fingerprint.map { .blob(try JSONEncoder().encode($0)) } ?? .null])
-                guard try db.queryValues("SELECT hash FROM mutation_versions WHERE vault_id=? AND operation_id=? AND role=?", bindings: bindings(r) + [.text(v.role)]) == [[.blob(p.hashBytes)]] else { throw MutationError.conflict("preserved version changed; existing recovery bytes retained") }
+
             }
         }
     }
@@ -202,18 +229,30 @@ extension MutationJournal {
     func resolve(_ id: Data, strategy: String) throws -> MutationOperation {
         let r = try reload(id)
         if let d = try decision(r) {
-            guard d[0] == .text(strategy) else { throw MutationError.conflict("a different resolution is already recorded") }
-            if d[2] == .text("completed") { return r.operation }
+            if d[2] == .text("completed"), ["completed", "cancelled"].contains(r.operation.state) {
+                guard d[0] == .text(strategy) else { throw MutationError.conflict("a different resolution is already recorded") }
+                return r.operation
+            }
+            if d[2] == .text("pending"), d[0] != .text(strategy) { throw MutationError.conflict("a different pending resolution is already recorded") }
         }
         guard r.operation.state == "quarantined", try inspect(id).choices.contains(strategy) else { throw MutationError.conflict("strategy is not safe for the current verified evidence") }
+        let base = try db.queryValues("SELECT head_revision FROM entries WHERE vault_id=? AND id=? AND state='live'", bindings: [.blob(vaultID), .blob(r.operation.entryID)])
+        let prior = try decision(r)
+        let priorBase = prior.map { [$0[2] == .text("completed") ? $0[4] : $0[3]] }
+        guard base == [[.blob(r.parent)]] || base == [[.blob(r.operation.revisionID)]] ||
+              priorBase.map({ base == [$0] }) == true else { throw MutationError.conflict("catalog lineage has diverged") }
         let e = try evidence(r), encoded = try JSONEncoder().encode(e.map(\.0))
         try preserve(e, record: r)
         try db.transaction {
+            if let d = try decision(r), d[2] == .text("completed") {
+                try db.executeValues("INSERT INTO mutation_decision_history(vault_id,operation_id,strategy,evidence,outcome,created_at,base_revision,outcome_revision) SELECT vault_id,operation_id,strategy,evidence,outcome,created_at,base_revision,outcome_revision FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
+                try db.executeValues("DELETE FROM mutation_decisions WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
+            }
             if let d = try decision(r) {
                 let previous = try JSONDecoder().decode([MutationVersion].self, from: { if case .blob(let b) = d[1] { return b }; return Data() }())
                 guard previous == e.map(\.0) else { throw MutationError.conflict("evidence changed since the durable resolution intent; quarantine retained") }
             } else {
-                try db.executeValues("INSERT INTO mutation_decisions VALUES(?,?,?,?,?,?)", bindings: bindings(r) + [.text(strategy), .blob(encoded), .text("pending"), .real(Date().timeIntervalSince1970)])
+                try db.executeValues("INSERT INTO mutation_decisions VALUES(?,?,?,?,?,?,?,NULL)", bindings: bindings(r) + [.text(strategy), .blob(encoded), .text("pending"), .real(Date().timeIntervalSince1970), base[0][0]])
             }
         }
         try fault("resolution-intent")
@@ -225,21 +264,24 @@ extension MutationJournal {
             let p = try ExternalCapture.prepare(path: VaultPath(location.path), observation: observation, objects: objects)
             guard p.valid else { throw MutationError.conflict("current bytes are not valid Markdown; export before manual repair") }
             let heads = try db.queryValues("SELECT head_revision FROM entries WHERE vault_id=? AND id=? AND state='live'", bindings: [.blob(vaultID), .blob(r.operation.entryID)])
-            guard heads == [[.blob(r.parent)]] || heads == [[.blob(r.operation.revisionID)]] else { throw MutationError.conflict("catalog lineage has diverged") }
+            guard let active = try decision(r), heads == [[active[3]]] else { throw MutationError.conflict("catalog lineage has diverged since resolution intent") }
+            var resultRevision: Data?
             // Explicit namespace collision check, including case/Unicode aliases.
             guard try db.queryValues("SELECT id FROM entries WHERE vault_id=? AND path_key=? AND state='live' AND id<>?", bindings: [.blob(vaultID), .text(p.path.portabilityKey), .blob(r.operation.entryID)]).isEmpty else { throw MutationError.conflict("relocated path belongs to another catalog document") }
-            if strategy != "cancel-unpublished" {
+            if strategy == "cancel-unpublished" {
+                guard heads == [[.blob(r.parent)]], location.path == r.operation.path else { throw MutationError.conflict("cancellation requires the unchanged original catalog path") }
+            }
+            do {
                 let restoring: Data? = strategy == "complete-published" && heads == [[.blob(r.parent)]] ? r.operation.revisionID : nil
                 guard let captured = try ExternalCapture.publish(db: db, vaultID: vaultID, prepared: p, entryID: r.operation.entryID, at: Date(), restoringRevision: restoring) else { throw SnapshotError.inconsistentMetadata }
+                resultRevision = captured.revisionID
                 try SearchIndex.index(db: db, vaultID: vaultID, entryID: captured.entryID, revisionID: captured.revisionID, bytes: current.1, withinTransaction: true)
                 _ = try preserveHead(entryID: captured.entryID, at: Date())
-            } else {
-                guard heads == [[.blob(r.parent)]], location.path == r.operation.path else { throw MutationError.conflict("cancellation requires the unchanged original catalog path") }
             }
             try fault("resolution-written")
             guard try evidence(r).map(\.0) == e.map(\.0) else { throw MutationError.conflict("external edit before resolution commit") }
             try setState(r, strategy == "cancel-unpublished" ? "cancelled" : "completed", "Explicit resolution: " + strategy + "; competing versions retained in mutation_decisions")
-            try db.executeValues("UPDATE mutation_decisions SET outcome='completed' WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
+            try db.executeValues("UPDATE mutation_decisions SET outcome='completed',outcome_revision=? WHERE vault_id=? AND operation_id=?", bindings: [resultRevision.map(SQLiteValue.blob) ?? .null] + bindings(r))
         }
         try fault("resolution-completed")
         return try reload(id).operation
@@ -247,14 +289,21 @@ extension MutationJournal {
     func exportVersion(_ id: Data, role: String, to destination: String) throws {
         let r = try reload(id)
         var bytes: Data?
+        if role.hasPrefix("sha256:") {
+            let hash = String(role.dropFirst(7))
+            let preserved = try db.queryValues("SELECT lower(hex(hash)) FROM mutation_versions WHERE vault_id=? AND operation_id=?", bindings: bindings(r))
+            guard preserved.contains([.text(hash)]) else { throw MutationError.conflict("hash is not preserved by this operation") }
+            bytes = try objects.get(hash, maximumBytes: maximumBytes)
+        }
         // Prefer durable decision evidence: this still works after retirement.
-        if let d = try decision(r), case .blob(let encoded) = d[1],
+        if bytes == nil, let d = try decision(r), case .blob(let encoded) = d[1],
            let v = try JSONDecoder().decode([MutationVersion].self, from: encoded).first(where: { $0.role == role }) {
             bytes = try objects.get(v.hash, maximumBytes: maximumBytes)
         } else if role == "intended" || role == "preimage" {
             bytes = try snapshot(role == "intended" ? r.operation.snapshotID : r.operation.preimageID).1
         } else if role == "current" { bytes = try version(role, currentLocation(r)).1 }
         else if role == "artifact" { bytes = try version(role, artifactLocation(r)).1 }
+        else if role == "path-occupant" { bytes = try filesystem(path: r.operation.path).observe(VaultPath(r.operation.path).components.last!, maximumBytes: maximumBytes).bytes }
         if role == "retirement", let t = try retirement(r) { bytes = try objects.get(t.hash, maximumBytes: maximumBytes) }
         guard let bytes else { throw MutationError.conflict("version is unavailable") }
         try SnapshotExport.publish(bytes, to: destination, excluding: [root, stateRoot])
@@ -265,18 +314,32 @@ extension MutationJournal {
                 return MutationArtifact(operationID: r.operation.id, path: t.path, status: "retired", diagnostic: "durable retirement receipt; path is no longer excluded or owned", logicalBytes: 0, allocatedBytes: 0, eligible: false)
             }
             do {
-                let l = try artifactLocation(r), observation = try l.fs.observe(l.fs.name, maximumBytes: maximumBytes)
+                let l = try artifactLocation(r)
+                if r.operation.state == "cancelled", r.stage == nil, try ownedStage(r) == nil, try l.fs.info(l.fs.name) == nil {
+                    return MutationArtifact(operationID: r.operation.id, path: l.path, status: "not-observed", diagnostic: "cancelled without durable stage identity; absence gives no retirement authority", logicalBytes: 0, allocatedBytes: 0, eligible: false)
+                }
+                if let t = try retirement(r), t.state == "pending", try l.fs.info(l.fs.name) == nil {
+                    return MutationArtifact(operationID: r.operation.id, path: l.path, status: "retirement-pending", diagnostic: "bytes preserved; repeat explicit cleanup to sync parent and commit receipt", logicalBytes: 0, allocatedBytes: 0, eligible: false)
+                }
+                let observation = try l.fs.observe(l.fs.name, maximumBytes: maximumBytes)
                 guard try isOwned(observation, r), let s = try l.fs.info(l.fs.name) else { throw MutationError.conflict("artifact identity mismatch") }
+                if let t = try retirement(r), observation.fingerprint != t.hint || ObjectStore.hash(observation.bytes) != t.hash {
+                    return MutationArtifact(operationID: r.operation.id, path: l.path, status: "uncertain", diagnostic: "artifact changed after durable retirement intent; repeat cleanup will refuse deletion", logicalBytes: s.st_size, allocatedBytes: Int64(s.st_blocks) * 512, eligible: false)
+                }
                 let expected: String?
                 if let d = try decision(r), case .blob(let data) = d[1] {
                     expected = try JSONDecoder().decode([MutationVersion].self, from: data).first { $0.role == "artifact" }?.hash
                 } else if r.operation.state == "completed" { expected = try snapshot(r.operation.preimageID).0.contentHash }
                 else if r.operation.state == "cancelled", r.stage != nil { expected = try snapshot(r.operation.snapshotID).0.contentHash }
                 else { expected = nil }
-                let eligible = ["completed", "cancelled"].contains(r.operation.state) && expected == ObjectStore.hash(observation.bytes)
+                let referenced = try records().contains { other in
+                    guard other.operation.id != r.operation.id, !["completed", "cancelled"].contains(other.operation.state) else { return false }
+                    return try isOwned(observation, other)
+                }
+                let eligible = !referenced && ["completed", "cancelled"].contains(r.operation.state) && expected == ObjectStore.hash(observation.bytes)
                 return MutationArtifact(operationID: r.operation.id, path: l.path, status: eligible ? "retirement-eligible" : r.operation.state, diagnostic: eligible ? "verified owned inode and preserved content; retirement preserves exact bytes first" : "retained: unresolved operation or content differs from verified completion", logicalBytes: s.st_size, allocatedBytes: Int64(s.st_blocks) * 512, eligible: eligible)
             } catch {
-                return MutationArtifact(operationID: r.operation.id, path: r.operation.path + "/../" + r.operation.artifact, status: "uncertain", diagnostic: "\(error)", logicalBytes: 0, allocatedBytes: 0, eligible: false)
+                return MutationArtifact(operationID: r.operation.id, path: (try VaultPath(r.operation.path)).components.dropLast().map { $0 + "/" }.joined() + r.operation.artifact, status: "uncertain", diagnostic: "\(error)", logicalBytes: 0, allocatedBytes: 0, eligible: false)
             }
         }
     }
@@ -300,7 +363,13 @@ extension MutationJournal {
                 try fault("retirement-intent")
             }
             guard let t else { throw VaultRuntimeError.inconsistentCatalog }
-            let fs = try filesystem(path: t.path)
+            let located = try artifactLocation(r)
+            let fs = located.fs
+            if Array(located.path.utf8) != Array(t.path.utf8) {
+                let moved = try fs.observe(fs.name, maximumBytes: maximumBytes)
+                guard moved.fingerprint == t.hint, ObjectStore.hash(moved.bytes) == t.hash else { throw MutationError.conflict("relocated retirement evidence changed") }
+                try db.executeValues("UPDATE mutation_retirements SET path=? WHERE vault_id=? AND operation_id=?", bindings: [.text(located.path)] + bindings(r))
+            }
             guard fs.identities.last == r.directories.last else { throw MutationError.conflict("retirement parent identity changed") }
             // Verify preserved bytes even on the missing-file restart branch.
             _ = try objects.get(t.hash, maximumBytes: maximumBytes)

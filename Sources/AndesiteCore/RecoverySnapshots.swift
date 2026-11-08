@@ -45,6 +45,7 @@ public struct SnapshotObjectReferences: Sendable, Equatable {
     public let snapshots: Int64
     public let revisions: Int64
     public let incidents: Int64
+    public let mutationVersions: Int64
 }
 
 public struct SnapshotStorageUsage: Sendable {
@@ -179,13 +180,14 @@ enum RecoverySnapshots {
             SELECT lower(hex(o.hash)),o.length,
               (SELECT count(*) FROM recovery_snapshots s WHERE s.content_hash=o.hash),
               (SELECT count(*) FROM revisions r WHERE r.content_hash=o.hash),
-              (SELECT count(*) FROM incidents i WHERE i.content_hash=o.hash)
+              (SELECT count(*) FROM incidents i WHERE i.content_hash=o.hash),
+              (SELECT count(*) FROM mutation_versions m WHERE m.hash=o.hash)
             FROM objects o ORDER BY o.hash
             """)
         let objects: [SnapshotObjectReferences] = try rows.map { row in
             guard case .text(let hash) = row[0], case .integer(let length) = row[1], case .integer(let s) = row[2],
-                  case .integer(let r) = row[3], case .integer(let i) = row[4] else { throw SnapshotError.inconsistentMetadata }
-            return SnapshotObjectReferences(contentHash: hash, byteLength: length, snapshots: s, revisions: r, incidents: i)
+                  case .integer(let r) = row[3], case .integer(let i) = row[4], case .integer(let m) = row[5] else { throw SnapshotError.inconsistentMetadata }
+            return SnapshotObjectReferences(contentHash: hash, byteLength: length, snapshots: s, revisions: r, incidents: i, mutationVersions: m)
         }
         return try SnapshotStorageUsage(policy: policy(db: db, vaultID: vaultID), snapshots: snapshots.count,
             expirationEligible: snapshots.filter { $0.isExpired(at: date) }.count,

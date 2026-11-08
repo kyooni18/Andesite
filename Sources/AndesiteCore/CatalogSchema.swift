@@ -71,7 +71,7 @@ public enum CatalogSchema {
                 try db.execute("""
                     CREATE TABLE mutation_decisions (
                       vault_id BLOB NOT NULL, operation_id BLOB NOT NULL, strategy TEXT NOT NULL,
-                      evidence BLOB NOT NULL, outcome TEXT NOT NULL, created_at REAL NOT NULL,
+                      evidence BLOB NOT NULL, outcome TEXT NOT NULL, created_at REAL NOT NULL, base_revision BLOB NOT NULL, outcome_revision BLOB,
                       PRIMARY KEY(vault_id,operation_id),
                       FOREIGN KEY(vault_id,operation_id) REFERENCES mutation_journal(vault_id,id)
                     ) WITHOUT ROWID
@@ -89,9 +89,16 @@ public enum CatalogSchema {
                       vault_id BLOB NOT NULL, operation_id BLOB NOT NULL, role TEXT NOT NULL,
                       hash BLOB NOT NULL REFERENCES objects(hash), byte_length INTEGER NOT NULL CHECK(byte_length>=0),
                       path TEXT NOT NULL, hint BLOB,
-                      PRIMARY KEY(vault_id,operation_id,role),
+                      PRIMARY KEY(vault_id,operation_id,role,hash),
                       FOREIGN KEY(vault_id,operation_id) REFERENCES mutation_journal(vault_id,id)
                     ) WITHOUT ROWID
+                    """)
+                try db.execute("""
+                    CREATE TABLE mutation_decision_history (
+                      id INTEGER PRIMARY KEY, vault_id BLOB NOT NULL, operation_id BLOB NOT NULL,
+                      strategy TEXT NOT NULL, evidence BLOB NOT NULL, outcome TEXT NOT NULL, created_at REAL NOT NULL, base_revision BLOB NOT NULL, outcome_revision BLOB,
+                      FOREIGN KEY(vault_id,operation_id) REFERENCES mutation_journal(vault_id,id)
+                    )
                     """)
                 try db.execute("PRAGMA user_version=7")
             }

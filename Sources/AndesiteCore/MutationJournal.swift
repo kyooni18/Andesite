@@ -241,7 +241,20 @@ final class MutationJournal {
         if !pending.isEmpty { try requireDurableStorage() }
         for record in pending {
             if try retirement(record) != nil { continue }
-            if try decisionFinished(record) { continue }
+            if try decisionFinished(record), record.operation.state != "quarantined" {
+                // A later write through an old descriptor is a NEW conflict,
+                // not permission to retire under the earlier decision.
+                do {
+                    if let d = try decision(record), case .blob(let data) = d[1],
+                       let expected = try JSONDecoder().decode([MutationVersion].self, from: data).first(where: { $0.role == "artifact" }) {
+                        let l = try artifactLocation(record), actual = try l.fs.observe(l.fs.name, maximumBytes: maximumBytes)
+                        guard try isOwned(actual, record), ObjectStore.hash(actual.bytes) == expected.hash else { throw MutationError.conflict("artifact changed after explicit resolution") }
+                    }
+                } catch {
+                    try db.transaction { try setState(record, "quarantined", "Artifact changed or disappeared after explicit resolution; inspect and preserve the new conflict") }
+                }
+                continue
+            }
             if record.operation.state == "quarantined" { continue }
             // A cancelled, never-staged intent owns no filesystem evidence;
             // later ordinary parent deletion/moves must not re-block the vault.
@@ -258,6 +271,7 @@ final class MutationJournal {
                 case "cancelled": break
                 case "prepared":
                     if try fs.info(record.operation.artifact) != nil { throw MutationError.conflict("interrupted staging; unverified artifact retained") }
+                    if try ownedStage(record) != nil { throw MutationError.conflict("created stage disappeared before durable staging; evidence retained") }
                     try db.transaction { try setState(record, "cancelled", "Intent was never staged; source not modified by recovery") }
                 case "staged", "published":
                     guard let stage = record.stage else { throw MutationError.conflict("missing staged identity") }

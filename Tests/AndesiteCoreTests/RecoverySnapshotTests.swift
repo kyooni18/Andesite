@@ -329,6 +329,7 @@ private extension RuntimeFixture {
     let db = try f.database()
     // Fixture for an actual v4 operational catalog: no recovery tables existed.
     // These test-only drops remove empty new tables, never operational history.
+    try db.execute("DROP TABLE mutation_decision_history")
     try db.execute("DROP TABLE mutation_versions")
     try db.execute("DROP TABLE mutation_retirements")
     try db.execute("DROP TABLE mutation_decisions")

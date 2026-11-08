@@ -27,7 +27,7 @@ Usage: andesite-server <command> --vault /absolute/vault --state /absolute/priva
   mutation-journal    (all operations, including conflicts and recovery outcomes)
   mutation-inspect <operation-id>
   mutation-resolve <operation-id> --strategy <accept-current|preserve-current|complete-published|cancel-unpublished>
-  mutation-export <operation-id> <intended|preimage|current|artifact|retirement> /absolute/new-file
+  mutation-export <operation-id> <intended|preimage|current|artifact|path-occupant|retirement|sha256:HASH> /absolute/new-file
   mutation-artifacts
   mutation-cleanup --dry-run | --retire  (stop external editors before --retire)
   snapshot-storage
@@ -75,6 +75,8 @@ do {
             let inspection = try runtime.inspectMutation(identifier(args[5]))
             let op = inspection.operation
             print("operation=\(hex(op.id)) state=\(op.state) document=\(hex(op.entryID)) path=\(op.path) snapshot=\(hex(op.snapshotID)) preimage=\(hex(op.preimageID)) revision=\(hex(op.revisionID)) strategy=\(inspection.strategy ?? "none") outcome=\(inspection.outcome ?? "none")")
+            print("parentRevision=\(hex(inspection.parentRevision)) expectedOriginal=\(inspection.expectedOriginal) expectedStage=\(inspection.expectedStage.map { String(describing: $0) } ?? "none") previousDecisions=\(inspection.previousDecisions)")
+            for event in inspection.audit { print("decision=\(event)") }
             for version in inspection.versions {
                 print("version=\(version.role) path=\(version.path) hash=\(version.hash) bytes=\(version.bytes) identity=\(version.fingerprint.map { String(describing: $0) } ?? "immutable")")
             }
@@ -110,7 +112,7 @@ do {
             print("minimumIntervalSeconds=\(storage.policy.minimumInterval) retentionSeconds=\(storage.policy.retentionSeconds) snapshots=\(storage.snapshots) expirationEligible=\(storage.expirationEligible) pendingDocuments=\(storage.pendingDocuments) logicalBytes=\(storage.logicalBytes) uniqueSnapshotBytes=\(storage.uniqueSnapshotBytes) registeredObjectBytes=\(storage.registeredObjectBytes) automaticPruning=false")
             print("immutableObjectLogicalBytes=\(storage.immutableObjectLogicalBytes) physicalObjectAllocatedBytes=\(storage.physicalObjectAllocatedBytes) temporaryObjectAllocatedBytes=\(storage.temporaryObjectAllocatedBytes) journalArtifactAllocatedBytes=\(storage.artifactAllocatedBytes) retirementEligibleAllocatedBytes=\(storage.retirementEligibleAllocatedBytes) unresolvedArtifactAllocatedBytes=\(storage.unresolvedArtifactAllocatedBytes) uncertainArtifacts=\(storage.uncertainArtifacts) physicalNumbersAreAllocatedBlockEstimates=true snapshotLogicalBytesAreNotAdditionalPhysicalUsage=true")
             for object in storage.objects {
-                print("\(object.contentHash) bytes=\(object.byteLength) snapshots=\(object.snapshots) revisions=\(object.revisions) incidents=\(object.incidents)")
+                print("\(object.contentHash) bytes=\(object.byteLength) snapshots=\(object.snapshots) revisions=\(object.revisions) incidents=\(object.incidents) mutationVersions=\(object.mutationVersions)")
             }
         default:
             let status = try runtime.status()
