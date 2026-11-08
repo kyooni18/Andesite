@@ -377,6 +377,11 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
         try runtime.shutdown()
         if point == "retirement-intent" {
             let legacy = try f.catalog()
+            for table in ["sync_outgoing_snapshots", "sync_inbox_snapshots",
+                  "sync_inbox_changes", "sync_inbox_cursors",
+                  "sync_outgoing_peers"] {
+                try legacy.execute("DROP TABLE " + table)
+            }
             for table in ["document_property_values", "document_property_keys",
                           "document_tags", "document_properties"] {
                 try legacy.execute("DROP TABLE " + table)

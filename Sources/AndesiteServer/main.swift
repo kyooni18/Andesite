@@ -16,6 +16,56 @@ func describe(_ snapshot: RecoverySnapshot) -> String {
     let formatter = ISO8601DateFormatter()
     return "snapshot=\(hex(snapshot.id)) document=\(hex(snapshot.entryID)) state=\(snapshot.documentState) path=\(snapshot.originalPath) created=\(formatter.string(from: snapshot.createdAt)) expires=\(formatter.string(from: snapshot.expiresAt)) eligible=\(snapshot.isExpired()) reason=\(snapshot.reason) hash=\(snapshot.contentHash) bytes=\(snapshot.byteLength) revision=\(hex(snapshot.revisionID)) observed=\(snapshot.observedAt)"
 }
+/// Manual, opt-in upload of immutable local history to a remote
+/// authenticated Andesite server. This is a single-owner CLI: stop the
+/// local watcher first, or use AndesiteBackend directly in the embedded app.
+@MainActor
+func runSyncPush(vault: String, state: String?, destination: URL,
+                 peer: String, changesOnly: Bool) async throws {
+    guard let secret = ProcessInfo.processInfo.environment["ANDESITE_API_TOKEN"] else {
+        throw CLIError.usage
+    }
+    let transport = try AndesiteHTTPSyncClient(destination: destination, token: secret)
+    let checkpoint = try transport.checkpointKey(peer: peer)
+    let session = try VaultSession(vaultDirectory: vault, stateDirectory: state)
+    do {
+        _ = try session.reconcile()
+        let backend = try session.backend
+        var after = try backend.syncAcknowledgedSequence(peer: checkpoint)
+        var changes = 0
+        while true {
+            let batch = try backend.syncChanges(after: after, limit: 8)
+            if batch.changes.isEmpty { break }
+            let receipt = try await transport.uploadChanges(batch)
+            try backend.acknowledgeSync(peer: checkpoint, batch: batch, receipt: receipt)
+            changes += batch.changes.count
+            after = receipt.acknowledgedSequence
+        }
+        var snapshots = 0
+        if !changesOnly {
+            // Snapshot publication can lag behind a change event. A separate
+            // durable acknowledgement set guarantees later snapshots are not
+            // skipped after the event cursor has advanced.
+            while true {
+                let pending = try backend.pendingSyncSnapshots(peer: checkpoint, limit: 16)
+                if pending.isEmpty { break }
+                for id in pending {
+                    let payload = try backend.syncSnapshot(id)
+                    _ = try await transport.uploadSnapshot(payload)
+                    try backend.acknowledgeSyncSnapshot(peer: checkpoint, snapshot: payload)
+                    snapshots += 1
+                }
+            }
+        }
+        print("sync-push peer=\(peer) acknowledgedSequence=\(after) changes=\(changes) snapshots=\(snapshots) archivedOnly=true")
+        try session.close()
+    } catch {
+        let failure = error
+        try? session.close()
+        throw failure
+    }
+}
+
 let usage = """
 Usage: andesite-server <command> --vault /absolute/vault --state /absolute/private-state [arguments]
   vault-add /absolute/vault         (create <vault>/.andesite/vault.json with path only)
@@ -27,7 +77,11 @@ Usage: andesite-server <command> --vault /absolute/vault --state /absolute/priva
   vault-watch /absolute/vault [--state /absolute/private-state]
                                    (connect, reconcile, then continuously monitor until stopped)
   api-serve /absolute/vault [--port 8788] [--state /absolute/private-state]
-                                   (authenticated loopback GET plus version-conditional Markdown PUT)
+                                   (authenticated loopback GET, conditional Markdown PUT and archive POST)
+  sync-push /absolute/vault --to https://remote-host --peer stable-peer-name
+                                   [--state /absolute/private-state] [--changes-only]
+                                   (upload changes and snapshots to remote archive;
+                                    stop this Vault's watcher first; requires ANDESITE_API_TOKEN)
   init | reconcile | status | search <phrase>
   watch    (macOS FSEvents plus same-user HTTP on state/andesite-read.sock; SIGINT/SIGTERM to stop)
   snapshots [document-id-or-historical-path]
@@ -45,7 +99,8 @@ Usage: andesite-server <command> --vault /absolute/vault --state /absolute/priva
   mutation-cleanup --dry-run | --retire  (stop external editors before --retire)
   snapshot-storage
   snapshot-config <minimum-interval-seconds> <retention-seconds>
-Directories must already exist; state must be mode 0700. No TCP listener.
+Directories must already exist; state must be mode 0700.
+The core/watch process has no TCP listener; optional api-serve binds 127.0.0.1.
 Snapshot expiration is metadata only; no snapshots, revisions or objects are pruned.
 """
 let args = Array(CommandLine.arguments.dropFirst())
@@ -61,6 +116,33 @@ do {
         default:
             print(try registry.unregister() ? "Removed saved path: \(args[1])" : "Not registered: \(args[1])")
         }
+    } else if args.first == "sync-push" {
+        guard args.count >= 6 else { throw CLIError.usage }
+        let vault = args[1]
+        var state: String?
+        var destination: URL?
+        var peer: String?
+        var changesOnly = false
+        var index = 2
+        while index < args.count {
+            if args[index] == "--changes-only" {
+                changesOnly = true
+                index += 1
+                continue
+            }
+            guard index + 1 < args.count else { throw CLIError.usage }
+            switch args[index] {
+            case "--state": state = args[index + 1]
+            case "--to": destination = URL(string: args[index + 1])
+            case "--peer": peer = args[index + 1]
+            default: throw CLIError.usage
+            }
+            index += 2
+        }
+        guard let destination, let peer else { throw CLIError.usage }
+        try await runSyncPush(vault: vault, state: state,
+                              destination: destination, peer: peer,
+                              changesOnly: changesOnly)
     } else if args.first == "api-serve" {
         #if os(macOS)
         guard args.count >= 2 else { throw CLIError.usage }

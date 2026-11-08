@@ -15,8 +15,9 @@ public struct VaultRelayResult: Sendable {
 
 /// Prevents concurrent requests from competing with the single-threaded
 /// watcher. Blocking AF_UNIX I/O runs on a background queue, never on an
-/// Hummingbird/NIO event-loop thread. Only a version-conditioned Markdown
-/// PUT is authorized in addition to the existing read-only GET routes.
+/// Hummingbird/NIO event-loop thread. In addition to read-only GET,
+/// only a version-conditioned Markdown PUT and versioned archive POST
+/// to the two explicit sync inbox routes are authorized.
 public actor VaultHTTPRelay {
     private let socketPath: String
     private var busy = false
@@ -67,6 +68,49 @@ public actor VaultHTTPRelay {
                     expectedRevision: expectedRevision, contents: contents))
             }
         }
+    }
+
+    /// Authenticated Hummingbird's bounded replica-inbox submission. The
+    /// same private Unix owner handles it, never a second SQLite connection.
+    public func postSync(_ target: String, json: Data) async -> VaultRelayResult {
+        guard target == "/v1/sync/changes" || target == "/v1/sync/snapshots",
+              json.count <= AndesiteSyncWire.maximumJSONBytes else {
+            return Self.error(400, "invalid_sync_request")
+        }
+        guard !busy else { return Self.error(503, "backend_busy") }
+        busy = true
+        defer { busy = false }
+        let path = socketPath
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: Self.sendSync(
+                    path: path, target: target, json: json))
+            }
+        }
+    }
+
+    nonisolated private static func sendSync(path: String, target: String,
+                                             json: Data) -> VaultRelayResult {
+        let maximum = 1_100_000
+        var response = [UInt8](repeating: 0, count: maximum)
+        var length: UInt = 0
+        let ok = response.withUnsafeMutableBufferPointer { output in
+            path.withCString { address in
+                target.withCString { uri in
+                    json.withUnsafeBytes { raw in
+                        andesite_http_relay_sync_post(
+                            address, uri,
+                            raw.bindMemory(to: UInt8.self).baseAddress,
+                            UInt(json.count), output.baseAddress,
+                            UInt(maximum), &length)
+                    }
+                }
+            }
+        }
+        guard ok == 0, length > 0, length <= maximum else {
+            return error(503, "vault_watcher_unavailable")
+        }
+        return decodeResponse(Data(response.prefix(Int(length))))
     }
 
     nonisolated private static func error(_ status: Int, _ code: String) -> VaultRelayResult {

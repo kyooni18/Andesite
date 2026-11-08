@@ -29,7 +29,10 @@ private struct AndesiteBearerAuthorization: RouterMiddleware {
         }
         let editPath = request.uri.path.hasPrefix("/v1/documents/") &&
                        request.uri.path.hasSuffix("/content")
-        guard request.method == .get || (request.method == .put && editPath) else {
+        let syncInbox = request.uri.path == "/v1/sync/changes" ||
+                        request.uri.path == "/v1/sync/snapshots"
+        guard request.method == .get || (request.method == .put && editPath) ||
+              (request.method == .post && syncInbox) else {
             return Self.failure(.methodNotAllowed, "method_not_allowed")
         }
         guard request.headers[.transferEncoding] == nil,
@@ -41,10 +44,13 @@ private struct AndesiteBearerAuthorization: RouterMiddleware {
                 return Self.failure(.badRequest, "request_body_not_supported")
             }
         } else {
+            let requiredType = request.method == .post ?
+                "application/json; charset=utf-8" :
+                "text/markdown; charset=utf-8"
             guard let value = request.headers[.contentLength],
                   let size = Int(value), (0...262144).contains(size),
-                  request.headers[.contentType] == "text/markdown; charset=utf-8" else {
-                return Self.failure(.badRequest, "invalid_edit_content")
+                  request.headers[.contentType] == requiredType else {
+                return Self.failure(.badRequest, "invalid_request_content")
             }
         }
         return try await next(request, context)
@@ -121,6 +127,33 @@ enum AndesiteHTTPAPI {
         )
     }
 
+    private static func forwardSync(_ request: Request,
+                                    via relay: VaultHTTPRelay) async -> Response {
+        let body: Data
+        do {
+            let buffer = try await request.body.collect(
+                upTo: AndesiteSyncWire.maximumJSONBytes + 1)
+            body = Data(buffer.readableBytesView)
+        } catch {
+            return AndesiteBearerAuthorization.failure(
+                HTTPResponse.Status(code: 413), "sync_payload_too_large")
+        }
+        guard body.count <= AndesiteSyncWire.maximumJSONBytes else {
+            return AndesiteBearerAuthorization.failure(
+                HTTPResponse.Status(code: 413), "sync_payload_too_large")
+        }
+        let result = await relay.postSync(request.uri.path, json: body)
+        return Response(
+            status: HTTPResponse.Status(code: result.status),
+            headers: [
+                .contentType: result.contentType,
+                .cacheControl: "no-store",
+                .init("x-content-type-options")!: "nosniff"
+            ],
+            body: .init(byteBuffer: ByteBuffer(bytes: result.body))
+        )
+    }
+
     static func run(vault: String, state: String?, port: Int) async throws {
         guard (1024...65535).contains(port) else { throw ConfigurationError.invalidPort }
         guard let rawToken = ProcessInfo.processInfo.environment["ANDESITE_API_TOKEN"] else {
@@ -147,6 +180,14 @@ enum AndesiteHTTPAPI {
 
         router.get("/v1/status") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/search") { request, _ in await Self.forward(request, via: relay) }
+        router.get("/v1/sync/inbox") { request, _ in await Self.forward(request, via: relay) }
+        router.get("/v1/sync/inbox/changes") { request, _ in await Self.forward(request, via: relay) }
+        router.get("/v1/sync/inbox/snapshots") { request, _ in await Self.forward(request, via: relay) }
+        router.get("/v1/sync/inbox/snapshots/{id}") { request, _ in await Self.forward(request, via: relay) }
+        router.get("/v1/sync/changes") { request, _ in await Self.forward(request, via: relay) }
+        router.get("/v1/sync/snapshots/{id}") { request, _ in await Self.forward(request, via: relay) }
+        router.post("/v1/sync/changes") { request, _ in await Self.forwardSync(request, via: relay) }
+        router.post("/v1/sync/snapshots") { request, _ in await Self.forwardSync(request, via: relay) }
         router.get("/v1/tags") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/properties") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/documents") { request, _ in await Self.forward(request, via: relay) }
@@ -169,7 +210,7 @@ enum AndesiteHTTPAPI {
             ),
             onServerRunning: { _ in
                 FileHandle.standardOutput.write(
-                    Data("api-ready host=127.0.0.1 port=\(port) transport=http1 authentication=bearer edits=conditional-put-only\n".utf8)
+                    Data("api-ready host=127.0.0.1 port=\(port) transport=http1 authentication=bearer edits=conditional-put sync=archival-inbox\n".utf8)
                 )
             }
         )

@@ -327,6 +327,11 @@ private extension RuntimeFixture {
         try runtime.shutdown()
     }
     let db = try f.database()
+    for table in ["sync_outgoing_snapshots", "sync_inbox_snapshots",
+                  "sync_inbox_changes", "sync_inbox_cursors",
+                  "sync_outgoing_peers"] {
+        try db.execute("DROP TABLE " + table)
+    }
     // Rebuild the actual historical v4 layout; newly introduced derived
     // metadata tables did not exist in that catalog.
     for table in ["document_property_values", "document_property_keys",
@@ -353,7 +358,7 @@ private extension RuntimeFixture {
     #expect(throws: ExternalCaptureError.invalidMarkdown) { try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: identity, path: path, maximumBytes: 1024, debounce: 0) }
     let upgraded = try VaultRuntime(configuration: f.configuration)
     #expect(upgraded.vaultID == identity)
-    #expect(try db.scalarText("PRAGMA user_version") == "9")
+    #expect(try db.scalarText("PRAGMA user_version") == "10")
     #expect(try upgraded.status().revisions == 2 && upgraded.status().openIncidents == 1)
     let snapshot = try #require(upgraded.snapshots().first)
     #expect(snapshot.reason == "recovery" && snapshot.entryID == old.entryID)

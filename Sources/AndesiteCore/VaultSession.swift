@@ -33,6 +33,12 @@ public final class VaultSession {
         }
     }
 
+    /// In-process, transport-free backend facade for an embedded app.
+    /// It shares the session's single owner and cannot outlive the session.
+    public var backend: AndesiteBackend {
+        get throws { AndesiteBackend(runtime: try runtime) }
+    }
+
     public static var defaultStateRoot: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         #if os(macOS)

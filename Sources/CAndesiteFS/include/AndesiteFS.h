@@ -36,5 +36,9 @@ int andesite_http_relay_put(const char *socket_path, const char *target,
                            const char *revision, const unsigned char *body,
                            unsigned long body_length, unsigned char *out,
                            unsigned long capacity, unsigned long *length);
+int andesite_http_relay_sync_post(const char *socket_path, const char *target,
+                                 const unsigned char *body,
+                                 unsigned long body_length, unsigned char *out,
+                                 unsigned long capacity, unsigned long *length);
 #endif /* __APPLE__ */
 #endif /* ANDESITE_FS_H */

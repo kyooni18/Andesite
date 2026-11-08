@@ -37,12 +37,12 @@ public struct VaultHTTPResponse {
     }
 }
 
-/// Bounded HTTP/1.1 GET and revision-conditional Markdown PUT over a private
+/// Bounded HTTP/1.1 GET, conditional PUT and replica inbox POST over a private
 /// Unix domain socket in the already
 /// validated 0700 state directory. The OS verifies same-UID peer credentials.
 /// No TCP listener, extra database connection, executor, or background thread.
 public final class VaultLocalHTTP {
-    private let runtime: VaultRuntime
+    private let backend: AndesiteBackend
     private let server: OpaquePointer
     public static let socketName = "andesite-read.sock"
     private let maximumHeaders = 8192
@@ -63,7 +63,7 @@ public final class VaultLocalHTTP {
         guard let socket = stateDirectory.withCString({ andesite_local_http_open($0) }) else {
             throw VaultLocalHTTPError.cannotBind(errno)
         }
-        self.runtime = runtime
+        self.backend = AndesiteBackend(runtime: runtime)
         self.server = socket
         self.socketPath = path
     }
@@ -170,7 +170,7 @@ public final class VaultLocalHTTP {
     private func preview(_ id: Data, of d: IndexedDocument) throws -> [String: Any] {
         var detail: [String: Any] = [
             "document": documentJSON(d),
-            "metadata": try runtime.documentMetadata(id),
+            "metadata": try backend.documentMetadata(id),
             "structureAvailable": false,
             "source": "last_completed_reconciliation"
         ]
@@ -179,7 +179,7 @@ public final class VaultLocalHTTP {
             detail["structureReason"] = "too_large_for_outline"
             return detail
         }
-        let bytes = try runtime.documentContents(id, maximumBytes: maximumStructureBytes)
+        let bytes = try backend.documentContents(id, maximumBytes: maximumStructureBytes)
         let parsed = try ObsidianMetadataParser.parse(bytes)
         let facts = try MarkdownAnalyzer.analyze(Data(parsed.body.utf8))
         let wiki = ObsidianLinks.extract(parsed.body)
@@ -284,8 +284,14 @@ public final class VaultLocalHTTP {
         guard words.count == 3, words[2] == "HTTP/1.1",
               first.utf8.count <= 4096 else { return .error(400, "invalid_request") }
         let method = String(words[0])
-        guard method == "GET" || method == "PUT" else {
+        guard method == "GET" || method == "PUT" || method == "POST" else {
             return .error(405, "method_not_allowed")
+        }
+        if method == "POST" {
+            guard words[1] == "/v1/sync/changes" ||
+                  words[1] == "/v1/sync/snapshots" else {
+                return .error(405, "method_not_allowed")
+            }
         }
 
         var hostCount = 0
@@ -307,14 +313,15 @@ public final class VaultLocalHTTP {
                 hostCount += 1
                 guard !value.isEmpty else { return .error(400, "invalid_headers") }
             case "content-length":
-                guard method == "PUT", contentLength == nil, !value.isEmpty,
+                guard (method == "PUT" || method == "POST"),
+                      contentLength == nil, !value.isEmpty,
                       value.utf8.allSatisfy({ (48...57).contains($0) }),
                       let count = Int(value), count <= maximumEditBody else {
                     return .error(400, "invalid_content_length")
                 }
                 contentLength = count
             case "content-type":
-                guard method == "PUT", contentType == nil else {
+                guard (method == "PUT" || method == "POST"), contentType == nil else {
                     return .error(400, "invalid_content_type")
                 }
                 contentType = value
@@ -333,8 +340,10 @@ public final class VaultLocalHTTP {
             guard body.isEmpty else { return .error(400, "request_body_not_supported") }
         } else {
             guard let count = contentLength, count == body.count,
-                  contentType == "text/markdown; charset=utf-8" else {
-                return .error(400, "invalid_edit_request")
+                  contentType == (method == "PUT" ?
+                    "text/markdown; charset=utf-8" :
+                    "application/json; charset=utf-8") else {
+                return .error(400, "invalid_request_body")
             }
         }
 
@@ -349,6 +358,77 @@ public final class VaultLocalHTTP {
         }
 
         do {
+            if method == "POST" {
+                guard args.isEmpty else { return .error(400, "invalid_sync_request") }
+                if path == "/v1/sync/inbox/changes" {
+                guard Set(args.keys).isSubset(of: ["source", "epoch", "after", "limit"]),
+                      let source = args["source"], let epoch = args["epoch"],
+                      let afterText = args["after"],
+                      !afterText.isEmpty, afterText.utf8.count <= 18,
+                      afterText.utf8.allSatisfy({ (48...57).contains($0) }),
+                      let after = Int64(afterText), after >= 0,
+                      let count = limit(args["limit"], default: 8),
+                      count <= AndesiteSyncWire.maximumChangesPerBatch else {
+                    return .error(400, "invalid_sync_query")
+                }
+                return VaultHTTPResponse(status: 200, body: try AndesiteSyncWire.encode(
+                    backend.syncInboxChanges(sourceVault: source, sourceEpoch: epoch,
+                                             after: after, limit: count)))
+            }
+            if path == "/v1/sync/inbox/snapshots" {
+                guard Set(args.keys).isSubset(of: ["source", "epoch", "limit", "offset"]),
+                      let source = args["source"], let epoch = args["epoch"],
+                      let count = limit(args["limit"]),
+                      let offset = validatedOffset(args["offset"]) else {
+                    return .error(400, "invalid_sync_query")
+                }
+                return .json(200, try backend.syncInboxSnapshotList(
+                    sourceVault: source, sourceEpoch: epoch,
+                    limit: count, offset: offset))
+            }
+            let incoming = path.split(separator: "/", omittingEmptySubsequences: false)
+            if incoming.count == 6 && incoming[1] == "v1" &&
+               incoming[2] == "sync" && incoming[3] == "inbox" &&
+               incoming[4] == "snapshots" {
+                guard Set(args.keys) == ["source", "epoch"],
+                      let source = args["source"], let epoch = args["epoch"] else {
+                    return .error(400, "invalid_sync_query")
+                }
+                return VaultHTTPResponse(status: 200, body: try AndesiteSyncWire.encode(
+                    backend.syncInboxSnapshot(sourceVault: source, sourceEpoch: epoch,
+                                              snapshotID: String(incoming[5]))))
+            }
+            if path == "/v1/sync/inbox" {
+                guard Set(args.keys).isSubset(of: ["limit", "offset"]),
+                      let count = limit(args["limit"]),
+                      let offset = validatedOffset(args["offset"]) else {
+                    return .error(400, "invalid_sync_query")
+                }
+                return .json(200, try backend.syncInbox(limit: count, offset: offset))
+            }
+            if path == "/v1/sync/changes" {
+                    let batch = try AndesiteSyncWire.decode(
+                        AndesiteSyncChangeBatch.self, bytes: body)
+                    let receipt = try backend.receiveSyncChanges(batch)
+                    return .json(200, [
+                        "sourceVault": receipt.sourceVault,
+                        "sourceEpoch": receipt.sourceEpoch,
+                         "acknowledgedSequence": receipt.acknowledgedSequence,
+                        "accepted": receipt.accepted,
+                        "replay": receipt.replay
+                    ])
+                }
+                if path == "/v1/sync/snapshots" {
+                    let item = try AndesiteSyncWire.decode(
+                        AndesiteSyncSnapshot.self, bytes: body)
+                    let inserted = try backend.receiveSyncSnapshot(item)
+                    return .json(200, [
+                        "sourceVault": item.sourceVault, "sourceEpoch": item.sourceEpoch,
+                        "snapshot": item.id, "stored": inserted
+                    ])
+                }
+                return .error(405, "method_not_allowed")
+            }
             if method == "PUT" {
                 let fields = path.split(separator: "/", omittingEmptySubsequences: false)
                 guard fields.count == 5, fields[1] == "v1",
@@ -362,11 +442,11 @@ public final class VaultLocalHTTP {
                       let expected = id(String(ifMatch.dropFirst().dropLast())) else {
                     return .error(428, "revision_precondition_required")
                 }
-                let current = try runtime.inspectDocument(documentID)
+                let current = try backend.inspectDocument(documentID)
                 guard current.revisionID == expected else {
                     return .error(412, "revision_mismatch")
                 }
-                let operation = try runtime.editDocument(documentID,
+                let operation = try backend.editDocument(documentID,
                                                          expectedRevision: expected,
                                                          contents: body)
                 return .json(200, [
@@ -377,18 +457,92 @@ public final class VaultLocalHTTP {
                     "indexReady": false
                 ])
             }
+            if path == "/v1/sync/inbox/changes" {
+                guard Set(args.keys).isSubset(of: ["source", "epoch", "after", "limit"]),
+                      let source = args["source"], let epoch = args["epoch"],
+                      let afterText = args["after"],
+                      !afterText.isEmpty, afterText.utf8.count <= 18,
+                      afterText.utf8.allSatisfy({ (48...57).contains($0) }),
+                      let after = Int64(afterText), after >= 0,
+                      let count = limit(args["limit"], default: 8),
+                      count <= AndesiteSyncWire.maximumChangesPerBatch else {
+                    return .error(400, "invalid_sync_query")
+                }
+                return VaultHTTPResponse(status: 200, body: try AndesiteSyncWire.encode(
+                    backend.syncInboxChanges(sourceVault: source, sourceEpoch: epoch,
+                                             after: after, limit: count)))
+            }
+            if path == "/v1/sync/inbox/snapshots" {
+                guard Set(args.keys).isSubset(of: ["source", "epoch", "limit", "offset"]),
+                      let source = args["source"], let epoch = args["epoch"],
+                      let count = limit(args["limit"]),
+                      let offset = validatedOffset(args["offset"]) else {
+                    return .error(400, "invalid_sync_query")
+                }
+                return .json(200, try backend.syncInboxSnapshotList(
+                    sourceVault: source, sourceEpoch: epoch,
+                    limit: count, offset: offset))
+            }
+            let incoming = path.split(separator: "/", omittingEmptySubsequences: false)
+            if incoming.count == 6 && incoming[1] == "v1" &&
+               incoming[2] == "sync" && incoming[3] == "inbox" &&
+               incoming[4] == "snapshots" {
+                guard Set(args.keys) == ["source", "epoch"],
+                      let source = args["source"], let epoch = args["epoch"] else {
+                    return .error(400, "invalid_sync_query")
+                }
+                return VaultHTTPResponse(status: 200, body: try AndesiteSyncWire.encode(
+                    backend.syncInboxSnapshot(sourceVault: source, sourceEpoch: epoch,
+                                              snapshotID: String(incoming[5]))))
+            }
+            if path == "/v1/sync/inbox" {
+                guard Set(args.keys).isSubset(of: ["limit", "offset"]),
+                      let count = limit(args["limit"]),
+                      let offset = validatedOffset(args["offset"]) else {
+                    return .error(400, "invalid_sync_query")
+                }
+                return .json(200, try backend.syncInbox(limit: count, offset: offset))
+            }
+            if path == "/v1/sync/changes" {
+                guard Set(args.keys).isSubset(of: ["after", "limit"]),
+                      let afterText = args["after"],
+                      !afterText.isEmpty, afterText.utf8.count <= 18,
+                      afterText.utf8.allSatisfy({ (48...57).contains($0) }),
+                      let after = Int64(afterText), after >= 0,
+                      let count = limit(args["limit"], default: 8),
+                      count <= AndesiteSyncWire.maximumChangesPerBatch else {
+                    return .error(400, "invalid_sync_cursor")
+                }
+                guard indexReady else { return .error(503, "rescan_pending") }
+                let feed = try backend.syncChanges(after: after, limit: count)
+                return VaultHTTPResponse(status: 200,
+                                         body: try AndesiteSyncWire.encode(feed))
+            }
+            let syncPath = path.split(separator: "/",
+                                      omittingEmptySubsequences: false)
+            if syncPath.count == 5, syncPath[1] == "v1",
+               syncPath[2] == "sync", syncPath[3] == "snapshots" {
+                guard args.isEmpty,
+                      let snapshotID = id(String(syncPath[4])) else {
+                    return .error(400, "invalid_sync_snapshot")
+                }
+                guard indexReady else { return .error(503, "rescan_pending") }
+                let item = try backend.syncSnapshot(snapshotID)
+                return VaultHTTPResponse(status: 200,
+                                         body: try AndesiteSyncWire.encode(item))
+            }
             if path == "/v1/status" {
                 guard args.isEmpty else { return .error(400, "unsupported_parameter") }
-                let status = try runtime.status()
+                let status = try backend.status()
                 return .json(200, [
                     "vault": hex(status.vaultID), "state": status.state,
                     "entries": status.entries, "revisions": status.revisions,
                     "openIncidents": status.openIncidents,
                     "unfinishedMutations": status.unfinishedMutations,
                     "indexedReadable": indexReady && status.state == "ready",
-                    "linksIndexed": indexReady && runtime.linksIndexed,
-                    "linkCacheGeneration": runtime.linkCacheGeneration,
-                    "linkCacheProgress": runtime.linkCacheProgress.map {
+                    "linksIndexed": indexReady && backend.linksIndexed,
+                    "linkCacheGeneration": backend.linkCacheGeneration,
+                    "linkCacheProgress": backend.linkCacheProgress.map {
                         ["processedHeads": $0.processedHeads,
                          "totalHeads": $0.totalHeads,
                          "resolvedHeads": $0.resolvedHeads] as [String: Int]
@@ -407,13 +561,13 @@ public final class VaultLocalHTTP {
                     explicitProperty: args["property"], explicitValue: args["value"])
                 let found: [[String: String]]
                 if let phrase = search.phrase {
-                    found = try runtime.searchIndexed(phrase, limit: count,
+                    found = try backend.searchIndexed(phrase, limit: count,
                                                      filter: search.filter).map {
                         ["document": hex($0.entryID), "revision": hex($0.revisionID),
                          "title": $0.title, "path": $0.path]
                     }
                 } else {
-                    let page = try runtime.documents(limit: count,
+                    let page = try backend.documents(limit: count,
                                                      filter: search.filter)
                     found = page.documents.map {
                         ["document": hex($0.id), "revision": hex($0.revisionID),
@@ -430,8 +584,8 @@ public final class VaultLocalHTTP {
                 }
                 guard indexReady else { return .error(503, "rescan_pending") }
                 return .json(200, try path == "/v1/tags" ?
-                    runtime.tags(limit: count, offset: offset) :
-                    runtime.properties(limit: count, offset: offset))
+                    backend.tags(limit: count, offset: offset) :
+                    backend.properties(limit: count, offset: offset))
             }
             if path == "/v1/documents" {
                 guard Set(args.keys).isSubset(of: ["limit", "offset", "tag", "property", "value"]),
@@ -443,7 +597,7 @@ public final class VaultLocalHTTP {
                 }
                 guard indexReady else { return .error(503, "rescan_pending") }
                 let filter = try validatedFilter(args)
-                let page = try runtime.documents(limit: count, offset: offset,
+                let page = try backend.documents(limit: count, offset: offset,
                                                  filter: filter)
                 return .json(200, [
                     "documents": page.documents.map(documentJSON),
@@ -461,11 +615,11 @@ public final class VaultLocalHTTP {
                 guard indexReady else { return .error(503, "rescan_pending") }
                 if documentPath.count == 4 {
                     guard args.isEmpty else { return .error(400, "unsupported_parameter") }
-                    return .json(200, try preview(document, of: runtime.inspectDocument(document)))
+                    return .json(200, try preview(document, of: backend.inspectDocument(document)))
                 }
                 if documentPath.count == 5 && documentPath[4] == "properties" {
                     guard args.isEmpty else { return .error(400, "unsupported_parameter") }
-                    return .json(200, try runtime.documentMetadata(document))
+                    return .json(200, try backend.documentMetadata(document))
                 }
                 if documentPath.count == 5 &&
                    (documentPath[4] == "links" || documentPath[4] == "backlinks") {
@@ -483,7 +637,7 @@ public final class VaultLocalHTTP {
                         offset = parsed
                     } else { offset = 0 }
                     let inbound = documentPath[4] == "backlinks"
-                    let result = try runtime.links(
+                    let result = try backend.links(
                         document, direction: inbound ? .incoming : .outgoing,
                         limit: count, offset: offset)
                     return .json(200, [
@@ -497,7 +651,7 @@ public final class VaultLocalHTTP {
                 }
                 if documentPath.count == 5 && documentPath[4] == "content" {
                     guard args.isEmpty else { return .error(400, "unsupported_parameter") }
-                    let content = try runtime.documentContents(document,
+                    let content = try backend.documentContents(document,
                                                               maximumBytes: maximumResponse)
                     return VaultHTTPResponse(status: 200, body: content,
                                              contentType: "text/markdown; charset=utf-8")
@@ -523,7 +677,7 @@ public final class VaultLocalHTTP {
                     }
                     offset = parsed
                 } else { offset = 0 }
-                let snapshots = try runtime.snapshots(entryID: document, path: args["path"])
+                let snapshots = try backend.snapshots(entryID: document, path: args["path"])
                 // A bounded API response; offset paginates newest to oldest
                 // without deleting or modifying any earlier snapshot.
                 let recent = snapshots.reversed().dropFirst(offset).prefix(count).map(metadata)
@@ -540,21 +694,31 @@ public final class VaultLocalHTTP {
                 guard args.isEmpty, let snapshot = id(String(components[3])) else {
                     return .error(400, "invalid_snapshot")
                 }
-                return .json(200, ["snapshot": metadata(try runtime.inspectSnapshot(snapshot))])
+                return .json(200, ["snapshot": metadata(try backend.inspectSnapshot(snapshot))])
             }
             if components.count == 5 && components[1] == "v1" &&
                 components[2] == "snapshots" && components[4] == "content" {
                 guard args.isEmpty, let snapshot = id(String(components[3])) else {
                     return .error(400, "invalid_snapshot")
                 }
-                let info = try runtime.inspectSnapshot(snapshot)
+                let info = try backend.inspectSnapshot(snapshot)
                 guard info.byteLength <= maximumResponse else {
                     return .error(413, "snapshot_too_large_for_local_http")
                 }
-                return VaultHTTPResponse(status: 200, body: try runtime.snapshotContents(snapshot),
+                return VaultHTTPResponse(status: 200, body: try backend.snapshotContents(snapshot),
                                          contentType: "text/markdown; charset=utf-8")
             }
             return .error(404, "not_found")
+        } catch AndesiteSyncError.invalidPacket,
+                AndesiteSyncError.invalidPeer,
+                AndesiteSyncError.unsupportedVersion {
+            return .error(400, "invalid_sync_packet")
+        } catch AndesiteSyncError.historyGap,
+                AndesiteSyncError.sequenceConflict,
+                AndesiteSyncError.contentMismatch {
+            return .error(409, "sync_conflict_or_corrupt_payload")
+        } catch AndesiteSyncError.artifactTooLarge {
+            return .error(413, "sync_artifact_exceeds_inline_limit")
         } catch VaultLinkGraphError.invalidQuery {
             return .error(400, "invalid_link_query")
         } catch VaultLinkGraphError.graphTooLarge {

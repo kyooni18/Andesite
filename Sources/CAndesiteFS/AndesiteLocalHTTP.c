@@ -170,8 +170,8 @@ long andesite_local_http_read_headers(int client, char *buffer, unsigned long ca
 }
 
 
-/* GET keeps the existing header-only contract; PUT can carry at most
-   256 KiB of UTF-8 Markdown, with an absolute one-second body deadline.
+/* GET keeps the existing header-only contract; PUT/POST carry at most
+   256 KiB of Markdown or replication JSON under an absolute deadline.
    The Swift decoder independently validates every header and byte count. */
 long andesite_local_http_read_request(int client, char *buffer,
                                      unsigned long capacity) {
@@ -180,7 +180,7 @@ long andesite_local_http_read_request(int client, char *buffer,
     long long started = monotonic_millis();
     if (started < 0) return -1;
     size_t used = 0, header_end = 0, expected = 0;
-    int is_put = -1;
+    int has_body = -1;
     struct pollfd pending = {.fd = client, .events = POLLIN, .revents = 0};
     while (used < capacity) {
         long long remaining = (header_end ? 1200 : 200) -
@@ -207,8 +207,9 @@ long andesite_local_http_read_request(int client, char *buffer,
                 continue;
             }
             if (header_end > 8192) { errno = EMSGSIZE; return -1; }
-            is_put = header_end >= 4 && memcmp(buffer, "PUT ", 4) == 0;
-            if (is_put) {
+            has_body = (header_end >= 4 && memcmp(buffer, "PUT ", 4) == 0) ||
+                       (header_end >= 5 && memcmp(buffer, "POST ", 5) == 0);
+            if (has_body) {
                 int matched = 0;
                 size_t offset = 0;
                 while (offset + 1 < header_end) {
@@ -237,7 +238,12 @@ long andesite_local_http_read_request(int client, char *buffer,
                     }
                     offset = ending + 2;
                 }
-                if (matched != 1) { errno = EINVAL; return -1; }
+                // A POST without a body length can still receive the
+                // correct 405 for a disallowed route in the Swift decoder.
+                // Accepted replication POSTs require the length there.
+                if (matched != 1 && memcmp(buffer, "POST ", 5) != 0) {
+                    errno = EINVAL; return -1;
+                }
             }
         }
         if (header_end) {

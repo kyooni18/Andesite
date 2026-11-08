@@ -9,7 +9,7 @@ public enum CatalogMigrationError: Error, Equatable {
 /// safe to use as a sync service until general operations/recovery and the
 /// remaining protocol tables are implemented (the local restore journal is v6). Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 9
+    public static let currentVersion = 10
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -157,6 +157,60 @@ public enum CatalogSchema {
                     """)
                 try db.execute("CREATE INDEX document_property_keys_by_name ON document_property_keys(vault_id,name_key,entry_id)")
                 try db.execute("PRAGMA user_version=9")
+            }
+            if version < 10 {
+                // Transport-independent, append-only replication receipts.
+                // Imported history remains outside active Vault revisions:
+                // no remote event may directly overwrite a local note.
+                try db.execute("""
+                    CREATE TABLE sync_inbox_cursors (
+                      origin_vault BLOB NOT NULL CHECK(length(origin_vault)=16),
+                      origin_epoch BLOB NOT NULL CHECK(length(origin_epoch)=16),
+                      last_seq INTEGER NOT NULL CHECK(last_seq>=0),
+                      PRIMARY KEY(origin_vault,origin_epoch)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("""
+                    CREATE TABLE sync_inbox_changes (
+                      origin_vault BLOB NOT NULL CHECK(length(origin_vault)=16),
+                      origin_epoch BLOB NOT NULL CHECK(length(origin_epoch)=16),
+                      seq INTEGER NOT NULL CHECK(seq>0),
+                      event_json TEXT NOT NULL,
+                      content_hash TEXT,
+                      content_bytes BLOB,
+                      PRIMARY KEY(origin_vault,origin_epoch,seq),
+                      CHECK((content_hash IS NULL AND content_bytes IS NULL)
+                            OR (length(content_hash)=64 AND content_bytes IS NOT NULL))
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("""
+                    CREATE TABLE sync_inbox_snapshots (
+                      origin_vault BLOB NOT NULL CHECK(length(origin_vault)=16),
+                      origin_epoch BLOB NOT NULL CHECK(length(origin_epoch)=16),
+                      snapshot_id BLOB NOT NULL CHECK(length(snapshot_id)=16),
+                      metadata_json TEXT NOT NULL,
+                      content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
+                      content_bytes BLOB NOT NULL,
+                      PRIMARY KEY(origin_vault,origin_epoch,snapshot_id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("""
+                    CREATE TABLE sync_outgoing_peers (
+                      peer_key TEXT PRIMARY KEY NOT NULL,
+                      acknowledged_seq INTEGER NOT NULL CHECK(acknowledged_seq>=0),
+                      updated_at TEXT NOT NULL
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("""
+                    CREATE TABLE sync_outgoing_snapshots (
+                      peer_key TEXT NOT NULL,
+                      snapshot_id BLOB NOT NULL CHECK(length(snapshot_id)=16),
+                      content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
+                      acknowledged_at TEXT NOT NULL,
+                      PRIMARY KEY(peer_key,snapshot_id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("PRAGMA user_version=10")
             }
         }
     }
