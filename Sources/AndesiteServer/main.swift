@@ -18,9 +18,9 @@ func describe(_ snapshot: RecoverySnapshot) -> String {
 }
 let usage = """
 Usage: andesite-server <command> --vault /absolute/vault --state /absolute/private-state [arguments]
-  vault-list                        (show selected paths from ~/.andesite/vaults.json)
-  vault-add /absolute/vault         (remember selected path without scanning)
-  vault-remove /absolute/vault      (forget path without changing vault or history)
+  vault-add /absolute/vault         (create <vault>/.andesite/vault.json with path only)
+  vault-info /absolute/vault        (read that Vault's saved path)
+  vault-remove /absolute/vault      (forget that Vault's saved path without removing notes)
   init | reconcile | status | search <phrase>
   watch    (macOS FSEvents plus read-only HTTP on state/andesite-read.sock; SIGINT/SIGTERM to stop)
   snapshots [document-id-or-historical-path]
@@ -41,17 +41,16 @@ Snapshot expiration is metadata only; no snapshots, revisions or objects are pru
 """
 let args = Array(CommandLine.arguments.dropFirst())
 do {
-    if let command = args.first, ["vault-list", "vault-add", "vault-remove"].contains(command) {
-        let expected = command == "vault-list" ? 1 : 2
-        guard args.count == expected else { throw CLIError.usage }
-        let registry = try VaultPathRegistry()
+    if let command = args.first, ["vault-add", "vault-info", "vault-remove"].contains(command) {
+        guard args.count == 2 else { throw CLIError.usage }
+        let registry = try VaultPathRegistry(vaultDirectory: args[1])
         switch command {
-        case "vault-list":
-            for path in try registry.list() { print(path) }
         case "vault-add":
-            print(try registry.add(args[1]) ? "Saved vault path: \(args[1])" : "Already registered: \(args[1])")
+            print(try registry.register() ? "Saved Vault path: \(args[1])" : "Already registered: \(args[1])")
+        case "vault-info":
+            print(try registry.storedPath() ?? "Not registered: \(args[1])")
         default:
-            print(try registry.remove(args[1]) ? "Removed saved path: \(args[1])" : "Not registered: \(args[1])")
+            print(try registry.unregister() ? "Removed saved path: \(args[1])" : "Not registered: \(args[1])")
         }
     } else {
     let counts: [String: ClosedRange<Int>] = ["init": 0...0, "reconcile": 0...0, "status": 0...0, "search": 1...1, "watch": 0...0,

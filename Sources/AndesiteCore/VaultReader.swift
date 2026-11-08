@@ -145,6 +145,25 @@ public final class VaultReader {
                           FileFingerprint(info).sameInode(as: expected) else { throw VaultReadError.unsafeFile }
                     continue
                 }
+                // The Vault's own private path-only configuration lives in
+                // <root>/.andesite. Verify the exact reserved directory,
+                // never follow it, and never traverse or index its contents.
+                // Any nested, misspelled, linked or unsafe .andesite name
+                // retains the existing fail-closed behavior.
+                if prefix.isEmpty && name == ".andesite" {
+                    guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+                          info.st_uid == geteuid(), info.st_mode & 0o077 == 0,
+                          UInt64(info.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
+                    let ignored = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                    guard ignored >= 0 else { throw VaultReadError.unsafeFile }
+                    defer { close(ignored) }
+                    var opened = stat()
+                    guard fstat(ignored, &opened) == 0,
+                          opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else {
+                        throw VaultReadError.unstable
+                    }
+                    continue
+                }
                 guard !name.lowercased().hasPrefix(".andesite"), namespace.insert(path.portabilityKey).inserted else { throw VaultReadError.invalidPath }
                 guard UInt64(info.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
                 switch info.st_mode & mode_t(S_IFMT) {

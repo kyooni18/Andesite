@@ -10,95 +10,120 @@ public enum VaultPathRegistryError: Error, Equatable {
     case invalidVaultPath
     case unsafeRegistry
     case invalidContents
-    case tooManyVaults
     case systemCall(String, Int32)
 }
 
-/// A deliberately minimal, per-user list of selected Vault directory paths.
+/// One path-only marker per Vault, stored in <vault>/.andesite/vault.json.
 ///
-/// ~/.andesite/vaults.json stores only an array of absolute paths. No note
-/// contents, SQLite catalog, state location, snapshot, inode or FTS data enter
-/// this registry. Existing per-vault state directories remain independent.
-///
-/// The registry never scans or opens the contents of a selected Vault.
+/// This does not register Vaults globally, create an index/database, or scan
+/// document contents. Historical snapshot/index state remains independent.
 public final class VaultPathRegistry {
-    public static let filename = "vaults.json"
-    private static let maximumPaths = 1_000
-    private static let maximumFileBytes = 512 * 1024
+    public static let directoryName = ".andesite"
+    public static let filename = "vault.json"
 
     private let root: Int32
+    private let path: String
+    private let device: dev_t
+    private let inode: ino_t
 
-    public init(directory: String = FileManager.default.homeDirectoryForCurrentUser.path + "/.andesite") throws {
-        try Self.validateAbsolutePath(directory)
-        if mkdir(directory, 0o700) != 0 && errno != EEXIST {
-            throw VaultPathRegistryError.systemCall("create registry directory", errno)
+    public init(vaultDirectory: String) throws {
+        try Self.validateAbsolutePath(vaultDirectory)
+        try Self.validateVaultDirectory(vaultDirectory)
+        let fd = open(vaultDirectory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else {
+            throw VaultPathRegistryError.systemCall("open vault directory", errno)
         }
-        try Self.validateDirectory(directory, privateDirectory: true)
-        let fd = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard fd >= 0 else { throw VaultPathRegistryError.systemCall("open registry directory", errno) }
-        root = fd
-        do {
-            try locked {
-                if try !Self.exists(Self.filename, in: root) {
-                    try Self.writePaths([], to: root)
-                } else {
-                    _ = try Self.readPaths(from: root)
-                }
-            }
-        } catch {
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              info.st_uid == geteuid() else {
             close(fd)
-            throw error
+            throw VaultPathRegistryError.invalidVaultPath
         }
+        self.root = fd
+        self.path = vaultDirectory
+        self.device = info.st_dev
+        self.inode = info.st_ino
     }
 
     deinit { close(root) }
 
-    /// Lists saved selections even when an external-drive vault is offline.
-    public func list() throws -> [String] {
-        try locked { try Self.readPaths(from: root) }
+    /// Read the stored path without making or modifying a .andesite directory.
+    /// A moved Vault may still contain its previous absolute path until added
+    /// at the new location; no automatic filesystem reorganization occurs.
+    public func storedPath() throws -> String? {
+        guard let directory = try openRegistry(create: false) else { return nil }
+        defer { close(directory) }
+        return try Self.readPath(from: directory)
     }
 
-    /// Only registration checks that a vault exists. Does not scan documents.
+    /// Create or update the path marker inside the selected Vault. Does not
+    /// open any Markdown file, create an index, or start the watcher.
     @discardableResult
-    public func add(_ path: String) throws -> Bool {
-        try Self.validateDirectory(path, privateDirectory: false)
-        return try locked {
-            var paths = try Self.readPaths(from: root)
-            if paths.contains(path) { return false }
-            guard paths.count < Self.maximumPaths else { throw VaultPathRegistryError.tooManyVaults }
-            paths.append(path)
-            try Self.writePaths(paths.sorted(), to: root)
+    public func register() throws -> Bool {
+        guard let directory = try openRegistry(create: true) else {
+            throw VaultPathRegistryError.unsafeRegistry
+        }
+        defer { close(directory) }
+        return try Self.withLock(directory) {
+            let previous = try Self.readPath(from: directory)
+            guard previous != path else { return false }
+            try Self.writePath(path, to: directory)
             return true
         }
     }
 
-    /// Removal is safe if an external drive is disconnected: no vault data is
-    /// touched, and no state files, snapshots or histories are ever removed.
+    /// Forget only this Vault's path marker. Never remove other contents from
+    /// .andesite, the Vault itself, or external snapshot/index state.
     @discardableResult
-    public func remove(_ path: String) throws -> Bool {
-        try Self.validateAbsolutePath(path)
-        return try locked {
-            var paths = try Self.readPaths(from: root)
-            guard let offset = paths.firstIndex(of: path) else { return false }
-            paths.remove(at: offset)
-            try Self.writePaths(paths, to: root)
+    public func unregister() throws -> Bool {
+        guard let directory = try openRegistry(create: false) else { return false }
+        defer { close(directory) }
+        return try Self.withLock(directory) {
+            guard try Self.readPath(from: directory) != nil else { return false }
+            guard unlinkat(directory, Self.filename, 0) == 0 else {
+                throw VaultPathRegistryError.systemCall("remove vault path", errno)
+            }
+            guard fsync(directory) == 0 else {
+                throw VaultPathRegistryError.systemCall("sync vault metadata", errno)
+            }
             return true
         }
     }
 
-    private func locked<T>(_ action: () throws -> T) throws -> T {
-        let fd = openat(root, ".vaults.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard fd >= 0 else {
-            if errno == ELOOP { throw VaultPathRegistryError.unsafeRegistry }
-            throw VaultPathRegistryError.systemCall("open registry lock", errno)
+    private func verifyRoot() throws {
+        var info = stat()
+        guard lstat(path, &info) == 0,
+              info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              info.st_dev == device, info.st_ino == inode else {
+            throw VaultPathRegistryError.invalidVaultPath
         }
-        defer { close(fd) }
-        try Self.validateFile(fd)
-        guard flock(fd, LOCK_EX) == 0 else {
-            throw VaultPathRegistryError.systemCall("lock registry", errno)
+    }
+
+    private func openRegistry(create: Bool) throws -> Int32? {
+        try verifyRoot()
+        if create && mkdirat(root, Self.directoryName, mode_t(0o700)) != 0 && errno != EEXIST {
+            throw VaultPathRegistryError.systemCall("create .andesite", errno)
         }
-        defer { _ = flock(fd, LOCK_UN) }
-        return try action()
+        let directory = openat(root, Self.directoryName,
+                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard directory >= 0 else {
+            if !create && errno == ENOENT { return nil }
+            if errno == ELOOP || errno == ENOTDIR { throw VaultPathRegistryError.unsafeRegistry }
+            throw VaultPathRegistryError.systemCall("open .andesite", errno)
+        }
+        var opened = stat(), linked = stat()
+        guard fstat(directory, &opened) == 0,
+              fstatat(root, Self.directoryName, &linked, AT_SYMLINK_NOFOLLOW) == 0,
+              opened.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              opened.st_uid == geteuid(),
+              opened.st_mode & 0o077 == 0,
+              opened.st_dev == linked.st_dev, opened.st_ino == linked.st_ino,
+              opened.st_dev == device else {
+            close(directory)
+            throw VaultPathRegistryError.unsafeRegistry
+        }
+        return directory
     }
 
     private static func validateAbsolutePath(_ path: String) throws {
@@ -108,29 +133,20 @@ public final class VaultPathRegistry {
               !path.hasSuffix("/"), !path.contains("//"),
               path.dropFirst().split(separator: "/").allSatisfy({
                   !$0.isEmpty && $0 != "." && $0 != ".." && $0.utf8.count <= 255
-              })
-        else { throw VaultPathRegistryError.invalidDirectory }
+              }) else { throw VaultPathRegistryError.invalidDirectory }
     }
 
-    private static func validateDirectory(_ path: String, privateDirectory: Bool) throws {
-        try validateAbsolutePath(path)
+    private static func validateVaultDirectory(_ path: String) throws {
         var prefix = ""
         for component in path.split(separator: "/") {
             prefix += "/" + component
-            var information = stat()
-            guard lstat(prefix, &information) == 0,
-                  information.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            var info = stat()
+            guard lstat(prefix, &info) == 0,
+                  info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
                 throw VaultPathRegistryError.invalidVaultPath
             }
-            // All parent directory entries are real directories, never links.
-            // An existing vault must belong to the caller, as with VaultRuntime.
-            if prefix == path {
-                guard information.st_uid == geteuid() else {
-                    throw VaultPathRegistryError.invalidVaultPath
-                }
-                if privateDirectory && information.st_mode & 0o077 != 0 {
-                    throw VaultPathRegistryError.unsafeRegistry
-                }
+            if prefix == path && info.st_uid != geteuid() {
+                throw VaultPathRegistryError.invalidVaultPath
             }
         }
     }
@@ -146,64 +162,73 @@ public final class VaultPathRegistry {
         }
     }
 
-    private static func exists(_ name: String, in directory: Int32) throws -> Bool {
-        var info = stat()
-        if fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) == 0 { return true }
-        if errno == ENOENT { return false }
-        throw VaultPathRegistryError.systemCall("stat registry", errno)
-    }
-
-    private static func readPaths(from directory: Int32) throws -> [String] {
+    private static func readPath(from directory: Int32) throws -> String? {
         let fd = openat(directory, Self.filename, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else {
+            if errno == ENOENT { return nil }
             if errno == ELOOP { throw VaultPathRegistryError.unsafeRegistry }
-            throw VaultPathRegistryError.systemCall("read registry", errno)
+            throw VaultPathRegistryError.systemCall("read vault path", errno)
         }
         defer { close(fd) }
         try validateFile(fd)
-        var statInfo = stat()
-        guard fstat(fd, &statInfo) == 0,
-              statInfo.st_size >= 0,
-              statInfo.st_size <= Self.maximumFileBytes else {
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_size >= 1, info.st_size <= 8192 else {
             throw VaultPathRegistryError.invalidContents
         }
-        var bytes = [UInt8](repeating: 0, count: Int(statInfo.st_size) + 1)
+        var data = [UInt8](repeating: 0, count: Int(info.st_size) + 1)
         var total = 0
-        while total < bytes.count {
-            let count = bytes.withUnsafeMutableBytes {
+        while total < data.count {
+            let count = data.withUnsafeMutableBytes {
                 read(fd, $0.baseAddress!.advanced(by: total), $0.count - total)
             }
             if count < 0 && errno == EINTR { continue }
-            guard count >= 0 else { throw VaultPathRegistryError.systemCall("read registry", errno) }
+            guard count >= 0 else { throw VaultPathRegistryError.systemCall("read vault path", errno) }
             if count == 0 { break }
             total += count
         }
-        guard total <= Self.maximumFileBytes,
-              let paths = try? JSONDecoder().decode([String].self, from: Data(bytes.prefix(total))),
-              paths.count <= Self.maximumPaths, paths == Array(Set(paths)).sorted() else {
+        guard total <= 8192,
+              let json = try? JSONSerialization.jsonObject(with: Data(data.prefix(total))),
+              let object = json as? [String: Any],
+              object.count == 1,
+              let path = object["path"] as? String else {
             throw VaultPathRegistryError.invalidContents
         }
-        for path in paths {
-            do { try validateAbsolutePath(path) }
-            catch { throw VaultPathRegistryError.invalidContents }
-        }
-        return paths
+        do { try validateAbsolutePath(path) }
+        catch { throw VaultPathRegistryError.invalidContents }
+        return path
     }
 
-    private static func writePaths(_ paths: [String], to directory: Int32) throws {
-        guard paths.count <= Self.maximumPaths,
-              let encoded = try? JSONEncoder().encode(paths), encoded.count <= Self.maximumFileBytes - 1
-        else { throw VaultPathRegistryError.tooManyVaults }
+    private static func withLock<T>(_ directory: Int32, _ body: () throws -> T) throws -> T {
+        let fd = openat(directory, ".vault.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            if errno == ELOOP { throw VaultPathRegistryError.unsafeRegistry }
+            throw VaultPathRegistryError.systemCall("open vault metadata lock", errno)
+        }
+        defer { close(fd) }
+        try validateFile(fd)
+        guard flock(fd, LOCK_EX) == 0 else {
+            throw VaultPathRegistryError.systemCall("lock vault metadata", errno)
+        }
+        defer { _ = flock(fd, LOCK_UN) }
+        return try body()
+    }
+
+    private static func writePath(_ path: String, to directory: Int32) throws {
+        guard let encoded = try? JSONSerialization.data(withJSONObject: ["path": path], options: [.sortedKeys, .withoutEscapingSlashes]),
+              encoded.count < 8192 else {
+            throw VaultPathRegistryError.invalidContents
+        }
         var bytes = encoded
         bytes.append(0x0A)
-
-        let temp = ".vaults-\(UUID().uuidString).tmp"
-        let fd = openat(directory, temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard fd >= 0 else { throw VaultPathRegistryError.systemCall("create registry staging", errno) }
-        var completed = false
+        let temporary = ".vault-\(UUID().uuidString).tmp"
+        let fd = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            throw VaultPathRegistryError.systemCall("create vault metadata staging", errno)
+        }
+        var published = false
         defer {
             close(fd)
-            if !completed { _ = unlinkat(directory, temp, 0) }
+            if !published { _ = unlinkat(directory, temporary, 0) }
         }
         try bytes.withUnsafeBytes { buffer in
             var offset = 0
@@ -211,16 +236,18 @@ public final class VaultPathRegistry {
                 let count = write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
                 if count < 0 && errno == EINTR { continue }
                 guard count > 0 else {
-                    throw VaultPathRegistryError.systemCall("write registry", errno)
+                    throw VaultPathRegistryError.systemCall("write vault metadata", errno)
                 }
                 offset += count
             }
         }
-        guard fsync(fd) == 0 else { throw VaultPathRegistryError.systemCall("sync registry", errno) }
-        guard renameat(directory, temp, directory, Self.filename) == 0 else {
-            throw VaultPathRegistryError.systemCall("publish registry", errno)
+        guard fsync(fd) == 0 else { throw VaultPathRegistryError.systemCall("sync vault path", errno) }
+        guard renameat(directory, temporary, directory, Self.filename) == 0 else {
+            throw VaultPathRegistryError.systemCall("publish vault path", errno)
         }
-        completed = true
-        guard fsync(directory) == 0 else { throw VaultPathRegistryError.systemCall("sync registry directory", errno) }
+        published = true
+        guard fsync(directory) == 0 else {
+            throw VaultPathRegistryError.systemCall("sync vault metadata", errno)
+        }
     }
 }

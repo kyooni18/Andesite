@@ -8,43 +8,50 @@ Network HTTP serving and remote synchronization are not implemented.**
 Use temporary test vaults, not production notes; filesystem/power-loss
 qualification and full v1 recovery remain outstanding.
 
-## Selected Vault paths (no database registry)
+## Vault-local path marker (no global registry)
 
-Andesite intentionally does **not** add a vault-directory registry to SQLite
-or build a second index of selected Vaults. The selection list is just an
-array of absolute directory-path strings in `~/.andesite/vaults.json`:
+Each Vault stores its own `.andesite/` folder **inside that Vault**.
+There is no home-level Vault registry and no Vault-selection table in SQLite:
 
-```json
-[
-  "/absolute/path/to/one-vault",
-  "/absolute/path/to/another-vault"
-]
+```text
+/absolute/path/to/vault/
+  note.md
+  .andesite/
+    vault.json
+    .vault.lock
 ```
 
-On first use, Andesite creates `~/.andesite` (0700) and `vaults.json`
-(0600). This folder is under the user's home directory, **not inside a
-Vault**. Only paths are stored: no file contents, metadata inventory, hashes,
-snapshot bytes, index, database or state-directory paths.
+The entire contents of `vault.json` are a single path field:
 
-Manage the path list without opening or scanning any selected Vault:
+```json
+{"path":"/absolute/path/to/vault"}
+```
+
+No note bytes, file metadata, hashes, snapshots, document index, database,
+or state-directory location are stored in this marker. Registration does not
+scan Markdown, create SQLite state, or start watching.
 
 ```sh
-.build/debug/andesite-server vault-list
 .build/debug/andesite-server vault-add /absolute/path/to/vault
+.build/debug/andesite-server vault-info /absolute/path/to/vault
 .build/debug/andesite-server vault-remove /absolute/path/to/vault
 ```
 
-Registration requires an existing physical directory without symlinks;
-listing/removal still work when an external-drive Vault is disconnected.
-Registering twice is idempotent. Removal forgets the selected path only—it
-does not delete the Vault, its note contents or any existing state/history.
-Updates use a private advisory lock and atomic file replacement.
+Registration creates `<vault>/.andesite/` with mode 0700, and writes
+`vault.json` with mode 0600 using an atomic replacement. Registering the
+same path again is idempotent. If a Vault moves, registering its new path
+updates the marker. There is no global `vault-list` command.
+Unregistering removes only the marker, preserving notes and any other
+files within `.andesite/`.
 
-**This is separate from the existing optional per-Vault backend.** Running
-`watch`/`reconcile` explicitly still uses the prior
-`--vault` and `--state` arguments, and continues maintaining
-its existing search/snapshot catalog. This change does not start indexing,
-enable a watcher or create a new SQLite database for registered selections.
+The Markdown scanner validates and skips exactly the top-level private
+`.andesite/`. A symlinked, unsafe or nested reserved directory still
+fails validation. Nothing inside that folder is indexed as a note.
+
+**The existing backend state directory remains separate.** Explicit
+`watch` / `reconcile` commands still use `--vault` and
+`--state`. This change does not relocate the existing SQLite catalog
+or snapshot history into the Vault.
 
 ## Build and exercise
 
@@ -135,8 +142,9 @@ A future HTTP layer can use this coordinator behind serialized blocking offload.
   namespace collisions abort the scan, even for non-Markdown entries.
 * Paths retain original spelling; portability comparison uses Unicode NFC plus
   Foundation Unicode case folding (POSIX locale). Unicode filenames work;
-  invalid UTF-8, controls, traversal, backslashes and `.andesite*` scan names
-  are rejected. This is not yet a version-pinned cross-platform Unicode table.
+  invalid UTF-8, controls, traversal, backslashes and reserved `.andesite*`
+  names are rejected. The verified, private top-level `.andesite/` is
+  the sole exception: it is skipped without indexing its contents. This is not yet a version-pinned cross-platform Unicode table.
 * Ordinary observation never rewrites canonical files. Two bounded byte/metadata reads
   capture observations. New/changed bytes become durable SHA-256 objects,
   random stable document IDs, parent-linked revisions and ordered changes.
