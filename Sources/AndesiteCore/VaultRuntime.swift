@@ -105,7 +105,29 @@ public final class VaultRuntime {
             id = Self.identifier()
             try db.executeValues("INSERT INTO vaults(id,root_config,epoch,created_at,state) VALUES(?,?,?,?, 'scanRequired')", bindings: [.blob(id), .text(rootIdentity), .blob(Self.identifier()), .text(ISO8601DateFormatter().string(from: Date()))])
         } else {
-            guard rows.count == 1, rows[0].count == 2, case .blob(let existing) = rows[0][0], rows[0][1] == .text(rootIdentity) else { throw VaultRuntimeError.identityMismatch }
+            guard rows.count == 1, rows[0].count == 2,
+                  case .blob(let existing) = rows[0][0],
+                  case .text(let recorded) = rows[0][1] else {
+                throw VaultRuntimeError.identityMismatch
+            }
+            if recorded != rootIdentity {
+                // Same-filesystem renames preserve the directory's inode.
+                // Require that identity AND the path-only marker that moved
+                // with the Vault. Existing revisions and IDs are preserved.
+                let pieces = recorded.split(separator: "\n", omittingEmptySubsequences: false)
+                let priorIdentity = "\(rootInfo.st_dev):\(rootInfo.st_ino)"
+                guard pieces.count == 2, String(pieces[1]) == priorIdentity,
+                      let oldPath = pieces.first.map(String.init), oldPath != vault,
+                      let selected = try VaultPathRegistry(vaultDirectory: vault).storedPath(),
+                      selected == oldPath || selected == vault else {
+                    throw VaultRuntimeError.identityMismatch
+                }
+                try db.transaction {
+                    try db.executeValues(
+                        "UPDATE vaults SET root_config=? WHERE id=? AND root_config=?",
+                        bindings: [.text(rootIdentity), .blob(existing), .text(recorded)])
+                }
+            }
             id = existing
         }
         self.configuration = c

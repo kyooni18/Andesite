@@ -21,6 +21,11 @@ Usage: andesite-server <command> --vault /absolute/vault --state /absolute/priva
   vault-add /absolute/vault         (create <vault>/.andesite/vault.json with path only)
   vault-info /absolute/vault        (read that Vault's saved path)
   vault-remove /absolute/vault      (forget that Vault's saved path without removing notes)
+  vault-state /absolute/vault       (resolve default backend state path without creating it)
+  vault-open /absolute/vault [--state /absolute/private-state]
+                                   (connect, reconcile and close gracefully)
+  vault-watch /absolute/vault [--state /absolute/private-state]
+                                   (connect, reconcile, then continuously monitor until stopped)
   init | reconcile | status | search <phrase>
   watch    (macOS FSEvents plus read-only HTTP on state/andesite-read.sock; SIGINT/SIGTERM to stop)
   snapshots [document-id-or-historical-path]
@@ -51,6 +56,43 @@ do {
             print(try registry.storedPath() ?? "Not registered: \(args[1])")
         default:
             print(try registry.unregister() ? "Removed saved path: \(args[1])" : "Not registered: \(args[1])")
+        }
+    } else if let command = args.first,
+              ["vault-open", "vault-watch", "vault-state"].contains(command) {
+        if command == "vault-state" {
+            guard args.count == 2 else { throw CLIError.usage }
+            print(try VaultSession.plannedStateDirectory(vaultDirectory: args[1]))
+        } else {
+            guard args.count == 2 || (args.count == 4 && args[2] == "--state") else {
+                throw CLIError.usage
+            }
+            #if os(macOS)
+            if command == "vault-watch" { VaultMonitor.installTerminationHandlers() }
+            #endif
+            let session = try VaultSession(vaultDirectory: args[1],
+                                           stateDirectory: args.count == 4 ? args[3] : nil)
+            do {
+                if command == "vault-open" {
+                    let report = try session.reconcile()
+                    print("vault-open path=\(args[1]) state=\(session.stateDirectory) discovered=\(report.discovered) revisions=\(report.revisionsCreated) snapshots=\(report.snapshotsCreated)")
+                } else {
+                    #if os(macOS)
+                    try session.watch(report: { line in
+                        FileHandle.standardOutput.write(Data((line + "\n").utf8))
+                    })
+                    #else
+                    throw CLIError.usage
+                    #endif
+                }
+                try session.close()
+            } catch {
+                let failure = error
+                do { try session.close() }
+                catch {
+                    FileHandle.standardError.write(Data("Vault closing also failed: \(error)\n".utf8))
+                }
+                throw failure
+            }
         }
     } else {
     let counts: [String: ClosedRange<Int>] = ["init": 0...0, "reconcile": 0...0, "status": 0...0, "search": 1...1, "watch": 0...0,
