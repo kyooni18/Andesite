@@ -55,6 +55,8 @@ network listener.
 | `/v1/documents?limit=50&offset=0` | Paginated current Markdown heads |
 | `/v1/documents/ID` | Current metadata, headings and raw link syntax |
 | `/v1/documents/ID/content` | Exact current immutable Markdown bytes up to 1 MiB |
+| `/v1/documents/ID/links` | Outgoing verified note targets, missing/ambiguous statuses and anchors |
+| `/v1/documents/ID/backlinks` | Inbound resolved references from indexed Markdown, no unlinked mentions |
 | `/v1/search?q=phrase&limit=50` | Literal-phrase search hit IDs, revision IDs and heading titles |
 | `/v1/snapshots?path=note.md&limit=50&offset=0` | Newest-first snapshot metadata and pagination counts |
 | `/v1/snapshots?document=ID` | Snapshot history for a stable document ID |
@@ -66,8 +68,9 @@ Limit is 1-100; offset is 0-100000. Larger snapshot content returns HTTP
 413; use the existing export command with the watcher stopped.
 Metadata and search responses use JSON, and content is exact UTF-8 Markdown.
 
-HTTP 400 indicates a malformed request, 404 an unknown route or snapshot,
-405 a non-GET method, and 503 a pending scan, unavailable index, quarantine
+HTTP 400 indicates a malformed request, 404 an unknown route, document
+or snapshot, 405 a non-GET method, 413 an object/graph over the configured
+safe read budget, and 503 a pending scan, unavailable index, quarantine
 or integrity failure. Search responses reflect the **last successfully
 reconciled catalog**, not an atomic live view of a note being edited. While
 known FSEvents changes remain pending, search returns 503 rather than
@@ -107,3 +110,8 @@ before applying limit and offset, so huge histories need query-level
 pagination optimization. Kernel event overflow and actual storage power-loss
 durability have not been qualified. Snapshot capture cannot reconstruct
 unobserved intermediate edits.
+
+Link GETs use an in-memory graph refreshed at low priority by
+VaultWorkScheduler after successful reconciliation. They do not parse
+or scan on a request. GET /v1/status includes linksIndexed and
+linkCacheGeneration; see [the scheduler architecture](andesite-work-queue.md).

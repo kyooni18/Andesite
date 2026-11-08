@@ -47,6 +47,8 @@ before Hummingbird binds TCP.
 | `/v1/documents?limit=50&offset=0` | Paginated live Markdown document metadata and stable IDs |
 | `/v1/documents/ID` | Indexed head metadata, headings, Markdown destinations and lexical wikilinks |
 | `/v1/documents/ID/content` | Current immutable Markdown bytes (up to 1 MiB) |
+| `/v1/documents/ID/links?limit=50&offset=0` | Outgoing lexical Markdown and wikilink references with conservative note/anchor resolution |
+| `/v1/documents/ID/backlinks?limit=50&offset=0` | Inbound resolved mentions from verified indexed Markdown notes, with pagination |
 | `/v1/status` | Vault catalog/readiness |
 | `/v1/search?q=phrase&limit=50` | FTS hits with stable document/revision IDs |
 | `/v1/snapshots?path=note.md&limit=50&offset=0` | Snapshot history metadata |
@@ -54,13 +56,42 @@ before Hummingbird binds TCP.
 | `/v1/snapshots/ID` | Verified snapshot metadata |
 | `/v1/snapshots/ID/content` | Verified Markdown bytes, at most 1 MiB |
 
-Document listing is path-sorted. Detail extraction exposes raw
-CommonMark headings and link syntax, including Obsidian wikilinks, embeds,
-aliases and anchors, but **does not resolve target files or backlinks**.
+Document listing is path-sorted. Detail extraction exposes raw CommonMark
+headings and link syntax, including Obsidian wikilinks, embeds, aliases and
+anchors. The separate link endpoints resolve unambiguous current Markdown
+note targets and linked backlinks, but not unlinked mentions or all
+Obsidian link/refactoring semantics.
 Document structure extraction is limited to notes of at most 256 KiB,
 and caps each list at 256 entries with a structureTruncated flag. For notes
 larger than 1 MiB, metadata is available but body retrieval is unavailable. Compare gaps in the
 [Obsidian parity register](obsidian-compatibility.md).
+
+Link endpoints return `mentions`, `total`,
+`offset`, `nextOffset`, and scope metadata. Each
+mention includes `source`, `sourcePath`,
+`target`, `fragment`, `display`,
+`syntax`, `embed`, a resolution status, optional
+canonical `document` and `path`, an independent
+`fragmentStatus`, and non-authoritative
+`aliasSuggestions`. Status is one of resolved, missing,
+ambiguous, unsupported or external. A file may be resolved while its
+heading/block fragment remains missing or ambiguous.
+
+Backlinks are prepared by the work scheduler **after** a successful
+filesystem reconciliation, not parsed again on every GET. Unchanged
+revisions reuse their parsed syntax and the fully resolved, immutable
+forward/backlink arrays are published atomically in memory.
+GET /v1/status includes linksIndexed and linkCacheGeneration.
+Pending cache work returns HTTP 503 link_index_pending.
+
+This does not yet support Obsidian's unlinked mentions, attachments,
+full YAML Properties, smart link suggestions, rename rewrites or all
+heading/block path forms. Oversized graphs return HTTP 413 rather
+than incomplete empty results: maximum 2000 documents, 24 MiB total,
+256 KiB per note, 20000 references total, and 512 per note.
+No source note is modified by refresh. The serial cache refresh can
+still delay read APIs for large Vaults; see
+[work scheduler architecture](andesite-work-queue.md).
 
 The payload format and resource limits follow the existing
 [private Unix-socket API](andesite-local-http.md).

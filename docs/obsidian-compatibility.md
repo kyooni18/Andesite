@@ -33,8 +33,9 @@ means no equivalent. Backend data compatibility is not desktop UI parity.
 | Notes list / folder browsing | **Partial** | Paginated GET /v1/documents; flat paths, no full file explorer |
 | Document content / outline | **Partial** | Exact immutable current heads; CommonMark headings bounded to 256 KiB and 256 items; no editable live preview |
 | Standard Markdown links | **Partial** | AST destinations in document detail; unresolved targets |
-| Wikilinks / embeds / aliases / heading references | **Partial** | ObsidianLinks extracts raw syntax outside code; no destination/anchor resolution |
-| Backlinks and unlinked mentions | **Missing** | No full link graph or reverse references |
+| Wikilinks / embeds / aliases / heading references | **Partial** | VaultLinkGraph resolves unambiguous Markdown note paths and filenames, checks simple heading and explicit ^block anchors; ambiguous/missing references fail closed. Alias suggestions are non-authoritative, multi-heading paths and attachments remain unsupported |
+| Linked backlinks | **Partial** | Reused parsed note syntax and low-priority cached forward/backlink arrays; capped at 2000 notes / 24 MiB / 20000 mentions, no persisted graph or unlinked mentions |
+| Unlinked mentions | **Missing** | Plain-text mentions of note names or aliases are not searched or displayed |
 | Graph view | **Missing** | No visual graph |
 | Frontmatter YAML / Properties | **Missing** | Raw bytes retained, no typed property index or UI |
 | Bases (.base) | **Missing** | No Bases format parser/views/formulas |
@@ -79,6 +80,7 @@ area is recovery integrity, not Obsidian's linked knowledge UI.
    bytes and their existing default Obsidian configuration.
 5. Update this matrix in the same commit as new features.
 
-**Next priority:** Obsidian-correct link target resolution/backlinks and
-renames; typed frontmatter/Properties and search filters; attachment and
-Canvas/Bases indexing; journal-safe write APIs; editor and plugin parity.
+**Next priority:** cooperative time-sliced link cache for large Vaults
+and full Obsidian heading/block/path/rename semantics, unlinked mentions, and
+typed frontmatter/Properties and search filters; then attachment and
+Canvas/Bases indexing, journal-safe write APIs, and editor/plugin parity.

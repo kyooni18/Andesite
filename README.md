@@ -118,12 +118,16 @@ export ANDESITE_API_TOKEN="$(openssl rand -hex 32)"
 curl -H "Authorization: Bearer $ANDESITE_API_TOKEN"   http://127.0.0.1:8788/v1/status
 ```
 
-The server requires the existing watcher to be healthy and exposes only
-GET status, phrase search, paginated Markdown document listing, indexed
-document detail and immutable content, and recovery snapshot views.
-Search hits include Vault-relative paths. Document detail contains
-CommonMark headings, Markdown link destinations and lexical Obsidian
-wikilinks/embeds/aliases, **not resolved backlinks**.
+The server requires the existing watcher to be healthy and exposes
+read-only status, phrase search, paginated Markdown documents, immutable
+head content, outgoing links, resolved incoming backlinks, and recovery
+snapshots. Search hits include Vault-relative paths. Document detail
+contains CommonMark headings and lexical links; linked backlinks are
+resolved against the current indexed note IDs. A coalescing work
+scheduler runs file reconciliation before disposable cached link-graph
+updates; GET requests page in-memory data without reparsing notes.
+Obsidian unlinked mentions, full Properties, rename rewrites and
+large-Vault parity remain unimplemented.
 
 From a separate local client, the same-user Unix socket supports:
 
@@ -131,6 +135,8 @@ From a separate local client, the same-user Unix socket supports:
 python3 scripts/andesite-api.py --state /absolute/private/state documents
 python3 scripts/andesite-api.py --state /absolute/private/state document DOCUMENT_ID
 python3 scripts/andesite-api.py --state /absolute/private/state document-content DOCUMENT_ID
+python3 scripts/andesite-api.py --state /absolute/private/state links DOCUMENT_ID
+python3 scripts/andesite-api.py --state /absolute/private/state backlinks DOCUMENT_ID
 ```
 
 No LAN listener, CORS, TLS, remote auth, write API, restoration or sync
@@ -138,6 +144,9 @@ is provided yet. See [the Hummingbird API contract](docs/andesite-http-server.md
 and the end-to-end `scripts/test-api-server.sh` test.
 Track what still differs from Obsidian in the
 [compatibility register](docs/obsidian-compatibility.md).
+The [work scheduler design](docs/andesite-work-queue.md) explains
+immediate filesystem edits, deferred indexing, priority and cache
+invalidation without a second SQLite owner.
 
 
 ## Build and exercise
@@ -445,7 +454,7 @@ the planned multi-user, remotely authenticated v1 API.
 Invalid UTF-8 bytes remain incident history, not valid Markdown snapshots; a file
 that was never valid has no document snapshot yet. The basic
 extractor lacks complete v1 frontmatter/wiki syntax/tags/link resolution,
-resolved backlinks, snippets, advanced search pagination and index generations.
+unlinked mentions, snippets, advanced search pagination and index generations.
 
 The [milestone engineering report](docs/andesite-quarantine-milestone.md) records
 implementation decisions, verified boundaries and remaining risks.
@@ -453,17 +462,17 @@ implementation decisions, verified boundaries and remaining risks.
 ## Verification and next milestone
 
 `swift build` and `swift test` pass on the macOS/APFS development host with
-**54 tests** (48 prior plus six document and Obsidian-compatibility tests).
-They exercise FSEvents, snapshot promotion, durable mutation recovery,
+**67 tests** (61 prior plus three scheduler, two cache and one real
+FSEvents cache test). They exercise FSEvents, snapshot promotion, durable mutation recovery,
 same-UID HTTP access, live document heads, pagination, immutable
 content, syntax-only Obsidian links, and safe preservation of
 the .obsidian, .trash and .git folders.
 Prior journal/recovery SIGKILL tests remain in the suite. Additional watcher
 smoke tests use only temporary vaults and preserve source bytes.
 
-Next: correctly resolved Obsidian internal links/backlinks and aliases,
-typed Properties/frontmatter, and safe journal-backed editing APIs.
-Large-vault pagination, Bases/Canvas, verified cross-volume migration
-and Linux inotify remain separate priorities.
+Next: cooperative time-sliced cache refresh for large Vaults,
+Obsidian-complete heading/block anchors, unlinked mentions and typed
+Properties/frontmatter. Safe journal-backed edits, Bases/Canvas, cross-volume
+migration and Linux inotify remain separate priorities.
 Network HTTP mutations, remote sync, physical power-loss qualification
 and object garbage collection remain separate milestones.
