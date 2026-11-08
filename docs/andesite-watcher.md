@@ -1,5 +1,10 @@
 # Andesite continuous monitoring — macOS
 
+For a path-only Vault selection and opt-in background open/close without
+a manually specified state path, see
+[Vault session lifecycle](andesite-vault-session.md).
+The existing explicit-state watch command documented below remains supported.
+
 ## Implementation and behavior
 
 `andesite-server watch --vault ABSOLUTE_VAULT --state ABSOLUTE_PRIVATE_STATE`
@@ -99,8 +104,8 @@ state directories. Keep the vault and private state on trusted local storage.
 
 The new Swift integration tests cover a live FSEvents stream and file changes,
 rename/delete history, snapshot due promotion, periodic fallback and re-launch
-after a real SIGKILL. The development Mac passes all **38 tests** (the
-original 34 plus four local HTTP tests), including earlier mutation-journal
+after a real SIGKILL. The development Mac passes all **47 tests** (38 through the
+read-only HTTP milestone, four vault marker tests and five session tests), including earlier mutation-journal
 SIGKILL coverage. Dropped-event flags are handled in code, but actual kernel
 queue overflow and physical power loss have **not** been reproduced. Linux
 inotify, network-backed filesystems and authenticated network HTTP access are

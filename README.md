@@ -53,6 +53,49 @@ fails validation. Nothing inside that folder is indexed as a note.
 `--state`. This change does not relocate the existing SQLite catalog
 or snapshot history into the Vault.
 
+## Opening and closing a Vault
+
+Selection and backend operation remain separate. Merely choosing a directory
+writes only its path marker and does **not** index notes. A subsequent
+explicit open creates/connects a backend outside the Vault, reconciles
+the selected folder, and closes cleanly after the command completes:
+
+```sh
+.build/debug/andesite-server vault-add /absolute/path/to/vault
+.build/debug/andesite-server vault-state /absolute/path/to/vault
+.build/debug/andesite-server vault-open /absolute/path/to/vault
+.build/debug/andesite-server vault-watch /absolute/path/to/vault # Ctrl-C closes it
+```
+
+On macOS, the simplest long-lived background open/close workflow uses an
+optional per-Vault LaunchAgent, without manually specifying the state path:
+
+```sh
+swift build -c release
+python3 scripts/andesite-vault.py select /absolute/path/to/vault
+python3 scripts/andesite-vault.py open /absolute/path/to/vault
+python3 scripts/andesite-vault.py status /absolute/path/to/vault
+python3 scripts/andesite-vault.py close /absolute/path/to/vault
+```
+
+Opening starts the existing FSEvents watcher and same-user read-only HTTP.
+Closing unloads the LaunchAgent, waits for graceful termination and snapshot
+flush, and leaves notes, markers, SQLite state and snapshots intact.
+
+Default backend state is private and **outside the Vault**, under
+`~/Library/Application Support/Andesite/States/`. Its key is derived
+from macOS directory identity (device, inode, birthtime), not its pathname.
+Same-volume renames retain the catalog and revision history; after verifying
+that the same directory has moved, the Vault marker records its new path.
+Copies to another device or a different inode must not inherit recovery data
+implicitly, so a displaced marker without its old identity fails closed.
+
+The existing explicit `--vault`/`--state` commands remain
+supported. To reuse an earlier manually configured state without copying
+or resetting its DB, use
+`vault-open /path/to/vault --state /existing/private/state`.
+See the [Vault session lifecycle](docs/andesite-vault-session.md).
+
 ## Build and exercise
 
 Requires Swift 6.2+, SQLite >= 3.35 with FTS5 and development headers/pkg-config.
@@ -365,15 +408,16 @@ implementation decisions, verified boundaries and remaining risks.
 ## Verification and next milestone
 
 `swift build` and `swift test` pass on the macOS/APFS development host with
-**38 tests** (34 prior plus four local HTTP tests). They exercise
+**47 tests** (42 prior plus five Vault session tests). They exercise
 FSEvents edits/moves/deletions, snapshot promotion, periodic scans,
 same-UID socket ownership, restricted HTTP methods, malformed requests,
-quarantine and SIGKILL downtime/startup re-observation.
+quarantine, SIGKILL recovery, path-only selection, session shutdown,
+same-filesystem relocation and copied-Vault identity refusal.
 Prior journal/recovery SIGKILL tests remain in the suite. Additional watcher
 smoke tests use only temporary vaults and preserve source bytes.
 
-Next: Linux inotify with the same scan/loss-recovery boundaries, fault
-qualification for file-event storms and unsupported filesystems, and
-stricter performance/capability qualification for local HTTP queries.
+Next: robust state migration for verified cross-volume moves, Linux inotify
+with the same scan/loss-recovery boundaries, and fault/performance
+qualification for file-event storms and unsupported filesystems.
 Network HTTP mutations, remote sync, physical power-loss qualification
 and object garbage collection remain separate milestones.
