@@ -11,8 +11,8 @@ import Testing
     let destination = try VaultRuntime(configuration: remote.configuration)
     _ = try source.reconcile()
     _ = try destination.reconcile()
-    let api = AndesiteBackend(runtime: source)
-    let server = AndesiteBackend(runtime: destination)
+    let api = source
+    let server = destination
     let peer = "server-archive"
 
     #expect(try api.syncAcknowledgedSequence(peer: peer) == 0)

@@ -55,106 +55,63 @@ public enum ExternalCapture {
     /// Caller owns the transaction. Explicit entryID is only supplied by the
     /// validated namespace planner, never inferred from a content hash.
     static func publish(db: SQLiteConnection, vaultID: Data, prepared p: Prepared,
-                        entryID requestedID: Data? = nil, at date: Date,
-                        restoringRevision: Data? = nil,
-                        mutationOrigin: String = "restore") throws -> ExternalCaptureResult? {
-        guard vaultID.count == 16, try db.queryValues("SELECT id FROM vaults WHERE id=?", bindings: [.blob(vaultID)]).count == 1 else { throw ExternalCaptureError.unknownVault }
-        let timestamp = ISO8601DateFormatter().string(from: date)
-        let predicate = requestedID == nil ? "e.path_key=? AND e.state='live'" : "e.id=? AND e.state IN ('live','reserved')"
-        let rows = try db.queryValues("""
-            SELECT e.id,r.path,e.kind,e.head_revision,r.content_hash
-            FROM entries e LEFT JOIN revisions r ON r.vault_id=e.vault_id AND r.revision_id=e.head_revision
-            WHERE e.vault_id=? AND \(predicate)
-            """, bindings: [.blob(vaultID), requestedID.map(SQLiteValue.blob) ?? .text(p.path.portabilityKey)])
-        let entryID: Data, oldRevision: Data?, oldPath: String?, oldHash: Data?
-        if let row = rows.first {
-            guard case .blob(let id) = row[0], case .text(let path) = row[1], row[2] == .text(p.kind),
-                  case .blob(let head) = row[3], case .blob(let hash) = row[4] else { throw ExternalCaptureError.corruptCatalog }
-            if requestedID == nil && Array(path.utf8) != Array(p.name.utf8) { throw ExternalCaptureError.pathCollision }
-            entryID = id; oldRevision = head; oldPath = path; oldHash = hash
+                        entryID requestedID: Data? = nil, at date: Date) throws -> ExternalCaptureResult? {
+        let current: CatalogEntry?
+        if let requestedID {
+            current = try Catalog.entry(db: db, vaultID: vaultID, id: requestedID)
+            guard current != nil else { throw ExternalCaptureError.corruptCatalog }
         } else {
-            guard requestedID == nil else { throw ExternalCaptureError.corruptCatalog }
-            entryID = identifier(); oldRevision = nil; oldPath = nil; oldHash = nil
+            current = try Catalog.live(db: db, vaultID: vaultID, path: p.name)
+            if let path = current?.path, Array(path.utf8) != Array(p.name.utf8) { throw ExternalCaptureError.pathCollision }
         }
-        try registerObject(db: db, prepared: p, timestamp: timestamp)
+        if let current, current.kind != p.kind { throw ExternalCaptureError.corruptCatalog }
+        try Catalog.registerObject(db: db, hash: p.hash, size: Int64(p.length))
+        let live = current?.state == "live" ? current : nil
         if !p.valid {
-            try incident(db: db, vaultID: vaultID, prepared: p, entryID: oldRevision == nil ? nil : entryID, at: date)
+            try incident(db: db, vaultID: vaultID, prepared: p, entryID: live?.id, at: date)
             return nil
         }
-        let moved = oldPath.map { Array($0.utf8) != Array(p.name.utf8) } ?? false
-        if restoringRevision == nil, oldHash == p.hashBytes && !moved, let head = oldRevision {
+        let entryID = current?.id ?? identifier()
+        if let live, let head = live.head, live.hash == p.hash, Array((live.path ?? "").utf8) == Array(p.name.utf8) {
             try db.executeValues("UPDATE entries SET fs_hint=? WHERE vault_id=? AND id=?", bindings: [.blob(p.hint), .blob(vaultID), .blob(entryID)])
             try resolveIncidents(db: db, vaultID: vaultID, key: p.path.portabilityKey, entryID: entryID)
             return ExternalCaptureResult(entryID: entryID, revisionID: head, contentHash: p.hash, sequence: nil)
         }
-        if oldRevision == nil {
-            try db.executeValues("INSERT INTO entries(vault_id,id,kind,state) VALUES(?,?,?,'reserved')", bindings: [.blob(vaultID), .blob(entryID), .text(p.kind)])
-        }
-        let revision = restoringRevision ?? identifier()
-        try db.executeValues("""
-            INSERT INTO revisions(vault_id,entry_id,revision_id,parent1,content_hash,byte_length,path,deleted,origin,created_at,fs_hint)
-            VALUES(?,?,?,?,?,?,?,0,?,?,?)
-            """, bindings: [.blob(vaultID), .blob(entryID), .blob(revision), oldRevision.map(SQLiteValue.blob) ?? .null,
-                            .blob(p.hashBytes), .integer(Int64(p.length)), .text(p.name), .text(restoringRevision == nil ? "external" : mutationOrigin), .text(timestamp), .blob(p.hint)])
-        try db.executeValues("UPDATE entries SET path=?,path_key=?,head_revision=?,state='live',fs_hint=? WHERE vault_id=? AND id=?", bindings: [.text(p.name), .text(p.path.portabilityKey), .blob(revision), .blob(p.hint), .blob(vaultID), .blob(entryID)])
+        let record = RevisionRecord(entry: entryID, revision: identifier(), parents: current?.head.map { [$0] } ?? [],
+                                    path: p.name, deleted: false, hash: p.hash, size: Int64(p.length),
+                                    kind: p.kind, origin: "external")
+        try Catalog.setHead(db: db, vaultID: vaultID, record, hint: try JSONDecoder().decode(FileFingerprint.self, from: p.hint))
         try resolveIncidents(db: db, vaultID: vaultID, key: p.path.portabilityKey, entryID: entryID)
-        let type = moved ? "moved" : (oldRevision == nil ? "created" : "updated")
-        let sequence = try event(db: db, vaultID: vaultID, entryID: entryID, revision: revision, type: type,
-                                 path: p.name, kind: p.kind, hash: p.hash, length: p.length, fromPath: moved ? oldPath : nil)
-        return ExternalCaptureResult(entryID: entryID, revisionID: revision, contentHash: p.hash, sequence: sequence)
+        let sequence = try db.queryValues("SELECT seq FROM changes WHERE vault_id=? AND revision_id=?",
+                                          bindings: [.blob(vaultID), .blob(record.revision)])
+        guard case .integer(let seq) = sequence.first?.first else { throw ExternalCaptureError.corruptCatalog }
+        return ExternalCaptureResult(entryID: entryID, revisionID: record.revision, contentHash: p.hash, sequence: seq)
     }
 
     static func tombstone(db: SQLiteConnection, vaultID: Data, entryID: Data, at date: Date) throws {
-        let rows = try db.queryValues("SELECT path,kind,head_revision FROM entries WHERE vault_id=? AND id=? AND state='live'", bindings: [.blob(vaultID), .blob(entryID)])
-        guard let row = rows.first, case .text(let path) = row[0], case .text(let kind) = row[1], case .blob(let parent) = row[2] else { throw ExternalCaptureError.corruptCatalog }
-        let revision = identifier()
-        try db.executeValues("INSERT INTO revisions(vault_id,entry_id,revision_id,parent1,path,deleted,origin,created_at) VALUES(?,?,?,?,?,1,'external',?)", bindings: [.blob(vaultID), .blob(entryID), .blob(revision), .blob(parent), .text(path), .text(ISO8601DateFormatter().string(from: date))])
-        try db.executeValues("UPDATE entries SET path=NULL,path_key=NULL,head_revision=?,state='deleted',fs_hint=NULL WHERE vault_id=? AND id=?", bindings: [.blob(revision), .blob(vaultID), .blob(entryID)])
-        _ = try event(db: db, vaultID: vaultID, entryID: entryID, revision: revision, type: "deleted", path: path, kind: kind, hash: nil, length: nil)
+        guard let current = try Catalog.entry(db: db, vaultID: vaultID, id: entryID), current.state == "live",
+              let path = current.path, let head = current.head else { throw ExternalCaptureError.corruptCatalog }
         // Incident bytes remain retained. A disappearance is not a correction.
+        try Catalog.setHead(db: db, vaultID: vaultID, RevisionRecord(
+            entry: entryID, revision: identifier(), parents: [head], path: path, deleted: true,
+            hash: nil, size: nil, kind: current.kind, origin: "external"), hint: nil)
     }
 
     static func incident(db: SQLiteConnection, vaultID: Data, prepared p: Prepared, entryID: Data?, at date: Date) throws {
         let timestamp = ISO8601DateFormatter().string(from: date)
-        try registerObject(db: db, prepared: p, timestamp: timestamp)
+        try Catalog.registerObject(db: db, hash: p.hash, size: Int64(p.length))
         let prior = try db.queryValues("SELECT id FROM incidents WHERE vault_id=? AND path_key=? AND content_hash=? AND status='open'", bindings: [.blob(vaultID), .text(p.path.portabilityKey), .blob(p.hashBytes)])
         if prior.isEmpty {
             try db.executeValues("INSERT INTO incidents(vault_id,id,path,path_key,entry_id,content_hash,fs_hint,status,observed_at) VALUES(?,?,?,?,?,?,?,'open',?)", bindings: [.blob(vaultID), .blob(identifier()), .text(p.name), .text(p.path.portabilityKey), entryID.map(SQLiteValue.blob) ?? .null, .blob(p.hashBytes), .blob(p.hint), .text(timestamp)])
         }
     }
 
-    static func registerObject(db: SQLiteConnection, prepared p: Prepared, timestamp: String) throws {
-        try db.executeValues("INSERT INTO objects(hash,length,durable_location,created_at) VALUES(?,?,?,?) ON CONFLICT(hash) DO NOTHING", bindings: [.blob(p.hashBytes), .integer(Int64(p.length)), .text(p.hash), .text(timestamp)])
-        guard try db.queryValues("SELECT length,durable_location FROM objects WHERE hash=?", bindings: [.blob(p.hashBytes)]) == [[.integer(Int64(p.length)), .text(p.hash)]] else { throw ExternalCaptureError.corruptCatalog }
-    }
-
     private static func resolveIncidents(db: SQLiteConnection, vaultID: Data, key: String, entryID: Data) throws {
         try db.executeValues("UPDATE incidents SET status='resolved' WHERE vault_id=? AND (entry_id=? OR (entry_id IS NULL AND path_key=?)) AND status='open'", bindings: [.blob(vaultID), .blob(entryID), .text(key)])
-    }
-
-    private static func event(db: SQLiteConnection, vaultID: Data, entryID: Data, revision: Data, type: String,
-                              path: String, kind: String, hash: String?, length: Int?, fromPath: String? = nil) throws -> Int64 {
-        let rows = try db.queryValues("UPDATE vaults SET next_seq=next_seq+1 WHERE id=? AND next_seq<9223372036854775807 RETURNING next_seq-1", bindings: [.blob(vaultID)])
-        guard rows.count == 1, case .integer(let sequence) = rows[0][0] else { throw ExternalCaptureError.sequenceExhausted }
-        var fields: [String: Any] = ["sequence": String(sequence), "entryId": uuidString(entryID), "operationId": NSNull(), "type": type, "revision": uuidString(revision), "path": path, "kind": kind, "contentHash": hash as Any? ?? NSNull(), "size": length.map(String.init) as Any? ?? NSNull()]
-        if let fromPath { fields["fromPath"] = fromPath }
-        let data = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
-        guard let json = String(data: data, encoding: .utf8) else { throw ExternalCaptureError.corruptCatalog }
-        try db.executeValues("INSERT INTO changes(vault_id,seq,entry_id,revision_id,type,payload_json) VALUES(?,?,?,?,?,?)", bindings: [.blob(vaultID), .integer(sequence), .blob(entryID), .blob(revision), .text(type), .text(json)])
-        return sequence
     }
 
     static func identifier() -> Data {
         var value = UUID().uuid
         return withUnsafeBytes(of: &value) { Data($0) }
-    }
-    private static func uuidString(_ bytes: Data) -> String {
-        let hex = bytes.map { String(format: "%02x", $0) }.joined()
-        var index = hex.startIndex
-        return [8, 4, 4, 4, 12].map { length in
-            let end = hex.index(index, offsetBy: length)
-            defer { index = end }
-            return String(hex[index..<end])
-        }.joined(separator: "-")
     }
 }

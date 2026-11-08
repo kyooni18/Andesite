@@ -88,15 +88,9 @@ Usage: andesite-server <command> --vault /absolute/vault --state /absolute/priva
   snapshot-inspect <snapshot-id>
   snapshot-compare <before-id> <after-id>
   snapshot-export <snapshot-id> /absolute/new-file-outside-vault-and-state
-  snapshot-restore <snapshot-id> --in-place
-  document-edit <document-id> <expected-revision-id> --stdin
-                                   (journal-backed edit of an existing Markdown note only)
-  mutation-journal    (all operations, including conflicts and recovery outcomes)
-  mutation-inspect <operation-id>
-  mutation-resolve <operation-id> --strategy <accept-current|preserve-current|complete-published|cancel-unpublished>
-  mutation-export <operation-id> <intended|preimage|current|artifact|path-occupant|retirement|sha256:HASH> /absolute/new-file
-  mutation-artifacts
-  mutation-cleanup --dry-run | --retire  (stop external editors before --retire)
+  read <path> | history <path> | mkdir <path> | mvdir <path> <new-path>
+  write <path> [<revision>]  (create, or update when a revision is given; content on stdin)
+  move <path> <new-path> <revision> | delete <path> <revision> | restore <path> <revision>
   snapshot-storage
   snapshot-config <minimum-interval-seconds> <retention-seconds>
 Directories must already exist; state must be mode 0700.
@@ -211,10 +205,10 @@ do {
     } else {
     let counts: [String: ClosedRange<Int>] = ["init": 0...0, "reconcile": 0...0, "status": 0...0, "search": 1...1, "watch": 0...0,
         "snapshots": 0...1, "snapshot-inspect": 1...1, "snapshot-compare": 2...2, "snapshot-export": 2...2,
-        "snapshot-restore": 2...2, "document-edit": 3...3,
-        "snapshot-storage": 0...0, "mutation-journal": 0...0, "snapshot-config": 2...2, "mutation-inspect": 1...1, "mutation-resolve": 3...3, "mutation-export": 3...3, "mutation-artifacts": 0...0, "mutation-cleanup": 1...1]
+        "read": 1...1, "history": 1...1, "mkdir": 1...1, "mvdir": 2...2, "write": 1...2,
+        "move": 3...3, "delete": 2...2, "restore": 2...2,
+        "snapshot-storage": 0...0, "snapshot-config": 2...2]
     guard args.count >= 5, let count = counts[args[0]], count.contains(args.count - 5), args[1] == "--vault", args[3] == "--state" else { throw CLIError.usage }
-    if args[0] == "snapshot-restore", args[6] != "--in-place" { throw CLIError.usage }
     let runtime = try VaultRuntime(configuration: VaultConfiguration(vaultDirectory: args[2], stateDirectory: args[4]))
     do {
         switch args[0] {
@@ -258,53 +252,32 @@ do {
         case "snapshot-export":
             try runtime.exportSnapshot(identifier(args[5]), to: args[6])
             print("Exported verified bytes without overwriting: \(args[6])")
-        case "snapshot-restore":
-            let op = try runtime.restoreSnapshot(identifier(args[5]))
-            print("Restored document=\(hex(op.entryID)) path=\(op.path) snapshot=\(hex(op.snapshotID)) preimage=\(hex(op.preimageID)) revision=\(hex(op.revisionID)) operation=\(hex(op.id)) state=\(op.state)")
-        case "document-edit":
-            guard args[7] == "--stdin" else { throw CLIError.usage }
-            // Bound stdin before any journal writes. An oversized request
-            // cannot force the owner to buffer arbitrarily large input.
-            let input = try FileHandle.standardInput.read(upToCount: 256 * 1024 + 1) ?? Data()
-            guard input.count <= 256 * 1024 else { throw CLIError.usage }
-            let op = try runtime.editDocument(identifier(args[5]),
-                                              expectedRevision: identifier(args[6]),
-                                              contents: input)
-            print("Edited document=\(hex(op.entryID)) revision=\(hex(op.revisionID)) preimage=\(hex(op.preimageID)) operation=\(hex(op.id)) state=\(op.state)")
-        case "mutation-inspect":
-            let inspection = try runtime.inspectMutation(identifier(args[5]))
-            let op = inspection.operation
-            print("operation=\(hex(op.id)) state=\(op.state) document=\(hex(op.entryID)) path=\(op.path) snapshot=\(hex(op.snapshotID)) preimage=\(hex(op.preimageID)) revision=\(hex(op.revisionID)) strategy=\(inspection.strategy ?? "none") outcome=\(inspection.outcome ?? "none")")
-            print("parentRevision=\(hex(inspection.parentRevision)) expectedOriginal=\(inspection.expectedOriginal) expectedStage=\(inspection.expectedStage.map { String(describing: $0) } ?? "none") previousDecisions=\(inspection.previousDecisions)")
-            for event in inspection.audit { print("decision=\(event)") }
-            for version in inspection.versions {
-                print("version=\(version.role) path=\(version.path) hash=\(version.hash) bytes=\(version.bytes) identity=\(version.fingerprint.map { String(describing: $0) } ?? "immutable")")
+        case "read":
+            FileHandle.standardOutput.write(try runtime.read(args[5]).content)
+        case "write":
+            // Bound stdin before anything is stored.
+            let input = try FileHandle.standardInput.read(upToCount: 16 * 1024 * 1024 + 1) ?? Data()
+            let document = args.count == 7 ?
+                try runtime.update(args[5], input, revision: identifier(args[6])) :
+                try runtime.create(args[5], input)
+            print("document=\(hex(document.id)) revision=\(hex(document.revisionID)) path=\(document.path)")
+        case "move":
+            let document = try runtime.move(args[5], to: args[6], revision: identifier(args[7]))
+            print("document=\(hex(document.id)) revision=\(hex(document.revisionID)) path=\(document.path)")
+        case "delete":
+            try runtime.delete(args[5], revision: identifier(args[6]))
+            print("deleted=\(args[5])")
+        case "restore":
+            let document = try runtime.restore(args[5], revision: identifier(args[6]))
+            print("document=\(hex(document.id)) revision=\(hex(document.revisionID)) path=\(document.path)")
+        case "history":
+            for r in try runtime.history(args[5]) {
+                print("revision=\(hex(r.id)) document=\(hex(r.document)) parents=\(r.parents.map(hex).joined(separator: ",")) path=\(r.path) deleted=\(r.deleted) hash=\(r.hash ?? "-") origin=\(r.origin) created=\(r.created)")
             }
-            for diagnostic in inspection.diagnostics { print("diagnostic=\(diagnostic)") }
-            print("choices=\(inspection.choices.joined(separator: ",")) export=mutation-export")
-        case "mutation-resolve":
-            guard args[6] == "--strategy" else { throw CLIError.usage }
-            let op = try runtime.resolveMutation(identifier(args[5]), strategy: args[7])
-            print("operation=\(hex(op.id)) state=\(op.state) outcome=\(op.diagnostic)")
-        case "mutation-export":
-            try runtime.exportMutationVersion(identifier(args[5]), role: args[6], to: args[7])
-            print("Exported verified version without overwriting: \(args[7])")
-        case "mutation-artifacts", "mutation-cleanup":
-            let artifacts: [MutationArtifact]
-            if args[0] == "mutation-cleanup" {
-                guard ["--dry-run", "--retire"].contains(args[5]) else { throw CLIError.usage }
-                artifacts = try runtime.cleanupMutationArtifacts(dryRun: args[5] == "--dry-run")
-            } else { artifacts = try runtime.mutationArtifacts() }
-            for a in artifacts { print("operation=\(hex(a.operationID)) path=\(a.path) status=\(a.status) logicalBytes=\(a.status == "uncertain" ? "unknown" : String(a.logicalBytes)) allocatedBytes=\(a.status == "uncertain" ? "unknown" : String(a.allocatedBytes)) eligible=\(a.eligible) diagnostic=\(a.diagnostic)") }
-            print("artifactAllocatedBytes=\(artifacts.reduce(0) { $0 + $1.allocatedBytes }) retirementEligibleAllocatedBytes=\(artifacts.filter(\.eligible).reduce(0) { $0 + $1.allocatedBytes }) retainedAllocatedBytes=\(artifacts.filter { !$0.eligible }.reduce(0) { $0 + $1.allocatedBytes }) uncertain=\(artifacts.filter { $0.status == "uncertain" }.count)")
-        case "mutation-journal":
-            let operations = try runtime.mutationOperations()
-            for op in operations {
-                print("operation=\(hex(op.id)) document=\(hex(op.entryID)) path=\(op.path) snapshot=\(hex(op.snapshotID)) preimage=\(hex(op.preimageID)) revision=\(hex(op.revisionID)) state=\(op.state) artifact=\(op.artifact) diagnostic=\(op.diagnostic)")
-            }
-            print("operations=\(operations.count) unfinished=\(operations.filter { !["completed", "cancelled"].contains($0.state) }.count)")
-            let maintenance = try runtime.status()
-            print("vaultState=\(maintenance.state) maintenanceUnfinished=\(maintenance.unfinishedMutations)")
+        case "mkdir":
+            try runtime.createDirectory(args[5])
+        case "mvdir":
+            try runtime.moveDirectory(args[5], to: args[6])
         case "snapshot-config":
             guard let interval = Double(args[5]), let retention = Double(args[6]) else { throw CLIError.invalidPolicy }
             try runtime.configureSnapshots(SnapshotPolicy(minimumInterval: interval, retentionSeconds: retention))
@@ -312,9 +285,9 @@ do {
         case "snapshot-storage":
             let storage = try runtime.snapshotStorage()
             print("minimumIntervalSeconds=\(storage.policy.minimumInterval) retentionSeconds=\(storage.policy.retentionSeconds) snapshots=\(storage.snapshots) expirationEligible=\(storage.expirationEligible) pendingDocuments=\(storage.pendingDocuments) logicalBytes=\(storage.logicalBytes) uniqueSnapshotBytes=\(storage.uniqueSnapshotBytes) registeredObjectBytes=\(storage.registeredObjectBytes) automaticPruning=false")
-            print("immutableObjectLogicalBytes=\(storage.immutableObjectLogicalBytes) physicalObjectAllocatedBytes=\(storage.physicalObjectAllocatedBytes) temporaryObjectAllocatedBytes=\(storage.temporaryObjectAllocatedBytes) journalArtifactAllocatedBytes=\(storage.artifactAllocatedBytes) retirementEligibleAllocatedBytes=\(storage.retirementEligibleAllocatedBytes) unresolvedArtifactAllocatedBytes=\(storage.unresolvedArtifactAllocatedBytes) uncertainArtifacts=\(storage.uncertainArtifacts) artifactAccountingComplete=\(storage.uncertainArtifacts == 0) physicalNumbersAreAllocatedBlockEstimates=true snapshotLogicalBytesAreNotAdditionalPhysicalUsage=true")
+            print("immutableObjectLogicalBytes=\(storage.immutableObjectLogicalBytes) physicalObjectAllocatedBytes=\(storage.physicalObjectAllocatedBytes) temporaryObjectAllocatedBytes=\(storage.temporaryObjectAllocatedBytes) physicalNumbersAreAllocatedBlockEstimates=true snapshotLogicalBytesAreNotAdditionalPhysicalUsage=true")
             for object in storage.objects {
-                print("\(object.contentHash) bytes=\(object.byteLength) snapshots=\(object.snapshots) revisions=\(object.revisions) incidents=\(object.incidents) mutationVersions=\(object.mutationVersions)")
+                print("\(object.contentHash) bytes=\(object.byteLength) snapshots=\(object.snapshots) revisions=\(object.revisions) incidents=\(object.incidents)")
             }
         default:
             let status = try runtime.status()

@@ -80,13 +80,13 @@ import Testing
     try FileManager.default.createSymbolicLink(at: metadata, withDestinationURL: outside)
     #expect(throws: VaultPathRegistryError.unsafeRegistry) { try registry.register() }
     let unsafeReader = try VaultReader(rootPath: f.vault.path)
-    #expect(throws: VaultReadError.unsafeFile) { try unsafeReader.markdownFiles() }
+    #expect(try unsafeReader.markdownFiles().isEmpty) // hidden entries are never followed
     try FileManager.default.removeItem(at: metadata)
 
     try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: false,
                                              attributes: [.posixPermissions: 0o755])
     #expect(throws: VaultPathRegistryError.unsafeRegistry) { try registry.register() }
-    #expect(throws: VaultReadError.unsafeFile) { try unsafeReader.markdownFiles() }
+    #expect(try unsafeReader.markdownFiles().isEmpty) // hidden entries are never followed
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: metadata.path)
 
     let marker = metadata.appendingPathComponent("vault.json")
@@ -112,13 +112,14 @@ import Testing
     }
 }
 
-@Test func nestedMetadataDirectoryRemainsUnsafeToScan() throws {
+@Test func hiddenDirectoriesAreNeverIndexed() throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     let nested = f.vault.appendingPathComponent("nested")
     try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: false)
     try FileManager.default.createDirectory(at: nested.appendingPathComponent(".andesite"),
                                              withIntermediateDirectories: false,
                                              attributes: [.posixPermissions: 0o700])
+    try Data("# hidden".utf8).write(to: nested.appendingPathComponent(".andesite/secret.md"))
     let reader = try VaultReader(rootPath: f.vault.path)
-    #expect(throws: VaultReadError.invalidPath) { try reader.markdownFiles() }
+    #expect(try reader.markdownFiles().isEmpty)
 }

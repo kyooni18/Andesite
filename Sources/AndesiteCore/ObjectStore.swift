@@ -76,7 +76,7 @@ public final class ObjectStore {
         return hash
     }
 
-    private func durabilityBarrier(_ fd: Int32) throws {
+    func durabilityBarrier(_ fd: Int32) throws {
         #if canImport(Darwin)
         guard fcntl(fd, F_FULLFSYNC) == 0 else { throw ObjectStoreError.systemCall("full sync object", errno) }
         #else
@@ -110,10 +110,84 @@ public final class ObjectStore {
         return (immutable.values.reduce(0) { $0 + $1.0 }, immutable.values.reduce(0) { $0 + $1.1 }, temporary.filter { immutable[$0.key] == nil }.values.reduce(0, +))
     }
 
-    public func get(_ hash: String, maximumBytes: Int) throws -> Data {
-        guard hash.utf8.count == 64 && hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
-            throw ObjectStoreError.invalidHash
+    public func contains(_ hash: String) -> Bool {
+        var info = stat()
+        return Self.validHash(hash) && fstatat(root, hash, &info, AT_SYMLINK_NOFOLLOW) == 0 &&
+            info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
+    }
+
+    /// Stores the remaining bytes of an open file without buffering it in
+    /// memory. Returns the SHA-256 hash and byte count of what was copied.
+    @discardableResult
+    func put(from source: Int32, maximumBytes: Int) throws -> (hash: String, size: Int64) {
+        let temp = ".object-" + UUID().uuidString.lowercased()
+        let fd = openat(root, temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        guard fd >= 0 else { throw ObjectStoreError.systemCall("create temporary object", errno) }
+        defer { close(fd); _ = unlinkat(root, temp, 0) }
+        var hasher = SHA256()
+        var size: Int64 = 0
+        try Self.copy(from: source, to: fd) { chunk in
+            size += Int64(chunk.count)
+            guard size <= Int64(maximumBytes) else { throw ObjectStoreError.tooLarge }
+            hasher.update(bufferPointer: chunk)
         }
+        let hash = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        try durabilityBarrier(fd)
+        if linkat(root, temp, root, hash, 0) != 0 {
+            guard errno == EEXIST else { throw ObjectStoreError.systemCall("publish object", errno) }
+            var existing = stat()
+            guard fstatat(root, hash, &existing, AT_SYMLINK_NOFOLLOW) == 0, Int64(existing.st_size) == size else {
+                throw ObjectStoreError.corruptObject
+            }
+        }
+        guard fsync(root) == 0 else { throw ObjectStoreError.systemCall("sync object directory", errno) }
+        return (hash, size)
+    }
+
+    /// Streams a verified object into an open file. A damaged object is
+    /// detected before the caller can publish the destination.
+    func export(_ hash: String, to destination: Int32) throws {
+        guard Self.validHash(hash) else { throw ObjectStoreError.invalidHash }
+        let fd = openat(root, hash, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw ObjectStoreError.systemCall("open object", errno) }
+        defer { close(fd) }
+        var hasher = SHA256()
+        try Self.copy(from: fd, to: destination) { hasher.update(bufferPointer: $0) }
+        guard hasher.finalize().map({ String(format: "%02x", $0) }).joined() == hash else {
+            throw ObjectStoreError.corruptObject
+        }
+    }
+
+    /// Copies in 1 MiB chunks, handing each chunk to `inspect` before writing.
+    static func copy(from source: Int32, to destination: Int32,
+                     inspect: (UnsafeRawBufferPointer) throws -> Void) throws {
+        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: 1 << 20, alignment: 16)
+        defer { buffer.deallocate() }
+        while true {
+            let n = read(source, buffer.baseAddress, buffer.count)
+            if n < 0 {
+                if errno == EINTR { continue }
+                throw ObjectStoreError.systemCall("read", errno)
+            }
+            if n == 0 { return }
+            let chunk = UnsafeRawBufferPointer(rebasing: buffer[0..<n])
+            try inspect(chunk)
+            var offset = 0
+            while offset < n {
+                let w = write(destination, chunk.baseAddress!.advanced(by: offset), n - offset)
+                if w < 0 && errno == EINTR { continue }
+                guard w > 0 else { throw ObjectStoreError.systemCall("write", errno) }
+                offset += w
+            }
+        }
+    }
+
+    static func validHash(_ hash: String) -> Bool {
+        hash.utf8.count == 64 && hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) })
+    }
+
+    public func get(_ hash: String, maximumBytes: Int) throws -> Data {
+        guard Self.validHash(hash) else { throw ObjectStoreError.invalidHash }
         guard maximumBytes >= 0 else { throw ObjectStoreError.tooLarge }
         let fd = openat(root, hash, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard fd >= 0 else { throw ObjectStoreError.systemCall("open object", errno) }
@@ -137,3 +211,4 @@ public final class ObjectStore {
         return bytes
     }
 }
+

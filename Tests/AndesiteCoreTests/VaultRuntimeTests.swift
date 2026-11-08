@@ -114,8 +114,9 @@ struct RuntimeFixture {
     #expect(try runtime.status().revisions == 3)
     #endif
     try FileManager.default.moveItem(at: f.vault.appendingPathComponent("moved.md"), to: f.vault.appendingPathComponent("a.md"))
+    // Symlinks are never followed or indexed; the scan itself proceeds.
     try FileManager.default.createSymbolicLink(atPath: f.vault.appendingPathComponent("link.md").path, withDestinationPath: f.vault.appendingPathComponent("a.md").path)
-    #expect(throws: VaultReadError.unsafeFile) { try runtime.search("history") }
+    #expect(try runtime.search("history").map(\.path) == ["a.md"])
     try FileManager.default.removeItem(at: f.vault.appendingPathComponent("link.md"))
     try FileManager.default.createDirectory(at: f.vault.appendingPathComponent("Upper"), withIntermediateDirectories: false)
     try f.write("Upper/one.md", "one")
@@ -170,7 +171,9 @@ struct RuntimeFixture {
     #expect(try db.queryValues("SELECT next_seq FROM vaults") == [[.integer(5)]])
     // An incomplete enumeration rejects the whole attempt; it never publishes deletion.
     try FileManager.default.removeItem(at: f.vault.appendingPathComponent("z.md"))
-    try FileManager.default.createSymbolicLink(atPath: f.vault.appendingPathComponent("unsafe.md").path, withDestinationPath: f.vault.appendingPathComponent("a.md").path)
+    let locked = f.vault.appendingPathComponent("locked")
+    try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: false, attributes: [.posixPermissions: 0])
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path) }
     #expect(throws: VaultReadError.unsafeFile) { try restarted.reconcile() }
     #expect(try db.queryValues("SELECT count(*) FROM entries WHERE state='live'") == [[.integer(3)]])
     #expect(try db.queryValues("SELECT count(*) FROM changes") == [[.integer(4)]])

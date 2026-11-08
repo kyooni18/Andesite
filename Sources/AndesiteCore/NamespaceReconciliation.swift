@@ -18,7 +18,7 @@ struct NamespacePlan {
     let deleted: Set<Int>
 
     init(db: SQLiteConnection, vaultID: Data, scan: [ScannedMarkdownFile]) throws {
-        let old = try db.queryValues("SELECT id,path,fs_hint FROM entries WHERE vault_id=? AND state='live' ORDER BY id", bindings: [.blob(vaultID)]).map { row -> CatalogFile in
+        let old = try db.queryValues("SELECT id,path,fs_hint FROM entries WHERE vault_id=? AND state='live' AND kind='markdown' ORDER BY id", bindings: [.blob(vaultID)]).map { row -> CatalogFile in
             guard case .blob(let id) = row[0], case .text(let name) = row[1] else { throw VaultRuntimeError.inconsistentCatalog }
             let fingerprint: FileFingerprint?
             if case .blob(let hint) = row[2] { fingerprint = try JSONDecoder().decode(FileFingerprint.self, from: hint) }

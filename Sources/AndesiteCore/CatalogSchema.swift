@@ -3,13 +3,16 @@ import Foundation
 public enum CatalogMigrationError: Error, Equatable {
     case unsupportedVersion(Int)
     case invalidVersion
+    /// A catalog from an older release has unfinished restore/edit journal
+    /// operations. Finish them with that release before upgrading.
+    case unfinishedLegacyMutations
 }
 
 /// Initial catalog subset. Migrations do not touch vault files. A catalog is not
 /// safe to use as a sync service until general operations/recovery and the
 /// remaining protocol tables are implemented (the local restore journal is v6). Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 10
+    public static let currentVersion = 11
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -211,6 +214,32 @@ public enum CatalogSchema {
                     ) WITHOUT ROWID
                     """)
                 try db.execute("PRAGMA user_version=10")
+            }
+            if version < 11 {
+                // One uniform, transient mutation journal replaces the
+                // restore/edit journal with its decision and retirement tables.
+                let legacy = try db.queryValues("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mutation_journal'")
+                if !legacy.isEmpty {
+                    let unfinished = try db.queryValues("""
+                        SELECT 1 FROM mutation_journal WHERE state NOT IN ('completed','cancelled')
+                        UNION ALL SELECT 1 FROM mutation_retirements WHERE state='pending' LIMIT 1
+                        """)
+                    guard unfinished.isEmpty else { throw CatalogMigrationError.unfinishedLegacyMutations }
+                }
+                for table in ["mutation_decision_history", "mutation_versions", "mutation_retirements",
+                              "mutation_decisions", "mutation_journal"] {
+                    try db.execute("DROP TABLE IF EXISTS \(table)")
+                }
+                try db.execute("""
+                    CREATE TABLE IF NOT EXISTS mutations (
+                      id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=16),
+                      state TEXT NOT NULL CHECK(state IN ('intent','committed')),
+                      plan TEXT NOT NULL,
+                      created_at REAL NOT NULL
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("CREATE INDEX IF NOT EXISTS changes_revision ON changes(vault_id,revision_id)")
+                try db.execute("PRAGMA user_version=11")
             }
         }
     }

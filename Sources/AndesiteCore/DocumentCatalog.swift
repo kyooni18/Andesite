@@ -15,6 +15,7 @@ public struct IndexedDocument: Equatable, Sendable {
     public let title: String
     public let hash: String
     public let byteLength: Int
+    public let kind: String
 }
 
 public struct DocumentPage: Sendable {
@@ -46,7 +47,7 @@ public enum DocumentCatalog {
         """
 
     private static let fields = """
-        SELECT e.id,e.head_revision,e.path,m.title,r.content_hash,r.byte_length
+        SELECT e.id,e.head_revision,e.path,m.title,r.content_hash,r.byte_length,e.kind
         """
 
     private static func availableCount(db: SQLiteConnection, vaultID: Data) throws -> Int {
@@ -66,7 +67,7 @@ public enum DocumentCatalog {
     }
 
     private static func decode(_ row: [SQLiteValue]) throws -> IndexedDocument {
-        guard row.count == 6,
+        guard row.count == 7, case .text(let kind) = row[6],
               case .blob(let id) = row[0], id.count == 16,
               case .blob(let revision) = row[1], revision.count == 16,
               case .text(let path) = row[2],
@@ -78,7 +79,7 @@ public enum DocumentCatalog {
         return IndexedDocument(
             id: id, revisionID: revision, path: path, title: title,
             hash: digest.map { String(format: "%02x", $0) }.joined(),
-            byteLength: Int(bytes))
+            byteLength: Int(bytes), kind: kind)
     }
 
     public static func list(db: SQLiteConnection, vaultID: Data,

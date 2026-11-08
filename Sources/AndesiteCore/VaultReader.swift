@@ -83,7 +83,7 @@ public struct ObservedFile: Sendable {
 /// executor, never an NIO event loop. This is a building block, not a watcher,
 /// catalog publication, durable capture, or proof that an editor has finished.
 public final class VaultReader {
-    private let root: Int32
+    let root: Int32
     private let rootDevice: UInt64
     private let rootInode: UInt64
     private let rootPath: String
@@ -102,7 +102,7 @@ public final class VaultReader {
     }
     deinit { close(root) }
 
-    private func verifyRoot() throws {
+    func verifyRoot() throws {
         var info = stat()
         guard lstat(rootPath, &info) == 0, info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
               UInt64(info.st_dev) == rootDevice, UInt64(info.st_ino) == rootInode else { throw VaultReadError.unstable }
@@ -113,11 +113,10 @@ public final class VaultReader {
         try markdownFiles().map(\.path)
     }
 
+    /// Hidden names (".obsidian", ".git", ".trash", ".andesite", journal
+    /// artifacts, editor swap files) are skipped like Obsidian skips them:
+    /// they are neither indexed nor followed.
     public func markdownFiles() throws -> [ScannedMarkdownFile] {
-        try markdownFiles(artifacts: [:])
-    }
-
-    func markdownFiles(artifacts: [String: FileFingerprint]) throws -> [ScannedMarkdownFile] {
         try verifyRoot()
         var paths: [ScannedMarkdownFile] = []
         var namespace = Set<String>()
@@ -136,44 +135,11 @@ public final class VaultReader {
                     $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(validatingCString: $0) }
                 }
                 guard let name else { throw VaultReadError.invalidPath }
-                if name == "." || name == ".." { continue }
+                if name.hasPrefix(".") { continue }
                 let path = try VaultPath(prefix + name)
                 var info = stat()
                 guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw VaultReadError.unstable }
-                if let expected = artifacts[prefix + name] {
-                    guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), info.st_nlink == 1,
-                          FileFingerprint(info).sameInode(as: expected) else { throw VaultReadError.unsafeFile }
-                    continue
-                }
-                // The Vault's own private path-only configuration lives in
-                // <root>/.andesite. Verify the exact reserved directory,
-                // never follow it, and never traverse or index its contents.
-                // Any nested, misspelled, linked or unsafe .andesite name
-                // retains the existing fail-closed behavior.
-                if prefix.isEmpty &&
-                   (name == ".andesite" || name == ".obsidian" ||
-                    name == ".trash" || name == ".git") {
-                    // Obsidian keeps settings/plugins in .obsidian and can
-                    // move deleted notes to .trash. .git is repository
-                    // metadata. Never index any as live Vault notes;
-                    // skip only these exact root directories.
-                    // .andesite is our own private metadata and stays 0700;
-                    // Existing Obsidian and Git folders may be mode 0755.
-                    guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
-                          info.st_uid == geteuid(),
-                          (name != ".andesite" || info.st_mode & 0o077 == 0),
-                          UInt64(info.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
-                    let ignored = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                    guard ignored >= 0 else { throw VaultReadError.unsafeFile }
-                    defer { close(ignored) }
-                    var opened = stat()
-                    guard fstat(ignored, &opened) == 0,
-                          opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else {
-                        throw VaultReadError.unstable
-                    }
-                    continue
-                }
-                guard !name.lowercased().hasPrefix(".andesite"), namespace.insert(path.portabilityKey).inserted else { throw VaultReadError.invalidPath }
+                guard namespace.insert(path.portabilityKey).inserted else { throw VaultReadError.invalidPath }
                 guard UInt64(info.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
                 switch info.st_mode & mode_t(S_IFMT) {
                 case mode_t(S_IFDIR):
@@ -183,10 +149,12 @@ public final class VaultReader {
                     var opened = stat()
                     guard fstat(child, &opened) == 0, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else { throw VaultReadError.unstable }
                     try visit(child, prefix + name + "/")
-                case mode_t(S_IFREG):
-                    guard info.st_nlink == 1 else { throw VaultReadError.unsafeFile }
+                case mode_t(S_IFREG) where info.st_nlink == 1:
                     if name.lowercased().hasSuffix(".md") { paths.append(ScannedMarkdownFile(path: path, fingerprint: FileFingerprint(info))) }
-                default: throw VaultReadError.unsafeFile
+                default:
+                    // Symlinks, hard-linked files and special files are never
+                    // followed or indexed; Andesite cannot replace them safely.
+                    continue
                 }
             }
         }

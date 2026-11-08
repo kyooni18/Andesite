@@ -1,7 +1,10 @@
 #ifndef ANDESITE_FS_H
 #define ANDESITE_FS_H
 int andesite_supported_filesystem(int directory);
-int andesite_exchange(int directory, const char *stage, const char *target);
+/* Atomically swap two names (RENAME_SWAP / RENAME_EXCHANGE). */
+int andesite_exchange(int directory_a, const char *a, int directory_b, const char *b);
+/* Atomic rename that fails with EEXIST instead of replacing the target. */
+int andesite_rename_noreplace(int from_directory, const char *from, int to_directory, const char *to);
 int andesite_copy_metadata(int source, int destination);
 
 #ifdef __APPLE__

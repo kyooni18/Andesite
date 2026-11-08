@@ -77,11 +77,12 @@ private extension RuntimeFixture {
     _ = try runtime.reconcile(at: start.addingTimeInterval(1))
     try f.remove("gone.md")
     // An incomplete scan is never confirmation of absence.
-    try FileManager.default.createSymbolicLink(atPath: f.vault.appendingPathComponent("unsafe.md").path, withDestinationPath: "missing")
+    let locked = f.vault.appendingPathComponent("locked")
+    try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: false, attributes: [.posixPermissions: 0])
     #expect(throws: VaultReadError.unsafeFile) { try runtime.reconcile() }
     let db = try f.database()
     #expect(try db.scalarText("SELECT count(*) FROM entries WHERE state='live'") == "1")
-    try f.remove("unsafe.md")
+    #expect(rmdir(locked.path) == 0)
     // Snapshot registration and tombstone publication must roll back together.
     try db.execute("CREATE TRIGGER snapshot_fault BEFORE INSERT ON recovery_snapshots BEGIN SELECT RAISE(ABORT,'snapshot fault'); END")
     #expect(throws: SQLiteFailure.self) { try runtime.reconcile(at: start.addingTimeInterval(2)) }
@@ -296,11 +297,7 @@ private extension RuntimeFixture {
     let targetLink = f.root.appendingPathComponent("target.md")
     try FileManager.default.createSymbolicLink(at: targetLink, withDestinationURL: f.vault.appendingPathComponent("a.md"))
     #expect(throws: SnapshotError.unsafeExport) { try runtime.exportSnapshot(first.id, to: targetLink.path) }
-    #if canImport(Darwin)
-    #expect(try runtime.restoreSnapshot(first.id).state == "completed")
-    #else
-    #expect(throws: MutationError.self) { try runtime.restoreSnapshot(first.id) }
-    #endif
+    #expect(try runtime.restore("a.md", revision: first.revisionID).hash == first.contentHash)
     #expect(try Data(contentsOf: f.vault.appendingPathComponent("a.md")) == bytes)
     // Byte-wise comparison must distinguish canonically equivalent UTF-8.
     try f.write("a.md", "# Cafe\u{301}\r\noriginal\r\n")
@@ -314,7 +311,9 @@ private extension RuntimeFixture {
     #expect(throws: ObjectStoreError.corruptObject) { try runtime.exportSnapshot(first.id, to: failedExport.path) }
     #expect(!FileManager.default.fileExists(atPath: failedExport.path))
     // Restore never repairs history from the current source or overwrites it.
-    #expect(throws: ObjectStoreError.corruptObject) { try runtime.restoreSnapshot(first.id) }
+    let head = try runtime.document("a.md").revisionID
+    #expect(throws: ObjectStoreError.corruptObject) { try runtime.restore("a.md", revision: first.revisionID) }
+    #expect(try runtime.document("a.md").revisionID == head)
     #expect(try Data(contentsOf: output) == bytes)
 }
 
@@ -339,11 +338,8 @@ private extension RuntimeFixture {
         try db.execute("DROP TABLE " + table)
     }
     // These test-only drops remove empty new tables, never operational history.
-    try db.execute("DROP TABLE mutation_decision_history")
-    try db.execute("DROP TABLE mutation_versions")
-    try db.execute("DROP TABLE mutation_retirements")
-    try db.execute("DROP TABLE mutation_decisions")
-    try db.execute("DROP TABLE mutation_journal")
+    try db.execute("DROP TABLE mutations")
+    try db.execute("DROP INDEX changes_revision")
     try db.execute("DROP TABLE recovery_snapshots")
     try db.execute("DROP TABLE snapshot_policy")
     try db.execute("PRAGMA user_version=4")
@@ -358,7 +354,7 @@ private extension RuntimeFixture {
     #expect(throws: ExternalCaptureError.invalidMarkdown) { try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: identity, path: path, maximumBytes: 1024, debounce: 0) }
     let upgraded = try VaultRuntime(configuration: f.configuration)
     #expect(upgraded.vaultID == identity)
-    #expect(try db.scalarText("PRAGMA user_version") == "10")
+    #expect(try db.scalarText("PRAGMA user_version") == String(CatalogSchema.currentVersion))
     #expect(try upgraded.status().revisions == 2 && upgraded.status().openIncidents == 1)
     let snapshot = try #require(upgraded.snapshots().first)
     #expect(snapshot.reason == "recovery" && snapshot.entryID == old.entryID)

@@ -63,7 +63,7 @@ public final class VaultLocalHTTP {
         guard let socket = stateDirectory.withCString({ andesite_local_http_open($0) }) else {
             throw VaultLocalHTTPError.cannotBind(errno)
         }
-        self.backend = AndesiteBackend(runtime: runtime)
+        self.backend = runtime
         self.server = socket
         self.socketPath = path
     }
@@ -446,16 +446,8 @@ public final class VaultLocalHTTP {
                 guard current.revisionID == expected else {
                     return .error(412, "revision_mismatch")
                 }
-                let operation = try backend.editDocument(documentID,
-                                                         expectedRevision: expected,
-                                                         contents: body)
-                return .json(200, [
-                    "operation": hex(operation.id), "document": hex(operation.entryID),
-                    "revision": hex(operation.revisionID),
-                    "preimage": hex(operation.preimageID),
-                    "state": operation.state,
-                    "indexReady": false
-                ])
+                let updated = try backend.update(current.path, body, revision: expected)
+                return .json(200, ["document": hex(updated.id), "revision": hex(updated.revisionID)])
             }
             if path == "/v1/sync/inbox/changes" {
                 guard Set(args.keys).isSubset(of: ["source", "epoch", "after", "limit"]),
@@ -729,12 +721,8 @@ public final class VaultLocalHTTP {
             return .error(503, "link_graph_inconsistent")
         } catch MarkdownAnalysisError.invalidUTF8 {
             return .error(422, "invalid_markdown_utf8")
-        } catch MutationError.conflict {
+        } catch VaultError.conflict {
             return .error(409, "edit_conflict_or_unsafe_target")
-        } catch MutationError.unfinished {
-            return .error(409, "unfinished_mutation")
-        } catch MutationError.unsupportedPlatform {
-            return .error(503, "unsupported_filesystem")
         } catch ObsidianIndexError.invalidQuery {
             return .error(400, "invalid_metadata_query")
         } catch ObsidianIndexError.inconsistentIndex {

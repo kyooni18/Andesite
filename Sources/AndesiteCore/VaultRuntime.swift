@@ -47,14 +47,14 @@ public struct VaultStatus: Sendable {
 /// Synchronous, deliberately non-Sendable owner. Use on one blocking executor;
 /// no database/reader/store escapes. shutdown closes the connection before lock release.
 public final class VaultRuntime {
-    private struct Resources {
+    struct Resources {
         let db: SQLiteConnection
         let reader: VaultReader
         let objects: ObjectStore
     }
-    private var resources: Resources?
+    private(set) var resources: Resources?
     private var processLock: ProcessLock?
-    private let configuration: VaultConfiguration
+    let configuration: VaultConfiguration
     public let vaultID: Data
 
     /// Derived, disposable in-memory data. Only the VaultRuntime owner
@@ -78,21 +78,26 @@ public final class VaultRuntime {
     /// Incremented for every successfully committed foreground mutation.
     /// The watcher observes this on its owner thread and enqueues a scan
     /// without depending solely on delivery timing of FSEvents.
-    public private(set) var foregroundMutationGeneration: UInt64 = 0
+    public internal(set) var foregroundMutationGeneration: UInt64 = 0
     /// Progress applies only to a pending low-priority generation.
     public var linkCacheProgress: (processedHeads: Int, totalHeads: Int, resolvedHeads: Int)? {
         guard let builder = linkBuilder else { return nil }
         return (builder.processedDocuments, builder.totalDocuments,
                 builder.resolvedDocuments)
     }
-    // Internal deterministic hooks for tests; never supplied by vault contents.
+    // Internal deterministic hook for tests; never supplied by vault contents.
     var mutationFault: ((String) throws -> Void)?
-    private func journal() throws -> MutationJournal {
+    func journal() throws -> Journal {
         guard let r = resources else { throw VaultRuntimeError.closed }
-        let journal = MutationJournal(db: r.db, objects: r.objects, vaultID: vaultID,
-            root: configuration.vaultDirectory, stateRoot: configuration.stateDirectory, maximumBytes: configuration.maximumBytes)
+        let journal = Journal(db: r.db, objects: r.objects, root: r.reader.root, vaultID: vaultID,
+                              maximumBytes: configuration.maximumBytes)
         if let mutationFault { journal.fault = mutationFault }
         return journal
+    }
+
+    func requireOpen() throws -> Resources {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        return r
     }
 
     public init(configuration: VaultConfiguration) throws {
@@ -169,11 +174,9 @@ public final class VaultRuntime {
             try RecoverySnapshots.configure(db: db, vaultID: id, policy: SnapshotPolicy())
         }
         _ = try RecoverySnapshots.policy(db: db, vaultID: id)
-        // Resolve source/catalog publication first. Then recover the separate
-        // capture -> snapshot-registration window without observing newer bytes.
+        // Settle interrupted mutations before anything observes the files.
         try journal().recover()
-        if try journal().hasUnfinished() { try setState("quarantined") }
-        else { _ = try flushSnapshotHeads(at: Date(), reason: "recovery") }
+        _ = try flushSnapshotHeads(at: Date(), reason: "recovery")
         let directory = open(state, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard directory >= 0 else { throw VaultRuntimeError.unsafeState }
         defer { close(directory) }
@@ -193,7 +196,7 @@ public final class VaultRuntime {
             resources = nil
             processLock = nil
         }
-        if try !journal().hasUnfinished() { _ = try flushSnapshots(at: date) }
+        _ = try flushSnapshots(at: date)
     }
 
     deinit { linkBuilder = nil; linkSnapshot = nil; resources = nil; processLock = nil }
@@ -205,8 +208,7 @@ public final class VaultRuntime {
     public func syncChanges(after: Int64, limit: Int = 8) throws
         -> AndesiteSyncChangeBatch {
         guard let r = resources else { throw VaultRuntimeError.closed }
-        try journal().assertResolved()
-        return try AndesiteSyncArchive.outgoingChanges(
+                return try AndesiteSyncArchive.outgoingChanges(
             db: r.db, objects: r.objects, vaultID: vaultID,
             after: after, limit: limit)
     }
@@ -293,7 +295,7 @@ public final class VaultRuntime {
         func count(_ table: String, _ suffix: String = "") throws -> Int {
             Int(try r.db.scalarText("SELECT count(*) FROM \(table) \(suffix)") ?? "") ?? 0
         }
-        return try VaultStatus(vaultID: vaultID, state: r.db.scalarText("SELECT state FROM vaults") ?? "unknown", entries: count("entries"), revisions: count("revisions"), openIncidents: count("incidents", "WHERE status='open'"), unfinishedMutations: count("mutation_journal", "WHERE state NOT IN ('completed','cancelled') OR id IN (SELECT operation_id FROM mutation_retirements WHERE state='pending')"))
+        return try VaultStatus(vaultID: vaultID, state: r.db.scalarText("SELECT state FROM vaults") ?? "unknown", entries: count("entries"), revisions: count("revisions"), openIncidents: count("incidents", "WHERE status='open'"), unfinishedMutations: count("mutations"))
     }
 
     /// Search refreshes canonical files first; failed/partial scans never expose
@@ -311,8 +313,7 @@ public final class VaultRuntime {
                               filter: ObsidianFilter? = nil) throws -> [SearchIndexHit] {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-        try journal().assertResolved()
-        return try SearchIndex.search(db: r.db, vaultID: vaultID,
+                return try SearchIndex.search(db: r.db, vaultID: vaultID,
                                       phrase: phrase, limit: limit, filter: filter)
     }
 
@@ -322,16 +323,14 @@ public final class VaultRuntime {
                           filter: ObsidianFilter? = nil) throws -> DocumentPage {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-        try journal().assertResolved()
-        return try DocumentCatalog.list(db: r.db, vaultID: vaultID,
+                return try DocumentCatalog.list(db: r.db, vaultID: vaultID,
                                         limit: limit, offset: offset, filter: filter)
     }
 
     public func inspectDocument(_ id: Data) throws -> IndexedDocument {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-        try journal().assertResolved()
-        return try DocumentCatalog.inspect(db: r.db, vaultID: vaultID, documentID: id)
+                return try DocumentCatalog.inspect(db: r.db, vaultID: vaultID, documentID: id)
     }
 
     public func documentContents(_ id: Data, maximumBytes: Int = 1024 * 1024) throws -> Data {
@@ -352,16 +351,14 @@ public final class VaultRuntime {
     public func tags(limit: Int = 50, offset: Int = 0) throws -> [String: Any] {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-        try journal().assertResolved()
-        return try ObsidianMetadataIndex.tags(db: r.db, vaultID: vaultID,
+                return try ObsidianMetadataIndex.tags(db: r.db, vaultID: vaultID,
                                                limit: limit, offset: offset)
     }
 
     public func properties(limit: Int = 50, offset: Int = 0) throws -> [String: Any] {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-        try journal().assertResolved()
-        return try ObsidianMetadataIndex.properties(db: r.db, vaultID: vaultID,
+                return try ObsidianMetadataIndex.properties(db: r.db, vaultID: vaultID,
                                                      limit: limit, offset: offset)
     }
 
@@ -374,8 +371,7 @@ public final class VaultRuntime {
                                  maxBytes: Int = 256 * 1024) throws -> LinkCacheReport? {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-        try journal().assertResolved()
-        do {
+                do {
             if linkBuilder == nil {
                 linkBuilder = try VaultLinkGraph.begin(
                     db: r.db, vaultID: vaultID, previous: linkSnapshot)
@@ -425,8 +421,7 @@ public final class VaultRuntime {
                       limit: Int = 50, offset: Int = 0) throws -> VaultLinkPage {
         guard resources != nil else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-        try journal().assertResolved()
-        guard linkCacheReady, let snapshot = linkSnapshot else {
+                guard linkCacheReady, let snapshot = linkSnapshot else {
             throw linkCacheError ?? .cacheNotReady
         }
         return try snapshot.query(documentID: documentID, direction: direction,
@@ -441,12 +436,11 @@ public final class VaultRuntime {
         linkBuilder = nil
         linkCacheError = nil
         try journal().recover()
-        try journal().assertResolved()
         try RecoverySnapshots.validateTime(date)
         try setState("scanning")
         do {
             try verifyObjects()
-            let scan = try r.reader.markdownFiles(artifacts: journal().scanArtifacts())
+            let scan = try r.reader.markdownFiles()
             let plan = try NamespacePlan(db: r.db, vaultID: vaultID, scan: scan)
             var report = ReconciliationReport()
             report.discovered = scan.count
@@ -479,7 +473,7 @@ public final class VaultRuntime {
             // Only a fully enumerated, unchanged namespace and a later secure
             // absence check may authorize tombstones. A failure above or here
             // leaves earlier captures intact but publishes no disappearances.
-            try NamespacePlan.validateUnchanged(scan, r.reader.markdownFiles(artifacts: journal().scanArtifacts()))
+            try NamespacePlan.validateUnchanged(scan, r.reader.markdownFiles())
             if quarantinedMove {
                 try setState("quarantined")
                 return report
@@ -612,87 +606,14 @@ public final class VaultRuntime {
         try SnapshotExport.publish(bytes, to: destination, excluding: [configuration.vaultDirectory, configuration.stateDirectory])
     }
 
-    /// Restores the snapshot to its stable document's CURRENT live path (which
-    /// may differ from its historical snapshot path). Does not recreate tombstones.
-    @discardableResult
-    public func restoreSnapshot(_ id: Data) throws -> MutationOperation {
-        _ = try inspectSnapshot(id)
-        let j = try journal()
-        // A journal-backed mutation is a foreground filesystem operation,
-        // not a cache job. Invalidate derived graph state before publication;
-        // a later successful scan will enqueue fresh low-priority work.
-        linkBuilder = nil
-        linkCacheReady = false
-        linkCacheError = nil
-        try j.recover()
-        let operation = try j.restore(id)
-        try setState("scanRequired")
-        foregroundMutationGeneration &+= 1
-        return operation
-    }
-
-    /// Explicit, version-conditioned in-place edit of an existing Markdown
-    /// document. Uses the same durable preimage + APFS exchange journal as
-    /// recovery, with the requested bytes separately pinned as an immutable
-    /// object. New files and deletions are not authorized by this operation.
-    @discardableResult
-    public func editDocument(_ id: Data, expectedRevision: Data,
-                             contents: Data) throws -> MutationOperation {
-        guard resources != nil else { throw VaultRuntimeError.closed }
-        linkBuilder = nil
-        linkCacheReady = false
-        linkCacheError = nil
-        let j = try journal()
-        try j.recover()
-        let operation = try j.edit(entryID: id, expectedRevision: expectedRevision,
-                                   bytes: contents)
-        try setState("scanRequired")
-        foregroundMutationGeneration &+= 1
-        return operation
-    }
-
-    public func mutationOperations() throws -> [MutationOperation] {
-        try journal().records().map(\.operation)
-    }
-
-    public func inspectMutation(_ id: Data) throws -> MutationInspection { try journal().inspect(id) }
-
-    @discardableResult
-    public func resolveMutation(_ id: Data, strategy: String) throws -> MutationOperation {
-        let j = try journal()
-        try j.recover()
-        let result = try j.resolve(id, strategy: strategy)
-        linkBuilder = nil
-        linkCacheReady = false
-        linkCacheError = nil
-        try setState(try journal().hasUnfinished() ? "quarantined" : "scanRequired")
-        foregroundMutationGeneration &+= 1
-        return result
-    }
-
-    public func exportMutationVersion(_ id: Data, role: String, to destination: String) throws {
-        try journal().exportVersion(id, role: role, to: destination)
-    }
-
-    public func mutationArtifacts() throws -> [MutationArtifact] { try journal().artifacts() }
-
-    @discardableResult
-    public func cleanupMutationArtifacts(dryRun: Bool = true) throws -> [MutationArtifact] {
-        try journal().cleanup(dryRun: dryRun)
-    }
-
     public func snapshotStorage(at date: Date = Date()) throws -> SnapshotStorageUsage {
         guard let r = resources else { throw VaultRuntimeError.closed }
         try verifyObjects()
         var usage = try RecoverySnapshots.usage(db: r.db, vaultID: vaultID, at: date)
-        let physical = try r.objects.storageUsage(), artifacts = try journal().artifacts()
+        let physical = try r.objects.storageUsage()
         usage.immutableObjectLogicalBytes = physical.logical
         usage.physicalObjectAllocatedBytes = physical.allocated
         usage.temporaryObjectAllocatedBytes = physical.temporary
-        usage.artifactAllocatedBytes = artifacts.reduce(0) { $0 + $1.allocatedBytes }
-        usage.retirementEligibleAllocatedBytes = artifacts.filter(\.eligible).reduce(0) { $0 + $1.allocatedBytes }
-        usage.unresolvedArtifactAllocatedBytes = artifacts.filter { !$0.eligible }.reduce(0) { $0 + $1.allocatedBytes }
-        usage.uncertainArtifacts = artifacts.filter { $0.status == "uncertain" }.count
         return usage
     }
 
@@ -707,8 +628,7 @@ public final class VaultRuntime {
         // Neither a failed scan nor a conflicting restore can silently publish
         // snapshots as though the currently observed filesystem were verified.
         guard try status().state == "ready" else { return 0 }
-        try journal().assertResolved()
-        return try r.db.transaction {
+                return try r.db.transaction {
             var created = 0
             for row in try r.db.queryValues("SELECT id FROM entries WHERE vault_id=? AND state='live' AND kind='markdown' ORDER BY id", bindings: [.blob(vaultID)]) {
                 guard case .blob(let id) = row[0] else { throw VaultRuntimeError.inconsistentCatalog }
