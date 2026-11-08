@@ -25,6 +25,10 @@ public struct VaultHTTPResponse {
         guard let bytes = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) else {
             return VaultHTTPResponse(status: 500, body: Data("{\"error\":\"serialization_failed\"}".utf8))
         }
+        guard bytes.count <= 1024 * 1024 else {
+            return VaultHTTPResponse(status: 413,
+                body: Data("{\"error\":\"response_too_large\"}".utf8))
+        }
         return VaultHTTPResponse(status: status, body: bytes)
     }
 
@@ -152,6 +156,53 @@ public final class VaultLocalHTTP {
         ]
     }
 
+    private func documentJSON(_ d: IndexedDocument) -> [String: Any] {
+        [
+            "document": hex(d.id), "revision": hex(d.revisionID), "path": d.path,
+            "title": d.title, "hash": d.hash, "bytes": d.byteLength
+        ]
+    }
+
+    private func preview(_ id: Data, of d: IndexedDocument) throws -> [String: Any] {
+        var detail: [String: Any] = [
+            "document": documentJSON(d),
+            "structureAvailable": false,
+            "source": "last_completed_reconciliation"
+        ]
+        let maximumStructureBytes = 256 * 1024
+        if d.byteLength > maximumStructureBytes {
+            detail["structureReason"] = "too_large_for_outline"
+            return detail
+        }
+        let bytes = try runtime.documentContents(id, maximumBytes: maximumStructureBytes)
+        let facts = try MarkdownAnalyzer.analyze(bytes)
+        let text = String(decoding: bytes, as: UTF8.self)
+        let wiki = ObsidianLinks.extract(text)
+        detail["structureTruncated"] = facts.headings.count > 256 ||
+            facts.linkDestinations.count > 256 || wiki.count > 256
+        detail["headings"] = facts.headings.prefix(256).map { heading -> [String: Any] in
+            [
+                "level": heading.level, "text": String(heading.text.prefix(512)),
+                "startLine": heading.startLine.map { $0 as Any } ?? NSNull(),
+                "endLine": heading.endLine.map { $0 as Any } ?? NSNull()
+            ]
+        }
+        // These are lexical references, NOT resolved Obsidian links.
+        detail["markdownLinks"] = facts.linkDestinations.prefix(256).map {
+            String($0.prefix(1024))
+        }
+        detail["wikilinks"] = wiki.prefix(256).map { link -> [String: Any] in
+            [
+                "target": String(link.target.prefix(1024)),
+                "fragment": link.fragment.map { String($0.prefix(512)) as Any } ?? NSNull(),
+                "alias": link.alias.map { String($0.prefix(512)) as Any } ?? NSNull(),
+                "embed": link.embed
+            ]
+        }
+        detail["structureAvailable"] = true
+        return detail
+    }
+
     private func queryParameters(_ raw: String) -> [String: String]? {
         if raw.isEmpty { return [:] }
         var parameters: [String: String] = [:]
@@ -245,9 +296,50 @@ public final class VaultLocalHTTP {
                 }
                 guard indexReady else { return .error(503, "rescan_pending") }
                 let found = try runtime.searchIndexed(phrase, limit: count).map {
-                    ["document": hex($0.entryID), "revision": hex($0.revisionID), "title": $0.title]
+                    ["document": hex($0.entryID), "revision": hex($0.revisionID),
+                     "title": $0.title, "path": $0.path]
                 }
                 return .json(200, ["hits": found, "source": "last_completed_reconciliation"])
+            }
+            if path == "/v1/documents" {
+                guard Set(args.keys).isSubset(of: ["limit", "offset"]),
+                      let count = limit(args["limit"]) else {
+                    return .error(400, "invalid_document_query")
+                }
+                let offset: Int
+                if let raw = args["offset"] {
+                    guard !raw.isEmpty, raw.utf8.count <= 6,
+                          raw.utf8.allSatisfy({ (48...57).contains($0) }),
+                          let parsed = Int(raw), parsed <= 100_000 else {
+                        return .error(400, "invalid_offset")
+                    }
+                    offset = parsed
+                } else { offset = 0 }
+                guard indexReady else { return .error(503, "rescan_pending") }
+                let page = try runtime.documents(limit: count, offset: offset)
+                return .json(200, [
+                    "documents": page.documents.map(documentJSON),
+                    "total": page.total, "offset": page.offset,
+                    "nextOffset": page.nextOffset.map { $0 as Any } ?? NSNull(),
+                    "source": "last_completed_reconciliation"
+                ])
+            }
+            let documentPath = path.split(separator: "/", omittingEmptySubsequences: false)
+            if documentPath.count >= 4 && documentPath.count <= 5 &&
+               documentPath[1] == "v1" && documentPath[2] == "documents" {
+                guard args.isEmpty, let document = id(String(documentPath[3])) else {
+                    return .error(400, "invalid_document")
+                }
+                guard indexReady else { return .error(503, "rescan_pending") }
+                if documentPath.count == 4 {
+                    return .json(200, try preview(document, of: runtime.inspectDocument(document)))
+                }
+                if documentPath.count == 5 && documentPath[4] == "content" {
+                    let content = try runtime.documentContents(document,
+                                                              maximumBytes: maximumResponse)
+                    return VaultHTTPResponse(status: 200, body: content,
+                                             contentType: "text/markdown; charset=utf-8")
+                }
             }
             if path == "/v1/snapshots" {
                 guard Set(args.keys).isSubset(of: ["path", "document", "limit", "offset"]),
@@ -301,6 +393,14 @@ public final class VaultLocalHTTP {
                                          contentType: "text/markdown; charset=utf-8")
             }
             return .error(404, "not_found")
+        } catch DocumentCatalogError.notFound {
+            return .error(404, "document_not_found")
+        } catch DocumentCatalogError.contentTooLarge {
+            return .error(413, "document_too_large_for_local_http")
+        } catch DocumentCatalogError.invalidIdentifier, DocumentCatalogError.invalidPage {
+            return .error(400, "invalid_document")
+        } catch DocumentCatalogError.inconsistentMetadata {
+            return .error(503, "document_catalog_inconsistent")
         } catch SnapshotError.notFound {
             return .error(404, "snapshot_not_found")
         } catch SearchIndexError.invalidQuery {

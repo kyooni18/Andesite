@@ -250,3 +250,62 @@ private final class WatchProcessFixture {
     #expect(unavailable.status == 503)
 }
 #endif
+
+#if os(macOS)
+@Test func documentHTTPExposesCurrentHeadsAndObsidianSyntaxWithoutSourceReads() throws {
+    let f = try RuntimeFixture(); defer { f.clean() }
+    let original = """
+    # Note title
+    [Regular](Notes/Linked.md)
+    [[Wiki page#Heading|Alias]]
+    ![[figure.png|320]]
+    """
+    try f.write("note.md", original)
+    let runtime = try VaultRuntime(configuration: f.configuration)
+    _ = try runtime.reconcile()
+    let api = try VaultLocalHTTP(runtime: runtime, stateDirectory: f.state.path)
+
+    let list = api.handle(request: httpRequest("/v1/documents?limit=1&offset=0"), indexReady: true)
+    #expect(list.status == 200)
+    let dictionary = try #require(JSONSerialization.jsonObject(with: list.body) as? [String: Any])
+    #expect(dictionary["total"] as? Int == 1)
+    let items = try #require(dictionary["documents"] as? [[String: Any]])
+    let identifier = try #require(items.first?["document"] as? String)
+    #expect(items.first?["path"] as? String == "note.md")
+
+    let detail = api.handle(request: httpRequest("/v1/documents/\(identifier)"), indexReady: true)
+    #expect(detail.status == 200)
+    let parsed = try #require(JSONSerialization.jsonObject(with: detail.body) as? [String: Any])
+    #expect(parsed["structureAvailable"] as? Bool == true)
+    let heading = try #require(parsed["headings"] as? [[String: Any]])
+    #expect(heading.first?["text"] as? String == "Note title")
+    let markdown = try #require(parsed["markdownLinks"] as? [String])
+    #expect(markdown.contains("Notes/Linked.md"))
+    let wikilinks = try #require(parsed["wikilinks"] as? [[String: Any]])
+    #expect(wikilinks.contains(where: { $0["target"] as? String == "Wiki page" }))
+    #expect(wikilinks.contains(where: { $0["embed"] as? Bool == true }))
+
+    let body = api.handle(request: httpRequest("/v1/documents/\(identifier)/content"), indexReady: true)
+    #expect(body.status == 200)
+    #expect(body.body == Data(original.utf8))
+    #expect(body.contentType == "text/markdown; charset=utf-8")
+
+    // Not yet observed changes must not pass through this indexed API.
+    try f.write("note.md", "# Unobserved\n")
+    #expect(api.handle(request: httpRequest("/v1/documents/\(identifier)/content"),
+                       indexReady: true).body == Data(original.utf8))
+    #expect(api.handle(request: httpRequest("/v1/documents"), indexReady: false).status == 503)
+    #expect(api.handle(request: httpRequest("/v1/documents/\(identifier)/content"),
+                       indexReady: false).status == 503)
+    #expect(api.handle(request: httpRequest("/v1/documents?limit=101"),
+                       indexReady: true).status == 400)
+    #expect(api.handle(request: httpRequest("/v1/documents?offset=-1"),
+                       indexReady: true).status == 400)
+    #expect(api.handle(request: httpRequest("/v1/documents/00000000000000000000000000000000"),
+                       indexReady: true).status == 404)
+    #expect(api.handle(request: httpRequest("/v1/documents/../../etc/passwd"),
+                       indexReady: true).status != 200)
+
+    try runtime.shutdown()
+}
+#endif

@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 
 demo=$(mktemp -d /private/tmp/andesite-api-contract.XXXXXX)
 mkdir "$demo/vault"
-printf '# Sample\napi-contract-search-unique\n' > "$demo/vault/note.md"
+printf '# Sample\napi-contract-search-unique\n[[Other note#Part|Label]]\n' > "$demo/vault/note.md"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 token=$(openssl rand -hex 32)
 state=$("${ANDESITE_SERVER_BIN:-.build/debug/andesite-server}" vault-state "$demo/vault")
@@ -39,6 +39,21 @@ test "$(status -H "Authorization: Bearer $token" "$url/v1/status")" = 200
 grep -q '"indexedReadable":true' "$demo/response"
 test "$(status -H "Authorization: Bearer $token" "$url/v1/search?q=api-contract-search-unique")" = 200
 grep -q 'Sample' "$demo/response"
+grep -q '"path":"note.md"' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents?limit=1&offset=0")" = 200
+grep -q '"total":1' "$demo/response"
+document_id=$(python3 - "$demo/response" <<'PYDOC'
+import json,sys
+print(json.load(open(sys.argv[1]))["documents"][0]["document"])
+PYDOC
+)
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents/$document_id")" = 200
+grep -q '"structureAvailable":true' "$demo/response"
+grep -q 'Other note' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents/$document_id/content")" = 200
+grep -q 'api-contract-search-unique' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents?limit=101")" = 400
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents/00000000000000000000000000000000")" = 404
 test "$(status -H "Authorization: Bearer $token" "$url/v1/snapshots?path=note.md")" = 200
 id=$(python3 - "$demo/response" <<'PY'
 import json,sys

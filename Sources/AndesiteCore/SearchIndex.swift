@@ -10,6 +10,7 @@ public struct SearchIndexHit: Equatable, Sendable {
     public let entryID: Data
     public let revisionID: Data
     public let title: String
+    public let path: String
 }
 
 /// A bounded, rebuildable FTS primitive, not the complete v1 search API.
@@ -40,7 +41,7 @@ public enum SearchIndex {
         let expression = "\"" + phrase.replacingOccurrences(of: "\"", with: "\"\"") + "\""
         let vaultKey = vaultID.map { String(format: "%02x", $0) }.joined()
         let rows = try db.queryValues("""
-            SELECT m.entry_id,m.indexed_revision,m.title
+            SELECT m.entry_id,m.indexed_revision,m.title,e.path
             FROM document_fts f JOIN document_metadata m
               ON lower(hex(m.entry_id))=f.entry_id AND lower(hex(m.vault_id))=f.vault_id
             JOIN entries e ON e.vault_id=m.vault_id AND e.id=m.entry_id
@@ -50,10 +51,11 @@ public enum SearchIndex {
             ORDER BY rank, m.entry_id LIMIT ?
             """, bindings: [.text(expression), .text(vaultKey), .blob(vaultID), .integer(Int64(limit))])
         return try rows.map { row in
-            guard row.count == 3, case .blob(let entry) = row[0], case .blob(let revision) = row[1], case .text(let title) = row[2] else {
+            guard row.count == 4, case .blob(let entry) = row[0], case .blob(let revision) = row[1],
+                  case .text(let title) = row[2], case .text(let path) = row[3] else {
                 throw SQLiteFailure(code: 20, message: "invalid search index row")
             }
-            return SearchIndexHit(entryID: entry, revisionID: revision, title: title)
+            return SearchIndexHit(entryID: entry, revisionID: revision, title: title, path: path)
         }
     }
 }

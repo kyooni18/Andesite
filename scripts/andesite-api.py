@@ -46,6 +46,13 @@ def main() -> int:
     parser.add_argument("--state", required=True, help="absolute private state directory")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    documents = sub.add_parser("documents")
+    documents.add_argument("--limit", type=int, default=50)
+    documents.add_argument("--offset", type=int, default=0)
+    document = sub.add_parser("document")
+    document.add_argument("id")
+    document_content = sub.add_parser("document-content")
+    document_content.add_argument("id")
     search = sub.add_parser("search")
     search.add_argument("phrase")
     search.add_argument("--limit", type=int, default=50)
@@ -65,6 +72,12 @@ def main() -> int:
         path = socket_path(args.state)
         if args.command == "status":
             url = "/v1/status"
+        elif args.command == "documents":
+            url = "/v1/documents?" + urlencode({"limit": args.limit, "offset": args.offset})
+        elif args.command == "document":
+            url = "/v1/documents/" + args.id
+        elif args.command == "document-content":
+            url = "/v1/documents/" + args.id + "/content"
         elif args.command == "search":
             url = "/v1/search?" + urlencode({"q": args.phrase, "limit": args.limit})
         elif args.command == "snapshots":
@@ -85,7 +98,7 @@ def main() -> int:
             data = response.read(1024 * 1024 + 8192)
             if response.status != 200:
                 raise RuntimeError(f"HTTP {response.status}: {data.decode('utf-8', 'replace')}")
-            if args.command == "content":
+            if args.command in ("content", "document-content"):
                 sys.stdout.buffer.write(data)
             else:
                 print(json.dumps(json.loads(data), indent=2, ensure_ascii=False))

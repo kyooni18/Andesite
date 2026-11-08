@@ -188,6 +188,28 @@ public final class VaultRuntime {
         return try SearchIndex.search(db: r.db, vaultID: vaultID, phrase: phrase, limit: limit)
     }
 
+    /// Current live Markdown heads, read from the same owner SQLite connection
+    /// and never from source notes. No nested reconciliation takes place.
+    public func documents(limit: Int = 50, offset: Int = 0) throws -> DocumentPage {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
+        try journal().assertResolved()
+        return try DocumentCatalog.list(db: r.db, vaultID: vaultID, limit: limit, offset: offset)
+    }
+
+    public func inspectDocument(_ id: Data) throws -> IndexedDocument {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
+        try journal().assertResolved()
+        return try DocumentCatalog.inspect(db: r.db, vaultID: vaultID, documentID: id)
+    }
+
+    public func documentContents(_ id: Data, maximumBytes: Int = 1024 * 1024) throws -> Data {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        let document = try inspectDocument(id)
+        return try DocumentCatalog.content(objects: r.objects, document: document, maximumBytes: maximumBytes)
+    }
+
     public func reconcile(at date: Date = Date()) throws -> ReconciliationReport {
         guard let r = resources else { throw VaultRuntimeError.closed }
         try journal().recover()

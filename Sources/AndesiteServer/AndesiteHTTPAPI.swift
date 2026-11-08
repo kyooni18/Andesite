@@ -101,6 +101,9 @@ enum AndesiteHTTPAPI {
 
         router.get("/v1/status") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/search") { request, _ in await Self.forward(request, via: relay) }
+        router.get("/v1/documents") { request, _ in await Self.forward(request, via: relay) }
+        router.get("/v1/documents/{id}") { request, _ in await Self.forward(request, via: relay) }
+        router.get("/v1/documents/{id}/content") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/snapshots") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/snapshots/{id}") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/snapshots/{id}/content") { request, _ in await Self.forward(request, via: relay) }

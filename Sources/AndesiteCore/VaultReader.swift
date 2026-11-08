@@ -150,9 +150,18 @@ public final class VaultReader {
                 // never follow it, and never traverse or index its contents.
                 // Any nested, misspelled, linked or unsafe .andesite name
                 // retains the existing fail-closed behavior.
-                if prefix.isEmpty && name == ".andesite" {
+                if prefix.isEmpty &&
+                   (name == ".andesite" || name == ".obsidian" ||
+                    name == ".trash" || name == ".git") {
+                    // Obsidian keeps settings/plugins in .obsidian and can
+                    // move deleted notes to .trash. .git is repository
+                    // metadata. Never index any as live Vault notes;
+                    // skip only these exact root directories.
+                    // .andesite is our own private metadata and stays 0700;
+                    // Existing Obsidian and Git folders may be mode 0755.
                     guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
-                          info.st_uid == geteuid(), info.st_mode & 0o077 == 0,
+                          info.st_uid == geteuid(),
+                          (name != ".andesite" || info.st_mode & 0o077 == 0),
                           UInt64(info.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
                     let ignored = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                     guard ignored >= 0 else { throw VaultReadError.unsafeFile }
