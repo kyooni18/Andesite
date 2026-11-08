@@ -338,10 +338,39 @@ public final class VaultRuntime {
         try journal().records().map(\.operation)
     }
 
+    public func inspectMutation(_ id: Data) throws -> MutationInspection { try journal().inspect(id) }
+
+    @discardableResult
+    public func resolveMutation(_ id: Data, strategy: String) throws -> MutationOperation {
+        let result = try journal().resolve(id, strategy: strategy)
+        try setState(try journal().hasUnfinished() ? "quarantined" : "scanRequired")
+        return result
+    }
+
+    public func exportMutationVersion(_ id: Data, role: String, to destination: String) throws {
+        try journal().exportVersion(id, role: role, to: destination)
+    }
+
+    public func mutationArtifacts() throws -> [MutationArtifact] { try journal().artifacts() }
+
+    @discardableResult
+    public func cleanupMutationArtifacts(dryRun: Bool = true) throws -> [MutationArtifact] {
+        try journal().cleanup(dryRun: dryRun)
+    }
+
     public func snapshotStorage(at date: Date = Date()) throws -> SnapshotStorageUsage {
         guard let r = resources else { throw VaultRuntimeError.closed }
         try verifyObjects()
-        return try RecoverySnapshots.usage(db: r.db, vaultID: vaultID, at: date)
+        var usage = try RecoverySnapshots.usage(db: r.db, vaultID: vaultID, at: date)
+        let physical = try r.objects.storageUsage(), artifacts = try journal().artifacts()
+        usage.immutableObjectLogicalBytes = physical.logical
+        usage.physicalObjectAllocatedBytes = physical.allocated
+        usage.temporaryObjectAllocatedBytes = physical.temporary
+        usage.artifactAllocatedBytes = artifacts.reduce(0) { $0 + $1.allocatedBytes }
+        usage.retirementEligibleAllocatedBytes = artifacts.filter(\.eligible).reduce(0) { $0 + $1.allocatedBytes }
+        usage.unresolvedArtifactAllocatedBytes = artifacts.filter { !$0.eligible }.reduce(0) { $0 + $1.allocatedBytes }
+        usage.uncertainArtifacts = artifacts.filter { $0.status == "uncertain" }.count
+        return usage
     }
 
     @discardableResult

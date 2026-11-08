@@ -98,7 +98,7 @@ final class MutationFilesystem {
               FileFingerprint(s) == FileFingerprint(before), FileFingerprint(after) == FileFingerprint(before), bytes.count == s.st_size else { throw MutationError.conflict("file changed during read") }
         return ObservedFile(fingerprint: FileFingerprint(s), bytes: bytes)
     }
-    func stage(_ bytes: Data, artifact: String, original: FileFingerprint, fault: (String) throws -> Void) throws -> FileFingerprint {
+    func stage(_ bytes: Data, artifact: String, original: FileFingerprint, owned: (FileFingerprint) throws -> Void, fault: (String) throws -> Void) throws -> FileFingerprint {
         let source = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard source >= 0 else { throw MutationError.conflict("cannot open original metadata") }
         defer { close(source) }
@@ -107,6 +107,9 @@ final class MutationFilesystem {
         let fd = openat(directory, artifact, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw MutationError.conflict("exclusive stage creation failed") }
         defer { close(fd) } // Never unlink: incomplete artifacts are diagnostic evidence.
+        guard fstat(fd, &s) == 0 else { throw MutationError.conflict("cannot identify created stage") }
+        try syncDirectory()
+        try owned(FileFingerprint(s))
         try fault("stage-created")
         try bytes.withUnsafeBytes { raw in
             var offset = 0

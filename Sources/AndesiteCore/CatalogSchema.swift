@@ -9,7 +9,7 @@ public enum CatalogMigrationError: Error, Equatable {
 /// safe to use as a sync service until general operations/recovery and the
 /// remaining protocol tables are implemented (the local restore journal is v6). Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 6
+    public static let currentVersion = 7
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -66,6 +66,35 @@ public enum CatalogSchema {
                 try db.execute("CREATE INDEX mutation_journal_state ON mutation_journal(vault_id,state)")
             }
             if version < 6 { try db.execute("PRAGMA user_version=6") }
+            if version < 7 {
+                try db.execute("ALTER TABLE mutation_journal ADD COLUMN owned_hint BLOB")
+                try db.execute("""
+                    CREATE TABLE mutation_decisions (
+                      vault_id BLOB NOT NULL, operation_id BLOB NOT NULL, strategy TEXT NOT NULL,
+                      evidence BLOB NOT NULL, outcome TEXT NOT NULL, created_at REAL NOT NULL,
+                      PRIMARY KEY(vault_id,operation_id),
+                      FOREIGN KEY(vault_id,operation_id) REFERENCES mutation_journal(vault_id,id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("""
+                    CREATE TABLE mutation_retirements (
+                      vault_id BLOB NOT NULL, operation_id BLOB NOT NULL, path TEXT NOT NULL,
+                      hint BLOB NOT NULL, hash TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','retired')),
+                      PRIMARY KEY(vault_id,operation_id),
+                      FOREIGN KEY(vault_id,operation_id) REFERENCES mutation_journal(vault_id,id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("""
+                    CREATE TABLE mutation_versions (
+                      vault_id BLOB NOT NULL, operation_id BLOB NOT NULL, role TEXT NOT NULL,
+                      hash BLOB NOT NULL REFERENCES objects(hash), byte_length INTEGER NOT NULL CHECK(byte_length>=0),
+                      path TEXT NOT NULL, hint BLOB,
+                      PRIMARY KEY(vault_id,operation_id,role),
+                      FOREIGN KEY(vault_id,operation_id) REFERENCES mutation_journal(vault_id,id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("PRAGMA user_version=7")
+            }
         }
     }
 

@@ -84,6 +84,32 @@ public final class ObjectStore {
         #endif
     }
 
+    /// Accounting only; does not authorize removal of anything in the store.
+    func storageUsage() throws -> (logical: Int64, allocated: Int64, temporary: Int64) {
+        let copy = openat(root, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard copy >= 0, let stream = fdopendir(copy) else { throw ObjectStoreError.systemCall("enumerate object storage", errno) }
+        defer { closedir(stream) }
+        var immutable: [String: (Int64, Int64)] = [:], temporary: [String: Int64] = [:]
+        while true {
+            errno = 0
+            guard let entry = readdir(stream) else {
+                guard errno == 0 else { throw ObjectStoreError.systemCall("read object storage", errno) }; break
+            }
+            let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: entry.pointee.d_name)) { String(cString: $0) }
+            }
+            if name == "." || name == ".." { continue }
+            var s = stat()
+            guard fstatat(root, name, &s, AT_SYMLINK_NOFOLLOW) == 0, s.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { throw ObjectStoreError.corruptObject }
+            let key = "\(s.st_dev):\(s.st_ino)"
+            let isHash = name.utf8.count == 64 && name.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+            if isHash { immutable[key] = (s.st_size, Int64(s.st_blocks) * 512) }
+            else if name.hasPrefix(".object-") { temporary[key] = Int64(s.st_blocks) * 512 }
+            else { throw ObjectStoreError.corruptObject }
+        }
+        return (immutable.values.reduce(0) { $0 + $1.0 }, immutable.values.reduce(0) { $0 + $1.1 }, temporary.filter { immutable[$0.key] == nil }.values.reduce(0, +))
+    }
+
     public func get(_ hash: String, maximumBytes: Int) throws -> Data {
         guard hash.utf8.count == 64 && hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
             throw ObjectStoreError.invalidHash

@@ -122,7 +122,7 @@ public enum ExternalCapture {
         }
     }
 
-    private static func registerObject(db: SQLiteConnection, prepared p: Prepared, timestamp: String) throws {
+    static func registerObject(db: SQLiteConnection, prepared p: Prepared, timestamp: String) throws {
         try db.executeValues("INSERT INTO objects(hash,length,durable_location,created_at) VALUES(?,?,?,?) ON CONFLICT(hash) DO NOTHING", bindings: [.blob(p.hashBytes), .integer(Int64(p.length)), .text(p.hash), .text(timestamp)])
         guard try db.queryValues("SELECT length,durable_location FROM objects WHERE hash=?", bindings: [.blob(p.hashBytes)]) == [[.integer(Int64(p.length)), .text(p.hash)]] else { throw ExternalCaptureError.corruptCatalog }
     }

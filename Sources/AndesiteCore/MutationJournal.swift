@@ -21,7 +21,8 @@ public struct MutationOperation: Sendable {
 /// Durable preimage -> prepared -> staged -> published -> catalogued -> completed.
 /// Never-published work is cancelled on restart; ambiguity is quarantined, never
 /// rolled back over a possibly newer edit. Atomic exchange retains the displaced
-/// inode indefinitely; no recovery path unlinks or rewrites that evidence.
+/// inode until explicitly verified retirement; automatic recovery never unlinks
+/// or rewrites that evidence.
 final class MutationJournal {
     struct Record {
         let operation: MutationOperation
@@ -72,7 +73,8 @@ final class MutationJournal {
     }
     static func hex(_ bytes: Data) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
     func hasUnfinished() throws -> Bool {
-        try records().contains { !["completed", "cancelled"].contains($0.operation.state) }
+        if try !db.queryValues("SELECT 1 FROM mutation_retirements WHERE vault_id=? AND state='pending' LIMIT 1", bindings: [.blob(vaultID)]).isEmpty { return true }
+        return try records().contains { !["completed", "cancelled"].contains($0.operation.state) }
     }
     func assertResolved() throws {
         if try hasUnfinished() { throw MutationError.unfinished }
@@ -161,7 +163,9 @@ final class MutationJournal {
             try fault("intent-written")
         }
         try fault("intent-committed")
-        let staged = try fs.stage(replacement, artifact: artifact, original: original, fault: fault)
+        let staged = try fs.stage(replacement, artifact: artifact, original: original, owned: { hint in
+            try self.db.executeValues("UPDATE mutation_journal SET owned_hint=? WHERE vault_id=? AND id=?", bindings: [.blob(try JSONEncoder().encode(hint)), .blob(self.vaultID), .blob(operationID)])
+        }, fault: fault)
         try db.transaction {
             try db.executeValues("UPDATE mutation_journal SET stage_hint=?,state='staged' WHERE vault_id=? AND id=?", bindings: [.blob(try JSONEncoder().encode(staged)), .blob(vaultID), .blob(operationID)])
         }
@@ -236,12 +240,14 @@ final class MutationJournal {
         let pending = try records()
         if !pending.isEmpty { try requireDurableStorage() }
         for record in pending {
+            if try retirement(record) != nil { continue }
+            if try decisionFinished(record) { continue }
             if record.operation.state == "quarantined" { continue }
             // A cancelled, never-staged intent owns no filesystem evidence;
             // later ordinary parent deletion/moves must not re-block the vault.
             if record.operation.state == "cancelled", record.stage == nil { continue }
             do {
-                let fs = try filesystem(path: record.operation.path, expected: record.directories)
+                let fs = try (record.operation.state == "completed" ? artifactLocation(record).fs : filesystem(path: record.operation.path, expected: record.directories))
                 switch record.operation.state {
                 case "completed":
                     // Keep watching displaced inodes: an editor with an open FD
@@ -288,6 +294,11 @@ final class MutationJournal {
         try assertResolved()
         var result: [String: FileFingerprint] = [:]
         for r in try records() {
+            if let retirement = try retirement(r), retirement.state == "retired" { continue }
+            if let located = try? artifactLocation(r), let observed = try? located.fs.observe(r.operation.artifact, maximumBytes: maximumBytes), try isOwned(observed, r) {
+                result[located.path] = observed.fingerprint
+                continue
+            }
             let expected: FileFingerprint?
             if r.operation.state == "completed" { expected = r.original }
             else { expected = r.stage }

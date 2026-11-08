@@ -55,6 +55,13 @@ public struct SnapshotStorageUsage: Sendable {
     public let logicalBytes: Int64
     public let uniqueSnapshotBytes: Int64
     public let registeredObjectBytes: Int64
+    public internal(set) var immutableObjectLogicalBytes: Int64 = 0
+    public internal(set) var physicalObjectAllocatedBytes: Int64 = 0
+    public internal(set) var temporaryObjectAllocatedBytes: Int64 = 0
+    public internal(set) var artifactAllocatedBytes: Int64 = 0
+    public internal(set) var retirementEligibleAllocatedBytes: Int64 = 0
+    public internal(set) var unresolvedArtifactAllocatedBytes: Int64 = 0
+    public internal(set) var uncertainArtifacts: Int = 0
     public let objects: [SnapshotObjectReferences]
 }
 
