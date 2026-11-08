@@ -56,7 +56,8 @@ public enum ExternalCapture {
     /// validated namespace planner, never inferred from a content hash.
     static func publish(db: SQLiteConnection, vaultID: Data, prepared p: Prepared,
                         entryID requestedID: Data? = nil, at date: Date,
-                        restoringRevision: Data? = nil) throws -> ExternalCaptureResult? {
+                        restoringRevision: Data? = nil,
+                        mutationOrigin: String = "restore") throws -> ExternalCaptureResult? {
         guard vaultID.count == 16, try db.queryValues("SELECT id FROM vaults WHERE id=?", bindings: [.blob(vaultID)]).count == 1 else { throw ExternalCaptureError.unknownVault }
         let timestamp = ISO8601DateFormatter().string(from: date)
         let predicate = requestedID == nil ? "e.path_key=? AND e.state='live'" : "e.id=? AND e.state IN ('live','reserved')"
@@ -94,7 +95,7 @@ public enum ExternalCapture {
             INSERT INTO revisions(vault_id,entry_id,revision_id,parent1,content_hash,byte_length,path,deleted,origin,created_at,fs_hint)
             VALUES(?,?,?,?,?,?,?,0,?,?,?)
             """, bindings: [.blob(vaultID), .blob(entryID), .blob(revision), oldRevision.map(SQLiteValue.blob) ?? .null,
-                            .blob(p.hashBytes), .integer(Int64(p.length)), .text(p.name), .text(restoringRevision == nil ? "external" : "restore"), .text(timestamp), .blob(p.hint)])
+                            .blob(p.hashBytes), .integer(Int64(p.length)), .text(p.name), .text(restoringRevision == nil ? "external" : mutationOrigin), .text(timestamp), .blob(p.hint)])
         try db.executeValues("UPDATE entries SET path=?,path_key=?,head_revision=?,state='live',fs_hint=? WHERE vault_id=? AND id=?", bindings: [.text(p.name), .text(p.path.portabilityKey), .blob(revision), .blob(p.hint), .blob(vaultID), .blob(entryID)])
         try resolveIncidents(db: db, vaultID: vaultID, key: p.path.portabilityKey, entryID: entryID)
         let type = moved ? "moved" : (oldRevision == nil ? "created" : "updated")

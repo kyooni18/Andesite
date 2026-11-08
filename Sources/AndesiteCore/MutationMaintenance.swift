@@ -150,15 +150,29 @@ extension MutationJournal {
         let observed = try located.fs.observe(located.fs.name, maximumBytes: maximumBytes)
         return (MutationVersion(role: role, path: located.path, hash: ObjectStore.hash(observed.bytes), fingerprint: observed.fingerprint, bytes: observed.bytes.count), observed.bytes)
     }
+    /// A user edit keeps the preimage as its historical snapshot; the
+    /// intended version is a separately pinned immutable object. Recovery
+    /// inspection and explicit conflict decisions must not confuse them.
+    func intendedVersion(_ r: Record) throws -> (MutationVersion, Data) {
+        let bytes = try desiredBytes(r)
+        let expected = r.replacementHash.map(Self.hex)
+        let hash = ObjectStore.hash(bytes)
+        guard expected == nil || expected == hash else {
+            throw MutationError.conflict("intended replacement object verification failed")
+        }
+        return (MutationVersion(role: "intended", path: r.operation.path,
+                                hash: hash, fingerprint: nil, bytes: bytes.count), bytes)
+    }
+
     func evidence(_ r: Record) throws -> [(MutationVersion, Data)] {
         let source = try snapshot(r.operation.snapshotID).0, before = try snapshot(r.operation.preimageID).0
         guard source.entryID == r.operation.entryID, before.entryID == r.operation.entryID,
               before.revisionID == r.parent else { throw MutationError.conflict("journal snapshot identity or preimage lineage mismatch") }
-        var versions: [(MutationVersion, Data)] = []
-        for (role, id) in [("intended", r.operation.snapshotID), ("preimage", r.operation.preimageID)] {
-            let (s, bytes) = try snapshot(id)
-            versions.append((MutationVersion(role: role, path: s.originalPath, hash: s.contentHash, fingerprint: nil, bytes: bytes.count), bytes))
-        }
+        var versions: [(MutationVersion, Data)] = [try intendedVersion(r)]
+        let (beforeSnapshot, preimage) = try snapshot(r.operation.preimageID)
+        versions.append((MutationVersion(role: "preimage", path: beforeSnapshot.originalPath,
+                                         hash: beforeSnapshot.contentHash,
+                                         fingerprint: nil, bytes: preimage.count), preimage))
         versions.append(try version("current", currentLocation(r)))
         let artifact = try artifactLocation(r)
         if let _ = try artifact.fs.info(artifact.fs.name) {
@@ -175,10 +189,13 @@ extension MutationJournal {
     func inspect(_ id: Data) throws -> MutationInspection {
         let r = try reload(id)
         var versions: [MutationVersion] = [], diagnostics = [r.operation.diagnostic], choices: [String] = []
-        for (role, snapshotID) in [("intended", r.operation.snapshotID), ("preimage", r.operation.preimageID)] {
-            do { let (s, bytes) = try snapshot(snapshotID); versions.append(MutationVersion(role: role, path: s.originalPath, hash: s.contentHash, fingerprint: nil, bytes: bytes.count)) }
-            catch { diagnostics.append("\(role): immutable verification failed") }
-        }
+        do { versions.append(try intendedVersion(r).0) }
+        catch { diagnostics.append("intended: immutable verification failed") }
+        do {
+            let (s, bytes) = try snapshot(r.operation.preimageID)
+            versions.append(MutationVersion(role: "preimage", path: s.originalPath,
+                                            hash: s.contentHash, fingerprint: nil, bytes: bytes.count))
+        } catch { diagnostics.append("preimage: immutable verification failed") }
         for (role, locate) in [("current", currentLocation), ("artifact", artifactLocation)] {
             do { let l = try locate(r); let v = try version(role, l).0; versions.append(v)
                 if let fp = v.fingerprint, try !isOwned(ObservedFile(fingerprint: fp, bytes: Data()), r) { diagnostics.append("\(role): UNVERIFIED ownership; no resolution or retirement authority") }
@@ -191,7 +208,7 @@ extension MutationJournal {
             if Array(current.0.path.utf8) == Array(r.operation.path.utf8), current.0.fingerprint?.sameInode(as: r.original) == true, current.1 == (try snapshot(r.operation.preimageID).1),
                try db.queryValues("SELECT head_revision FROM entries WHERE vault_id=? AND id=?", bindings: [.blob(vaultID), .blob(r.operation.entryID)]) == [[.blob(r.parent)]] { choices.append("cancel-unpublished") }
             if current.0.fingerprint?.sameInode(as: r.stage ?? r.original) == true, r.stage != nil,
-               current.1 == (try snapshot(r.operation.snapshotID).1) { choices.append("complete-published") }
+               current.1 == (try desiredBytes(r)) { choices.append("complete-published") }
         }
         if let fs = try? filesystem(path: r.operation.path), let observed = try? fs.observe(fs.name, maximumBytes: maximumBytes),
            try !isOwned(observed, r) {
@@ -322,8 +339,9 @@ extension MutationJournal {
            let v = try JSONDecoder().decode([MutationVersion].self, from: encoded).first(where: { $0.role == role }) {
             bytes = try objects.get(v.hash, maximumBytes: maximumBytes)
         }
-        if bytes == nil, role == "intended" || role == "preimage" {
-            bytes = try snapshot(role == "intended" ? r.operation.snapshotID : r.operation.preimageID).1
+        if bytes == nil, role == "intended" { bytes = try desiredBytes(r) }
+        if bytes == nil, role == "preimage" {
+            bytes = try snapshot(r.operation.preimageID).1
         }
         if bytes == nil, role == "current" { bytes = try version(role, currentLocation(r)).1 }
         if bytes == nil, role == "artifact" { bytes = try version(role, artifactLocation(r)).1 }
@@ -354,7 +372,7 @@ extension MutationJournal {
                 if let d = try decision(r), case .blob(let data) = d[1] {
                     expected = try JSONDecoder().decode([MutationVersion].self, from: data).first { $0.role == "artifact" }?.hash
                 } else if r.operation.state == "completed" { expected = try snapshot(r.operation.preimageID).0.contentHash }
-                else if r.operation.state == "cancelled", r.stage != nil { expected = try snapshot(r.operation.snapshotID).0.contentHash }
+                else if r.operation.state == "cancelled", r.stage != nil { expected = try intendedVersion(r).0.hash }
                 else { expected = nil }
                 let referenced = try records().contains { other in
                     guard other.operation.id != r.operation.id, !["completed", "cancelled"].contains(other.operation.state) else { return false }

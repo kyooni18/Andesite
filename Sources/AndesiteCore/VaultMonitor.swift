@@ -89,6 +89,7 @@ public final class VaultMonitor {
         let initial = try runtime.reconcile()
         report("watch-ready discovered=\(initial.discovered) revisions=\(initial.revisionsCreated) snapshots=\(initial.snapshotsCreated)")
         var lastGeneration: UInt64 = 0
+        var lastForegroundMutation = runtime.foregroundMutationGeneration
         var scheduler = VaultWorkScheduler(
             now: ProcessInfo.processInfo.systemUptime,
             debounce: settings.debounce,
@@ -100,6 +101,11 @@ public final class VaultMonitor {
 
         while !shouldStop() {
             let now = ProcessInfo.processInfo.systemUptime
+            if runtime.foregroundMutationGeneration != lastForegroundMutation {
+                lastForegroundMutation = runtime.foregroundMutationGeneration
+                scheduler.observedChange(at: now)
+                report("watch-foreground-mutation generation=\(lastForegroundMutation)")
+            }
             let events = try drain()
             if events.generation != lastGeneration || events.recovery_flags != 0 {
                 lastGeneration = events.generation
@@ -132,9 +138,13 @@ public final class VaultMonitor {
 
                 case .refreshLinks:
                     do {
-                        let result = try runtime.refreshLinkCache()
-                        scheduler.refreshedLinks()
-                        report("watch-link-cache generation=\(result.generation) parsed=\(result.parsedDocuments) reused=\(result.reusedDocuments) changed=\(result.graphChanged)")
+                        // One small unit of parsing or resolution per tick;
+                        // event reconciliation and HTTP polling get a chance
+                        // between slices.
+                        if let result = try runtime.advanceLinkCache() {
+                            scheduler.refreshedLinks()
+                            report("watch-link-cache generation=\(result.generation) parsed=\(result.parsedDocuments) reused=\(result.reusedDocuments) changed=\(result.graphChanged)")
+                        }
                     } catch VaultLinkGraphError.graphTooLarge {
                         scheduler.refreshFailed(at: ProcessInfo.processInfo.systemUptime,
                                                 retry: false)

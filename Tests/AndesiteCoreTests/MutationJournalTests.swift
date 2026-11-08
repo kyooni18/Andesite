@@ -378,6 +378,10 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
         if point == "retirement-intent" {
             let legacy = try f.catalog()
             for table in ["mutation_decision_history", "mutation_versions", "mutation_retirements", "mutation_decisions"] { try legacy.execute("DROP TABLE " + table) }
+            // Reconstruct a genuine v6 journal shape before exercising
+            // the v6 -> v7 -> v8 transactional upgrade in a child process.
+            try legacy.execute("ALTER TABLE mutation_journal DROP COLUMN intent_kind")
+            try legacy.execute("ALTER TABLE mutation_journal DROP COLUMN replacement_hash")
             try legacy.execute("ALTER TABLE mutation_journal DROP COLUMN owned_hint")
             try legacy.execute("PRAGMA user_version=6")
         }

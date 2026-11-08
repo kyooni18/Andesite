@@ -1,4 +1,5 @@
 import Foundation
+import Crypto
 #if canImport(Darwin)
 import Darwin
 #else
@@ -31,6 +32,8 @@ final class MutationJournal {
         let stage: FileFingerprint?
         let directories: [DirectoryIdentity]
         let created: Date
+        let replacementHash: Data?
+        let intentKind: String
     }
     let db: SQLiteConnection
     let objects: ObjectStore
@@ -52,7 +55,8 @@ final class MutationJournal {
     func records() throws -> [Record] {
         try db.queryValues("""
             SELECT id,entry_id,snapshot_id,preimage_id,revision_id,path,artifact,state,diagnostic,
-                   parent_revision,original_hint,stage_hint,directories,created_at
+                   parent_revision,original_hint,stage_hint,directories,created_at,
+                   replacement_hash,intent_kind
             FROM mutation_journal WHERE vault_id=? ORDER BY created_at,id
             """, bindings: [.blob(vaultID)]).map { row in
             guard case .blob(let id) = row[0], case .blob(let entry) = row[1], case .blob(let snapshot) = row[2],
@@ -64,11 +68,24 @@ final class MutationJournal {
             if case .blob(let bytes) = row[11] { stage = try JSONDecoder().decode(FileFingerprint.self, from: bytes) }
             else { guard row[11] == .null else { throw VaultRuntimeError.inconsistentCatalog }; stage = nil }
             _ = try VaultPath(path)
-            guard artifact == ".andesite-mutation-" + Self.hex(id), id.count == 16 else { throw VaultRuntimeError.inconsistentCatalog }
+            guard artifact == ".andesite-mutation-" + Self.hex(id), id.count == 16,
+                  case .text(let kind) = row[15], kind == "restore" || kind == "edit" else {
+                throw VaultRuntimeError.inconsistentCatalog
+            }
+            let replacementHash: Data?
+            if case .blob(let digest) = row[14], digest.count == 32 {
+                replacementHash = digest
+            } else if row[14] == .null {
+                replacementHash = nil
+            } else { throw VaultRuntimeError.inconsistentCatalog }
+            guard (kind == "edit") == (replacementHash != nil) else {
+                throw VaultRuntimeError.inconsistentCatalog
+            }
             return try Record(operation: MutationOperation(id: id, entryID: entry, snapshotID: snapshot, preimageID: preimage,
                 revisionID: revision, path: path, artifact: artifact, state: state, diagnostic: diagnostic), parent: parent,
                 original: JSONDecoder().decode(FileFingerprint.self, from: original), stage: stage,
-                directories: JSONDecoder().decode([DirectoryIdentity].self, from: dirs), created: Date(timeIntervalSince1970: time))
+                directories: JSONDecoder().decode([DirectoryIdentity].self, from: dirs), created: Date(timeIntervalSince1970: time),
+                replacementHash: replacementHash, intentKind: kind)
         }
     }
     static func hex(_ bytes: Data) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
@@ -83,6 +100,18 @@ final class MutationJournal {
         try MutationFilesystem.requireSupportedDirectory(stateRoot)
         try MutationFilesystem.requireSupportedDirectory(stateRoot + "/objects")
     }
+    func desiredBytes(_ record: Record) throws -> Data {
+        if let digest = record.replacementHash {
+            let hash = Self.hex(digest)
+            let bytes = try objects.get(hash, maximumBytes: maximumBytes)
+            guard Data(SHA256.hash(data: bytes)) == digest else {
+                throw MutationError.conflict("immutable replacement bytes no longer match intent")
+            }
+            return bytes
+        }
+        return try snapshot(record.operation.snapshotID).1
+    }
+
     func snapshot(_ id: Data) throws -> (RecoverySnapshot, Data) {
         guard let s = try RecoverySnapshots.list(db: db, vaultID: vaultID, snapshotID: id).first else { throw SnapshotError.notFound }
         let bytes = try objects.get(s.contentHash, maximumBytes: maximumBytes)
@@ -153,13 +182,99 @@ final class MutationJournal {
             return id
         }
         try fault("preimage-preserved")
+        return try finishReplacement(
+            entryID: snapshot.entryID, snapshotID: id, preimageID: preimage,
+            parent: parent, path: path, hint: hint, original: original,
+            observation: observation, fs: fs, replacement: replacement,
+            replacementHash: nil, intentKind: "restore", at: now)
+        #endif
+    }
+    /// The first journal-backed user edit supports existing live Markdown
+    /// only. Creation/deletion have different namespace semantics and remain
+    /// disabled until their own crash-recovery contracts are verified.
+    func edit(entryID: Data, expectedRevision: Data, bytes: Data) throws -> MutationOperation {
+        #if !canImport(Darwin)
+        throw MutationError.unsupportedPlatform
+        #else
+        guard entryID.count == 16, expectedRevision.count == 16,
+              bytes.count <= maximumBytes else {
+            throw MutationError.conflict("invalid revision or oversized replacement")
+        }
+        _ = try MarkdownAnalyzer.analyze(bytes)
+        try assertResolved()
+        try requireDurableStorage()
+        let rows = try db.queryValues("""
+            SELECT e.path,e.head_revision,e.fs_hint,r.content_hash FROM entries e
+            JOIN revisions r ON r.vault_id=e.vault_id AND r.revision_id=e.head_revision
+            WHERE e.vault_id=? AND e.id=? AND e.state='live' AND e.kind='markdown'
+            """, bindings: [.blob(vaultID), .blob(entryID)])
+        guard rows.count == 1, case .text(let path) = rows[0][0],
+              case .blob(let parent) = rows[0][1], case .blob(let hint) = rows[0][2],
+              case .blob(let hash) = rows[0][3] else {
+            throw MutationError.conflict("document is not an indexed live Markdown note")
+        }
+        guard parent == expectedRevision else {
+            throw MutationError.conflict("revision precondition failed; refresh document before editing")
+        }
+        let fs = try filesystem(path: path)
+        let observation = try fs.observe(fs.name, maximumBytes: maximumBytes)
+        let original = try JSONDecoder().decode(FileFingerprint.self, from: hint)
+        guard observation.fingerprint == original,
+              ObjectStore.hash(observation.bytes) == Self.hex(hash) else {
+            throw MutationError.conflict("external edit since indexed revision; reconcile before retrying")
+        }
+
+        // An immutable content object is durably published first, before any
+        // journal intent or file exchange. It is registered in the catalog
+        // transaction that preserves the exact current head as a preimage.
+        _ = try objects.put(observation.bytes)
+        let stored = try objects.put(bytes)
+        let digest = Data(SHA256.hash(data: bytes))
+        guard stored == Self.hex(digest) else {
+            throw MutationError.conflict("replacement object digest mismatch")
+        }
+        let now = Date()
+        try fault("before-preimage")
+        let preimage = try db.transaction {
+            try db.executeValues("""
+                INSERT INTO objects(hash,length,durable_location,created_at)
+                VALUES(?,?,?,?) ON CONFLICT(hash) DO NOTHING
+                """, bindings: [.blob(digest), .integer(Int64(bytes.count)),
+                                 .text(stored), .text(ISO8601DateFormatter().string(from: now))])
+            guard try db.queryValues("SELECT length,durable_location FROM objects WHERE hash=?",
+                                     bindings: [.blob(digest)]) == [
+                                        [.integer(Int64(bytes.count)), .text(stored)]
+                                     ] else {
+                throw VaultRuntimeError.inconsistentCatalog
+            }
+            let id = try preserveHead(entryID: entryID, at: now)
+            try fault("preimage-written")
+            return id
+        }
+        try fault("preimage-preserved")
+        return try finishReplacement(
+            entryID: entryID, snapshotID: preimage, preimageID: preimage,
+            parent: parent, path: path, hint: hint, original: original,
+            observation: observation, fs: fs, replacement: bytes,
+            replacementHash: digest, intentKind: "edit", at: now)
+        #endif
+    }
+
+    private func finishReplacement(
+        entryID: Data, snapshotID: Data, preimageID: Data,
+        parent: Data, path: String, hint: Data, original: FileFingerprint,
+        observation: ObservedFile, fs: MutationFilesystem, replacement: Data,
+        replacementHash: Data?, intentKind: String, at now: Date
+    ) throws -> MutationOperation {
         let operationID = ExternalCapture.identifier(), revision = ExternalCapture.identifier()
         let artifact = ".andesite-mutation-" + Self.hex(operationID)
         try db.transaction {
             try db.executeValues("""
-                INSERT INTO mutation_journal(vault_id,id,entry_id,snapshot_id,preimage_id,parent_revision,revision_id,path,artifact,original_hint,directories,state,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,'prepared',?)
-                """, bindings: [.blob(vaultID), .blob(operationID), .blob(snapshot.entryID), .blob(id), .blob(preimage), .blob(parent), .blob(revision), .text(path), .text(artifact), .blob(hint), .blob(try JSONEncoder().encode(fs.identities)), .real(now.timeIntervalSince1970)])
+                INSERT INTO mutation_journal(vault_id,id,entry_id,snapshot_id,preimage_id,parent_revision,revision_id,path,artifact,original_hint,directories,replacement_hash,intent_kind,state,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'prepared',?)
+                """, bindings: [.blob(vaultID), .blob(operationID), .blob(entryID), .blob(snapshotID), .blob(preimageID), .blob(parent), .blob(revision), .text(path), .text(artifact), .blob(hint), .blob(try JSONEncoder().encode(fs.identities)),
+                                  replacementHash.map(SQLiteValue.blob) ?? .null,
+                                  .text(intentKind), .real(now.timeIntervalSince1970)])
             try fault("intent-written")
         }
         try fault("intent-committed")
@@ -197,10 +312,10 @@ final class MutationJournal {
         try fault("catalogued")
         try complete(try reload(operationID), fs: fs)
         return try reload(operationID).operation
-        #endif
     }
     func verifyPublished(_ record: Record, fs: MutationFilesystem) throws {
-        let (source, wanted) = try snapshot(record.operation.snapshotID)
+        let (source, _) = try snapshot(record.operation.snapshotID)
+        let wanted = try desiredBytes(record)
         let (before, preimage) = try snapshot(record.operation.preimageID)
         guard source.entryID == record.operation.entryID, before.entryID == record.operation.entryID,
               before.revisionID == record.parent else { throw MutationError.conflict("journal snapshot identity or preimage lineage mismatch") }
@@ -214,13 +329,14 @@ final class MutationJournal {
     func publishCatalog(_ record: Record, fs: MutationFilesystem) throws {
         try verifyPublished(record, fs: fs)
         let observed = try fs.observe(fs.name, maximumBytes: maximumBytes)
-        guard let stage = record.stage, observed.fingerprint.sameInode(as: stage), observed.bytes == (try snapshot(record.operation.snapshotID).1) else { throw MutationError.conflict("target changed before catalog publication") }
+        guard let stage = record.stage, observed.fingerprint.sameInode(as: stage), observed.bytes == (try desiredBytes(record)) else { throw MutationError.conflict("target changed before catalog publication") }
         let p = try ExternalCapture.prepare(path: VaultPath(record.operation.path), observation: observed, objects: objects)
         try fault("before-catalog")
         try db.transaction {
             guard try db.queryValues("SELECT head_revision FROM entries WHERE vault_id=? AND id=? AND state='live'", bindings: [.blob(vaultID), .blob(record.operation.entryID)]) == [[.blob(record.parent)]] else { throw MutationError.conflict("catalog head no longer matches the journal parent") }
-            guard let captured = try ExternalCapture.publish(db: db, vaultID: vaultID, prepared: p, entryID: record.operation.entryID, at: record.created, restoringRevision: record.operation.revisionID) else { throw SnapshotError.inconsistentMetadata }
-            try SearchIndex.index(db: db, vaultID: vaultID, entryID: captured.entryID, revisionID: captured.revisionID, bytes: snapshot(record.operation.snapshotID).1, withinTransaction: true)
+            guard let captured = try ExternalCapture.publish(db: db, vaultID: vaultID, prepared: p, entryID: record.operation.entryID, at: record.created, restoringRevision: record.operation.revisionID,
+                                                         mutationOrigin: record.intentKind) else { throw SnapshotError.inconsistentMetadata }
+            try SearchIndex.index(db: db, vaultID: vaultID, entryID: captured.entryID, revisionID: captured.revisionID, bytes: desiredBytes(record), withinTransaction: true)
             _ = try preserveHead(entryID: captured.entryID, at: record.created)
             try fault("catalog-written")
             try setState(record, "catalogued")
@@ -279,7 +395,7 @@ final class MutationJournal {
                     let artifact = try fs.observe(record.operation.artifact, maximumBytes: maximumBytes)
                     if record.operation.state == "staged", target.fingerprint == record.original,
                        target.bytes == (try snapshot(record.operation.preimageID).1),
-                       artifact.fingerprint == stage, artifact.bytes == (try snapshot(record.operation.snapshotID).1) {
+                       artifact.fingerprint == stage, artifact.bytes == (try desiredBytes(record)) {
                         try db.transaction { try setState(record, "cancelled", "Staged but not published; source not modified by recovery") }
                     } else {
                         try verifyPublished(record, fs: fs)

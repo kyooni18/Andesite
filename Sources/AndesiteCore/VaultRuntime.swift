@@ -61,6 +61,7 @@ public final class VaultRuntime {
     /// touches it, never an FSEvents callback, NIO task or separate SQLite
     /// connection. Reconciliation invalidates the published generation.
     private var linkSnapshot: VaultLinkGraph.Snapshot?
+    private var linkBuilder: VaultLinkGraph.Builder?
     private var linkCacheReady = false
     private var linkCacheError: VaultLinkGraphError?
     private var linkCacheBuildCount = 0
@@ -74,6 +75,16 @@ public final class VaultRuntime {
 
     public var linksIndexed: Bool { linkCacheReady }
     public var linkCacheGeneration: Int { linkCacheBuildCount }
+    /// Incremented for every successfully committed foreground mutation.
+    /// The watcher observes this on its owner thread and enqueues a scan
+    /// without depending solely on delivery timing of FSEvents.
+    public private(set) var foregroundMutationGeneration: UInt64 = 0
+    /// Progress applies only to a pending low-priority generation.
+    public var linkCacheProgress: (processedHeads: Int, totalHeads: Int, resolvedHeads: Int)? {
+        guard let builder = linkBuilder else { return nil }
+        return (builder.processedDocuments, builder.totalDocuments,
+                builder.resolvedDocuments)
+    }
     // Internal deterministic hooks for tests; never supplied by vault contents.
     var mutationFault: ((String) throws -> Void)?
     private func journal() throws -> MutationJournal {
@@ -176,6 +187,7 @@ public final class VaultRuntime {
         guard resources != nil else { return }
         defer {
             linkSnapshot = nil
+            linkBuilder = nil
             linkCacheReady = false
             linkCacheError = nil
             resources = nil
@@ -184,7 +196,7 @@ public final class VaultRuntime {
         if try !journal().hasUnfinished() { _ = try flushSnapshots(at: date) }
     }
 
-    deinit { linkSnapshot = nil; resources = nil; processLock = nil }
+    deinit { linkBuilder = nil; linkSnapshot = nil; resources = nil; processLock = nil }
 
     public func status() throws -> VaultStatus {
         guard let r = resources else { throw VaultRuntimeError.closed }
@@ -234,19 +246,31 @@ public final class VaultRuntime {
         return try DocumentCatalog.content(objects: r.objects, document: document, maximumBytes: maximumBytes)
     }
 
-    /// Background-maintenance entrypoint. Parse only changed immutable head
-    /// revisions, then atomically publish the forward/backlink arrays.
-    /// Never call this from a GET handler; the watcher schedules it after
-    /// a successful scan, at lower priority than filesystem reconciliation.
+    /// Cooperative background maintenance: advance one bounded parse/resolve
+    /// slice, then yield to FSEvents and private HTTP before the next slice.
+    /// The result is nil until the graph is fully rebuilt and atomically
+    /// published. Only call on the existing synchronous VaultRuntime owner.
     @discardableResult
-    public func refreshLinkCache() throws -> LinkCacheReport {
+    public func advanceLinkCache(maxDocuments: Int = 8,
+                                 maxBytes: Int = 256 * 1024) throws -> LinkCacheReport? {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
         try journal().assertResolved()
         do {
-            let result = try VaultLinkGraph.prepare(db: r.db, objects: r.objects,
-                                                    vaultID: vaultID, previous: linkSnapshot)
+            if linkBuilder == nil {
+                linkBuilder = try VaultLinkGraph.begin(
+                    db: r.db, vaultID: vaultID, previous: linkSnapshot)
+            }
+            guard let builder = linkBuilder else { throw VaultLinkGraphError.inconsistentCatalog }
+            guard let result = try builder.step(objects: r.objects,
+                                                maxDocuments: maxDocuments,
+                                                maxBytes: maxBytes) else {
+                return nil
+            }
+            // Never publish partial generations; the old snapshot is reused
+            // only internally until a complete fresh graph is available.
             linkSnapshot = result.snapshot
+            linkBuilder = nil
             linkCacheError = nil
             linkCacheReady = true
             if result.changed { linkCacheBuildCount += 1 }
@@ -255,13 +279,24 @@ public final class VaultRuntime {
                                    graphChanged: result.changed,
                                    generation: linkCacheBuildCount)
         } catch let graphError as VaultLinkGraphError {
+            linkBuilder = nil
             linkCacheReady = false
             linkCacheError = graphError
             throw graphError
         } catch {
+            linkBuilder = nil
             linkCacheReady = false
             linkCacheError = .inconsistentCatalog
             throw error
+        }
+    }
+
+    /// Synchronous maintenance for explicit calls and legacy tests. The
+    /// always-on watcher uses advanceLinkCache, not this blocking wrapper.
+    @discardableResult
+    public func refreshLinkCache() throws -> LinkCacheReport {
+        while true {
+            if let report = try advanceLinkCache() { return report }
         }
     }
 
@@ -284,6 +319,7 @@ public final class VaultRuntime {
         // The prior snapshot can be reused incrementally after this scan,
         // but must not be served until its namespace has been reconciled.
         linkCacheReady = false
+        linkBuilder = nil
         linkCacheError = nil
         try journal().recover()
         try journal().assertResolved()
@@ -457,8 +493,37 @@ public final class VaultRuntime {
     public func restoreSnapshot(_ id: Data) throws -> MutationOperation {
         _ = try inspectSnapshot(id)
         let j = try journal()
+        // A journal-backed mutation is a foreground filesystem operation,
+        // not a cache job. Invalidate derived graph state before publication;
+        // a later successful scan will enqueue fresh low-priority work.
+        linkBuilder = nil
+        linkCacheReady = false
+        linkCacheError = nil
         try j.recover()
-        return try j.restore(id)
+        let operation = try j.restore(id)
+        try setState("scanRequired")
+        foregroundMutationGeneration &+= 1
+        return operation
+    }
+
+    /// Explicit, version-conditioned in-place edit of an existing Markdown
+    /// document. Uses the same durable preimage + APFS exchange journal as
+    /// recovery, with the requested bytes separately pinned as an immutable
+    /// object. New files and deletions are not authorized by this operation.
+    @discardableResult
+    public func editDocument(_ id: Data, expectedRevision: Data,
+                             contents: Data) throws -> MutationOperation {
+        guard resources != nil else { throw VaultRuntimeError.closed }
+        linkBuilder = nil
+        linkCacheReady = false
+        linkCacheError = nil
+        let j = try journal()
+        try j.recover()
+        let operation = try j.edit(entryID: id, expectedRevision: expectedRevision,
+                                   bytes: contents)
+        try setState("scanRequired")
+        foregroundMutationGeneration &+= 1
+        return operation
     }
 
     public func mutationOperations() throws -> [MutationOperation] {
@@ -472,7 +537,11 @@ public final class VaultRuntime {
         let j = try journal()
         try j.recover()
         let result = try j.resolve(id, strategy: strategy)
+        linkBuilder = nil
+        linkCacheReady = false
+        linkCacheError = nil
         try setState(try journal().hasUnfinished() ? "quarantined" : "scanRequired")
+        foregroundMutationGeneration &+= 1
         return result
     }
 

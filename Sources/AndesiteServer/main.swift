@@ -27,14 +27,16 @@ Usage: andesite-server <command> --vault /absolute/vault --state /absolute/priva
   vault-watch /absolute/vault [--state /absolute/private-state]
                                    (connect, reconcile, then continuously monitor until stopped)
   api-serve /absolute/vault [--port 8788] [--state /absolute/private-state]
-                                   (Hummingbird authenticated loopback read-only HTTP proxy)
+                                   (authenticated loopback GET plus version-conditional Markdown PUT)
   init | reconcile | status | search <phrase>
-  watch    (macOS FSEvents plus read-only HTTP on state/andesite-read.sock; SIGINT/SIGTERM to stop)
+  watch    (macOS FSEvents plus same-user HTTP on state/andesite-read.sock; SIGINT/SIGTERM to stop)
   snapshots [document-id-or-historical-path]
   snapshot-inspect <snapshot-id>
   snapshot-compare <before-id> <after-id>
   snapshot-export <snapshot-id> /absolute/new-file-outside-vault-and-state
   snapshot-restore <snapshot-id> --in-place
+  document-edit <document-id> <expected-revision-id> --stdin
+                                   (journal-backed edit of an existing Markdown note only)
   mutation-journal    (all operations, including conflicts and recovery outcomes)
   mutation-inspect <operation-id>
   mutation-resolve <operation-id> --strategy <accept-current|preserve-current|complete-published|cancel-unpublished>
@@ -127,7 +129,8 @@ do {
     } else {
     let counts: [String: ClosedRange<Int>] = ["init": 0...0, "reconcile": 0...0, "status": 0...0, "search": 1...1, "watch": 0...0,
         "snapshots": 0...1, "snapshot-inspect": 1...1, "snapshot-compare": 2...2, "snapshot-export": 2...2,
-        "snapshot-restore": 2...2, "snapshot-storage": 0...0, "mutation-journal": 0...0, "snapshot-config": 2...2, "mutation-inspect": 1...1, "mutation-resolve": 3...3, "mutation-export": 3...3, "mutation-artifacts": 0...0, "mutation-cleanup": 1...1]
+        "snapshot-restore": 2...2, "document-edit": 3...3,
+        "snapshot-storage": 0...0, "mutation-journal": 0...0, "snapshot-config": 2...2, "mutation-inspect": 1...1, "mutation-resolve": 3...3, "mutation-export": 3...3, "mutation-artifacts": 0...0, "mutation-cleanup": 1...1]
     guard args.count >= 5, let count = counts[args[0]], count.contains(args.count - 5), args[1] == "--vault", args[3] == "--state" else { throw CLIError.usage }
     if args[0] == "snapshot-restore", args[6] != "--in-place" { throw CLIError.usage }
     let runtime = try VaultRuntime(configuration: VaultConfiguration(vaultDirectory: args[2], stateDirectory: args[4]))
@@ -176,6 +179,16 @@ do {
         case "snapshot-restore":
             let op = try runtime.restoreSnapshot(identifier(args[5]))
             print("Restored document=\(hex(op.entryID)) path=\(op.path) snapshot=\(hex(op.snapshotID)) preimage=\(hex(op.preimageID)) revision=\(hex(op.revisionID)) operation=\(hex(op.id)) state=\(op.state)")
+        case "document-edit":
+            guard args[7] == "--stdin" else { throw CLIError.usage }
+            // Bound stdin before any journal writes. An oversized request
+            // cannot force the owner to buffer arbitrarily large input.
+            let input = try FileHandle.standardInput.read(upToCount: 256 * 1024 + 1) ?? Data()
+            guard input.count <= 256 * 1024 else { throw CLIError.usage }
+            let op = try runtime.editDocument(identifier(args[5]),
+                                              expectedRevision: identifier(args[6]),
+                                              contents: input)
+            print("Edited document=\(hex(op.entryID)) revision=\(hex(op.revisionID)) preimage=\(hex(op.preimageID)) operation=\(hex(op.id)) state=\(op.state)")
         case "mutation-inspect":
             let inspection = try runtime.inspectMutation(identifier(args[5]))
             let op = inspection.operation

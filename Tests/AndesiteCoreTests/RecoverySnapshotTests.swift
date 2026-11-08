@@ -348,7 +348,7 @@ private extension RuntimeFixture {
     #expect(throws: ExternalCaptureError.invalidMarkdown) { try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: identity, path: path, maximumBytes: 1024, debounce: 0) }
     let upgraded = try VaultRuntime(configuration: f.configuration)
     #expect(upgraded.vaultID == identity)
-    #expect(try db.scalarText("PRAGMA user_version") == "7")
+    #expect(try db.scalarText("PRAGMA user_version") == "8")
     #expect(try upgraded.status().revisions == 2 && upgraded.status().openIncidents == 1)
     let snapshot = try #require(upgraded.snapshots().first)
     #expect(snapshot.reason == "recovery" && snapshot.entryID == old.entryID)

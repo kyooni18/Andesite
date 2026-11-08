@@ -217,109 +217,177 @@ public enum VaultLinkGraph {
         return documents
     }
 
-    /// A low-priority scheduled operation, never called from an HTTP handler.
-    /// Reuses parsed syntax from unchanged revision IDs; when namespace names
-    /// move, all in-memory references are re-resolved without rereading notes.
+    /// Start a cooperative build on the existing single owner. Reading the
+    /// bounded catalog is a small operation; Markdown/object IO is deferred
+    /// to Builder.step() in limited slices of the watch loop.
+    static func begin(db: SQLiteConnection, vaultID: Data,
+                      previous: Snapshot?) throws -> Builder {
+        try Builder(current: documents(db: db, vaultID: vaultID),
+                    previous: previous)
+    }
+
+    final class Builder {
+        private let current: [IndexedDocument]
+        private let previous: Snapshot?
+        private let oldNodes: [Data: Node]
+        private var nodes: [Node] = []
+        private var totalBytes = 0
+        private var totalReferences = 0
+        private var parsed = 0
+        private var reused = 0
+        private var byPath: [String: [Int]] = [:]
+        private var byName: [String: [Int]] = [:]
+        private var byAlias: [String: [Int]] = [:]
+        private var outgoing: [Data: [VaultLinkMention]] = [:]
+        private var incoming: [Data: [VaultLinkMention]] = [:]
+        private var resolving = 0
+        private var indexed = false
+        private let unchanged: Bool
+
+        fileprivate init(current: [IndexedDocument], previous: Snapshot?) throws {
+            self.current = current
+            self.previous = previous
+            self.oldNodes = Dictionary(uniqueKeysWithValues: (previous?.nodes ?? []).map {
+                ($0.document.id, $0)
+            })
+            self.unchanged = previous.map { old in
+                old.nodes.count == current.count &&
+                zip(old.nodes, current).allSatisfy { prior, head in
+                    prior.document.id == head.id &&
+                    prior.document.revisionID == head.revisionID &&
+                    prior.document.path == head.path &&
+                    prior.document.hash == head.hash &&
+                    prior.document.byteLength == head.byteLength
+                }
+            } ?? false
+        }
+
+        var processedDocuments: Int { nodes.count }
+        var totalDocuments: Int { current.count }
+        var resolvedDocuments: Int { resolving }
+
+        /// Does at most maxDocuments notes in one slice and never reads more
+        /// than maxBytes of changed Markdown per slice (unless the first
+        /// document itself is larger, in which case its 256 KiB cap applies).
+        /// Resolution also advances at most maxDocuments sources per call.
+        /// A snapshot is returned only at full completion.
+        func step(objects: ObjectStore,
+                  maxDocuments: Int = 8,
+                  maxBytes: Int = 256 * 1024) throws -> BuildResult? {
+            guard maxDocuments > 0, maxBytes > 0 else {
+                throw VaultLinkGraphError.invalidQuery
+            }
+            if unchanged, let previous {
+                return BuildResult(snapshot: previous, parsed: 0,
+                                   reused: current.count, changed: false)
+            }
+
+            if nodes.count < current.count {
+                var count = 0
+                var cost = 0
+                while nodes.count < current.count, count < maxDocuments {
+                    let head = current[nodes.count]
+                    guard head.byteLength <= maximumDocumentBytes,
+                          totalBytes + head.byteLength <= maximumTotalBytes else {
+                        throw VaultLinkGraphError.graphTooLarge
+                    }
+                    let cached = oldNodes[head.id]
+                    let unchangedHead = cached?.document.revisionID == head.revisionID &&
+                                        cached?.document.hash == head.hash &&
+                                        cached?.document.byteLength == head.byteLength
+                    if !unchangedHead && count > 0 && cost + head.byteLength > maxBytes {
+                        break
+                    }
+                    let node: Node
+                    if unchangedHead, let cached {
+                        node = Node(document: head, references: cached.references,
+                                    headings: cached.headings, blocks: cached.blocks,
+                                    aliases: cached.aliases)
+                        reused += 1
+                    } else {
+                        let bytes = try DocumentCatalog.content(
+                            objects: objects, document: head,
+                            maximumBytes: maximumDocumentBytes)
+                        guard let text = String(data: bytes, encoding: .utf8) else {
+                            throw VaultLinkGraphError.inconsistentCatalog
+                        }
+                        let facts = try MarkdownAnalyzer.analyze(bytes)
+                        var refs = ObsidianLinks.extract(text).map {
+                            RawReference(syntax: "wikilink", target: $0.target,
+                                         fragment: $0.fragment, display: $0.alias, embed: $0.embed)
+                        }
+                        for destination in facts.linkDestinations {
+                            let parts = destination.split(separator: "#", maxSplits: 1,
+                                                          omittingEmptySubsequences: false)
+                            refs.append(RawReference(
+                                syntax: "markdown", target: String(parts[0]),
+                                fragment: parts.count == 2 ? String(parts[1]) : nil,
+                                display: nil, embed: false))
+                        }
+                        node = Node(document: head, references: refs,
+                                    headings: facts.headings.map(\.text),
+                                    blocks: blockIDs(text), aliases: aliases(text))
+                        parsed += 1
+                        cost += head.byteLength
+                    }
+                    guard node.references.count <= maximumPerDocumentMentions,
+                          totalReferences + node.references.count <= maximumMentions else {
+                        throw VaultLinkGraphError.graphTooLarge
+                    }
+                    totalBytes += head.byteLength
+                    totalReferences += node.references.count
+                    nodes.append(node)
+                    count += 1
+                }
+                if nodes.count < current.count { return nil }
+            }
+
+            if !indexed {
+                for index in nodes.indices {
+                    let note = nodes[index]
+                    byPath[pathKey(note.document.path), default: []].append(index)
+                    byName[key(baseName(note.document.path)), default: []].append(index)
+                    for alias in note.aliases {
+                        byAlias[key(alias), default: []].append(index)
+                    }
+                }
+                indexed = true
+            }
+
+            let limit = min(nodes.count, resolving + maxDocuments)
+            while resolving < limit {
+                let note = nodes[resolving]
+                var mentions: [VaultLinkMention] = []
+                for link in note.references {
+                    let mention = resolve(link, source: note, nodes: nodes,
+                                          byPath: byPath, byName: byName, byAlias: byAlias)
+                    mentions.append(mention)
+                    if let id = mention.documentID {
+                        incoming[id, default: []].append(mention)
+                    }
+                }
+                outgoing[note.document.id] = mentions
+                resolving += 1
+            }
+            if resolving < nodes.count { return nil }
+            return BuildResult(snapshot: Snapshot(
+                nodes: nodes,
+                documentIDs: Set(nodes.map { $0.document.id }),
+                outgoing: outgoing, incoming: incoming),
+                parsed: parsed, reused: reused, changed: true)
+        }
+    }
+
+    /// Synchronous explicit maintenance API kept for CLI and tests. The
+    /// continuously running watcher calls Builder.step() instead.
     static func prepare(db: SQLiteConnection, objects: ObjectStore,
                         vaultID: Data, previous: Snapshot?) throws -> BuildResult {
-        let current = try documents(db: db, vaultID: vaultID)
-        if let previous, previous.nodes.count == current.count,
-           zip(previous.nodes, current).allSatisfy({ old, new in
-               old.document.id == new.id &&
-               old.document.revisionID == new.revisionID &&
-               old.document.path == new.path &&
-               old.document.hash == new.hash &&
-               old.document.byteLength == new.byteLength
-           }) {
-            return BuildResult(snapshot: previous, parsed: 0,
-                               reused: current.count, changed: false)
-        }
-
-        let oldNodes = Dictionary(uniqueKeysWithValues: (previous?.nodes ?? []).map {
-            ($0.document.id, $0)
-        })
-        var nodes: [Node] = []
-        var totalBytes = 0
-        var totalReferences = 0
-        var parsed = 0
-        var reused = 0
-
-        for document in current {
-            guard document.byteLength <= maximumDocumentBytes,
-                  totalBytes + document.byteLength <= maximumTotalBytes else {
-                throw VaultLinkGraphError.graphTooLarge
-            }
-            let node: Node
-            if let cached = oldNodes[document.id],
-               cached.document.revisionID == document.revisionID &&
-               cached.document.hash == document.hash &&
-               cached.document.byteLength == document.byteLength {
-                node = Node(document: document, references: cached.references,
-                            headings: cached.headings, blocks: cached.blocks,
-                            aliases: cached.aliases)
-                reused += 1
-            } else {
-                let bytes = try DocumentCatalog.content(objects: objects, document: document,
-                                                        maximumBytes: maximumDocumentBytes)
-                guard let text = String(data: bytes, encoding: .utf8) else {
-                    throw VaultLinkGraphError.inconsistentCatalog
-                }
-                let facts = try MarkdownAnalyzer.analyze(bytes)
-                var refs = ObsidianLinks.extract(text).map {
-                    RawReference(syntax: "wikilink", target: $0.target,
-                                 fragment: $0.fragment, display: $0.alias, embed: $0.embed)
-                }
-                for destination in facts.linkDestinations {
-                    let parts = destination.split(separator: "#", maxSplits: 1,
-                                                  omittingEmptySubsequences: false)
-                    refs.append(RawReference(syntax: "markdown", target: String(parts[0]),
-                                             fragment: parts.count == 2 ? String(parts[1]) : nil,
-                                             display: nil, embed: false))
-                }
-                node = Node(document: document, references: refs,
-                            headings: facts.headings.map(\.text),
-                            blocks: blockIDs(text), aliases: aliases(text))
-                parsed += 1
-            }
-            guard node.references.count <= maximumPerDocumentMentions,
-                  totalReferences + node.references.count <= maximumMentions else {
-                throw VaultLinkGraphError.graphTooLarge
-            }
-            totalBytes += document.byteLength
-            totalReferences += node.references.count
-            nodes.append(node)
-        }
-
-        var byPath: [String: [Int]] = [:]
-        var byName: [String: [Int]] = [:]
-        var byAlias: [String: [Int]] = [:]
-        for index in nodes.indices {
-            let node = nodes[index]
-            byPath[pathKey(node.document.path), default: []].append(index)
-            byName[key(baseName(node.document.path)), default: []].append(index)
-            for alias in node.aliases {
-                byAlias[key(alias), default: []].append(index)
+        let builder = try begin(db: db, vaultID: vaultID, previous: previous)
+        while true {
+            if let result = try builder.step(objects: objects) {
+                return result
             }
         }
-
-        var outgoing: [Data: [VaultLinkMention]] = [:]
-        var incoming: [Data: [VaultLinkMention]] = [:]
-        for node in nodes {
-            var mentions: [VaultLinkMention] = []
-            for link in node.references {
-                let mention = resolve(link, source: node, nodes: nodes,
-                                      byPath: byPath, byName: byName, byAlias: byAlias)
-                mentions.append(mention)
-                if let targetID = mention.documentID {
-                    incoming[targetID, default: []].append(mention)
-                }
-            }
-            outgoing[node.document.id] = mentions
-        }
-        return BuildResult(snapshot: Snapshot(nodes: nodes,
-                                               documentIDs: Set(nodes.map { $0.document.id }),
-                                               outgoing: outgoing, incoming: incoming),
-                           parsed: parsed, reused: reused, changed: true)
     }
 
     private static func fragmentStatus(_ fragment: String?, on node: Node) -> String {

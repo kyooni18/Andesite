@@ -9,7 +9,7 @@ public enum CatalogMigrationError: Error, Equatable {
 /// safe to use as a sync service until general operations/recovery and the
 /// remaining protocol tables are implemented (the local restore journal is v6). Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 7
+    public static let currentVersion = 8
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -101,6 +101,15 @@ public enum CatalogSchema {
                     )
                     """)
                 try db.execute("PRAGMA user_version=7")
+            }
+            if version < 8 {
+                // Extend the proven restore journal to carry an immutable
+                // replacement object for conditional user edits. The original
+                // snapshot FK still points to a real historical snapshot;
+                // no speculative revision enters the recovery history.
+                try db.execute("ALTER TABLE mutation_journal ADD COLUMN replacement_hash BLOB REFERENCES objects(hash)")
+                try db.execute("ALTER TABLE mutation_journal ADD COLUMN intent_kind TEXT NOT NULL DEFAULT 'restore' CHECK(intent_kind IN ('restore','edit'))")
+                try db.execute("PRAGMA user_version=8")
             }
         }
     }
