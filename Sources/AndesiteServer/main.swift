@@ -19,6 +19,7 @@ func describe(_ snapshot: RecoverySnapshot) -> String {
 let usage = """
 Usage: andesite-server <command> --vault /absolute/vault --state /absolute/private-state [arguments]
   init | reconcile | status | search <phrase>
+  watch    (macOS FSEvents continuous local reconciliation; SIGINT/SIGTERM to stop)
   snapshots [document-id-or-historical-path]
   snapshot-inspect <snapshot-id>
   snapshot-compare <before-id> <after-id>
@@ -37,7 +38,7 @@ Snapshot expiration is metadata only; no snapshots, revisions or objects are pru
 """
 let args = Array(CommandLine.arguments.dropFirst())
 do {
-    let counts: [String: ClosedRange<Int>] = ["init": 0...0, "reconcile": 0...0, "status": 0...0, "search": 1...1,
+    let counts: [String: ClosedRange<Int>] = ["init": 0...0, "reconcile": 0...0, "status": 0...0, "search": 1...1, "watch": 0...0,
         "snapshots": 0...1, "snapshot-inspect": 1...1, "snapshot-compare": 2...2, "snapshot-export": 2...2,
         "snapshot-restore": 2...2, "snapshot-storage": 0...0, "mutation-journal": 0...0, "snapshot-config": 2...2, "mutation-inspect": 1...1, "mutation-resolve": 3...3, "mutation-export": 3...3, "mutation-artifacts": 0...0, "mutation-cleanup": 1...1]
     guard args.count >= 5, let count = counts[args[0]], count.contains(args.count - 5), args[1] == "--vault", args[3] == "--state" else { throw CLIError.usage }
@@ -48,6 +49,18 @@ do {
         case "init", "reconcile":
             let report = try runtime.reconcile()
             print("discovered=\(report.discovered) revisionsCreated=\(report.revisionsCreated) unchanged=\(report.unchanged) invalidMarkdown=\(report.invalidMarkdown) deleted=\(report.deleted) renamed=\(report.renamed) snapshotsCreated=\(report.snapshotsCreated)")
+        case "watch":
+            #if os(macOS)
+            // Keep the exclusive state lock and synchronous coordinator alive
+            // for the entire service lifetime. No network listener is started.
+            VaultMonitor.installTerminationHandlers()
+            let monitor = try VaultMonitor(runtime: runtime, vaultDirectory: args[2])
+            try monitor.run(report: { line in
+                FileHandle.standardOutput.write(Data((line + "\n").utf8))
+            })
+            #else
+            throw CLIError.usage
+            #endif
         case "search":
             for hit in try runtime.search(args[5]) { print("\(hex(hit.entryID))\t\(hit.title)") }
         case "snapshots":

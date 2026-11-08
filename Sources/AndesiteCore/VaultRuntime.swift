@@ -375,6 +375,28 @@ public final class VaultRuntime {
         return usage
     }
 
+    /// Promote already durably captured heads when their per-document minimum
+    /// snapshot interval expires. This never reads or writes vault source files.
+    /// The continuous monitor calls it on a timer; editor events are only hints
+    /// that drive full reconciliation through the existing scanner.
+    @discardableResult
+    public func scheduleDueSnapshots(at date: Date = Date()) throws -> Int {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        try RecoverySnapshots.validateTime(date)
+        // Neither a failed scan nor a conflicting restore can silently publish
+        // snapshots as though the currently observed filesystem were verified.
+        guard try status().state == "ready" else { return 0 }
+        try journal().assertResolved()
+        return try r.db.transaction {
+            var created = 0
+            for row in try r.db.queryValues("SELECT id FROM entries WHERE vault_id=? AND state='live' AND kind='markdown' ORDER BY id", bindings: [.blob(vaultID)]) {
+                guard case .blob(let id) = row[0] else { throw VaultRuntimeError.inconsistentCatalog }
+                if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: id, at: date) { created += 1 }
+            }
+            return created
+        }
+    }
+
     @discardableResult
     public func flushSnapshots(at date: Date = Date()) throws -> Int {
         try flushSnapshotHeads(at: date, reason: "shutdown")
