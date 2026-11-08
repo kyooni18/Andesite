@@ -2,7 +2,9 @@
 
 Andesite implements a small **same-user, bounded** HTTP/1.1 API over a
 Unix domain socket inside the running FSEvents watcher. This is not the
-Hummingbird loopback server, multi-user authentication or v1 sync protocol.
+Hummingbird loopback server or multi-user authentication; the separate
+peer archive sync v1 contract is documented in
+[backend architecture and archive transport](andesite-backend-and-sync.md).
 The watcher itself opens no TCP port. The separate authenticated Hummingbird
 sidecar is documented in [the HTTP server contract](andesite-http-server.md).
 
@@ -43,7 +45,7 @@ read the reported socket path in the watcher logs. On clean shutdown it
 is unlinked; after SIGKILL it is reused only after acquiring the state
 lock and verifying that the old path is a same-user Unix socket.
 
-## Read-only endpoints
+## Read endpoints (and bounded sync inbox POST)
 
 All methods except GET are rejected. Every response sends
 `Cache-Control: no-store`, no persistent HTTP connection and no
@@ -94,12 +96,18 @@ serialized with reconciliation, snapshot registration and journal recovery.
 There is no additional SQLite connection, HTTP task executor or concurrent
 database access. At most one accepted request is handled per loop. Headers
 are bounded to 8 KiB, with a 200 ms absolute receive deadline, and responses
-have a bounded send budget. Bodies, uploads and protocol upgrades are rejected.
+have a bounded send budget. GET request bodies and protocol upgrades are rejected. Only the
+specific revision-conditioned Markdown PUT and replica archive POST
+accept bounded request bodies, with separate content-type and length
+validation.
 Response JSON escapes user-controlled paths and titles; internal exceptions
 do not expose SQL or filesystem details to the caller.
 
-No endpoint edits the source vault, restores a snapshot, changes retention,
-resolves a quarantine, prunes objects or retires journal artifacts.
+Only the existing-note revision-conditioned PUT modifies Vault
+Markdown through its verified recovery journal. Archive POSTs
+modify private replication inbox records only; they do not apply
+remote content. No HTTP endpoint creates/deletes notes, restores a
+snapshot, resolves quarantine, prunes objects or retires artifacts.
 A second Andesite CLI process still cannot open the state while the watcher
 holds the exclusive lock; use the Python client for reads, and stop the watcher
 for maintenance operations.
@@ -107,8 +115,8 @@ for maintenance operations.
 ## Current limitations
 
 There is no multi-client HTTP concurrency, streaming, HTTP keep-alive,
-subscriptions, TCP/TLS transport, network authentication, Linux watcher or
-remote synchronization. Listing currently gathers the catalog snapshot list
+subscriptions, built-in TCP/TLS endpoint, multi-tenant
+remote authentication, Linux watcher or automatic remote merge/apply. Listing currently gathers the catalog snapshot list
 before applying limit and offset, so huge histories need query-level
 pagination optimization. Kernel event overflow and actual storage power-loss
 durability have not been qualified. Snapshot capture cannot reconstruct
@@ -130,3 +138,9 @@ tag, property and value selectors. The query string additionally supports
 a bounded tag:#project and [property:value] search subset. See
 [Obsidian metadata API](andesite-obsidian-metadata.md); no source YAML
 is modified by GET requests.
+
+The same private socket also supports bounded GET for the local sync
+feed, received-inbox status, and archived changes/snapshots, and
+authenticated-sidecar POST for verified peer archive receipts.
+See [backend modes and sync](andesite-backend-and-sync.md). The archive
+never applies remote content to active Markdown files.

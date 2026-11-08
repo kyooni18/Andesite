@@ -3,8 +3,9 @@
 The HTTP API is written in Swift 6 using the pinned Hummingbird 2.28.0
 dependency. It listens on **127.0.0.1 only** and serves authenticated,
 GET access to the existing single-owner Vault index and snapshots,
-plus one revision-conditional Markdown edit route. It does not expose
-creation, deletion, restoration, arbitrary file paths, SQL access or sync.
+plus one revision-conditional Markdown edit route and separate
+authenticated peer-archive sync transfer routes. It does not expose
+arbitrary file paths, remote merge/apply, creation, deletion or SQL.
 
 ## Run
 
@@ -53,6 +54,12 @@ before Hummingbird binds TCP.
 | `/v1/tags?limit=50&offset=0` | Canonical frontmatter/inline tag summary with document counts |
 | `/v1/properties?limit=50&offset=0` | Indexed YAML property keys, observed types and document counts |
 | `/v1/documents/ID/properties` | Revision-aligned typed YAML properties, tags and diagnostics |
+| `/v1/sync/changes?after=0&limit=8` | Immutable source revision/change feed, bounded JSON |
+| `/v1/sync/snapshots/ID` | Verified immutable source recovery snapshot |
+| `/v1/sync/inbox` | Remote archived Vaults and acknowledged cursors |
+| `/v1/sync/inbox/changes?source=HEX&epoch=HEX&after=0` | Archived remote changes for pull/review |
+| `/v1/sync/inbox/snapshots?source=HEX&epoch=HEX` | Archived remote snapshot IDs |
+| `/v1/sync/inbox/snapshots/ID?source=HEX&epoch=HEX` | Download archived remote snapshot |
 | `/v1/status` | Vault catalog/readiness |
 | `/v1/search?q=phrase&limit=50` | FTS with optional tag/property/value filters, limited Obsidian tag:/[property:value] syntax |
 | `/v1/snapshots?path=note.md&limit=50&offset=0` | Snapshot history metadata |
@@ -97,6 +104,17 @@ No source note is modified by refresh. The serial cache refresh can
 still delay read APIs for large Vaults; see
 [work scheduler architecture](andesite-work-queue.md).
 
+Separate write routes `POST /v1/sync/changes` and
+`POST /v1/sync/snapshots` archive foreign revision events
+and recovery snapshots **without applying them to active files**.
+The server verifies hashes, order, version and idempotent replay before
+acknowledgement. A source-side Swift client resumes from its durable
+per-destination and per-snapshot receipts. These JSON requests are
+limited to 256 KiB, with 128-KiB inline objects. They require bearer
+authentication and secure HTTPS termination or a tunnel for remote
+access; the bundled HTTP sidecar still binds loopback only.
+See [backend modes and peer archive protocol](andesite-backend-and-sync.md).
+
 One narrow write route is also supported: PUT /v1/documents/ID/content.
 It requires the same bearer token, a quoted exact If-Match revision
 from GET /v1/documents, Content-Type text/markdown; charset=utf-8,
@@ -140,9 +158,10 @@ the watcher's private same-UID Unix socket. The actor permits one
 in-flight backend query and rejects concurrent attempts with 503 rather
 than creating a second writer or unbounded queue. Synchronous socket I/O
 runs off NIO event loops. The bridge never forwards arbitrary headers or bearer credentials.
-Its PUT transport is restricted to a single exact-document edit route
-with a version precondition and bounded Markdown body; no other
-mutation methods reach the backend.
+Its PUT transport is restricted to a single version-conditioned
+document edit route. The separate POST transport accepts only bounded
+JSON for verified replica archive ingestion, never arbitrary paths.
+No other mutation methods reach the backend.
 
 The bridge verifies the response status, content length and content type
 and caps the entire reply at 1.1 MiB. If the watcher stops, the server

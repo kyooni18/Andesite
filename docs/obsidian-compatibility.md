@@ -49,7 +49,7 @@ means no equivalent. Backend data compatibility is not desktop UI parity.
 | Page preview, command palette, workspaces | **Missing** | No editor UI |
 | Plugins, themes, CSS snippets | **Missing** | No user extension runtime |
 | Web Clipper, URI hooks, slides, audio recorder | **Missing** | No corresponding app integrations |
-| Sync and Publish | **Missing** | No remote authenticated synchronization/publication |
+| Sync and Publish | **Partial (archive transport)** | Authenticated SHA-256-checked changes and snapshot push/pull; persistent sequence and snapshot receipts; no remote apply/merge, end-to-end encryption, conflict UI or publishing |
 | Cross-platform desktop/mobile | **Missing** | macOS-first backend; Hummingbird HTTP macOS 14+ |
 
 Full feature parity is **not achieved**. Andesite's strongest distinctive
@@ -63,6 +63,13 @@ area is recovery integrity, not Obsidian's linked knowledge UI.
   Unicode/emoji/code exclusions, malformed YAML status, current-head
   SQLite filters, v8-v9 immutable revision backfill and HTTP query guards.
 - [Obsidian metadata API and compatibility boundary](andesite-obsidian-metadata.md).
+- [Single Swift backend and archive sync transport](andesite-backend-and-sync.md):
+  embedded versus server mode, inbox receipts, idempotent remote upload
+  and explicit non-application/conflict limits.
+- `AndesiteSyncArchiveTests.swift` and
+  `scripts/test-sync-server.sh`: separate-Vault authenticated
+  archive, cursor replays, content hashes, snapshot receipts, remote
+  retrieval, and unchanged receiver notes.
 - `DocumentCatalogTests.swift`: paginated live heads, stable IDs,
   immutable current content, rename/deletion history, default .obsidian,
   .trash and .git preservation, lexical Obsidian wiki syntax.

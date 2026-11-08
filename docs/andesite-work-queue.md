@@ -100,3 +100,15 @@ andesite-conditional-edit.md.
 Full link resolution, unlinked mentions, Properties, Bases, Canvas,
 editor UI and plugins remain tracked in
 `docs/obsidian-compatibility.md`.
+
+## External replication scheduling
+
+The background job queue is still the owner of local scanning/indexing;
+transport logic is intentionally separate. A host app can schedule
+bounded immutable history exports and async upload after a successfully
+committed revision (not on every keystroke), but no unconditional
+always-running network process is installed. The CLI offers explicit
+`sync-push`. An eventual app worker should wake on new durable
+change sequences or snapshots and resume using persistent peer receipts.
+Remote archive contents are never applied as filesystem edits by this
+queue. See [backend and archive protocol](andesite-backend-and-sync.md).

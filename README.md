@@ -103,9 +103,9 @@ See the [Vault session lifecycle](docs/andesite-vault-session.md).
 ## Authenticated local HTTP server (Hummingbird)
 
 Andesite offers an optional **authenticated Hummingbird HTTP/1.1 server**
-bound to 127.0.0.1, with a 64-hex-character bearer token. It forwards
-GET requests and a narrow existing-note conditional PUT into the
-already-running watcher without opening a second SQLite connection.
+bound to 127.0.0.1, with a 64-hex-character bearer token. It forwards GET requests, conditional existing-note PUTs and
+authenticated peer-archive POSTs into the already-running watcher
+without opening a second SQLite connection.
 
 ```sh
 # Terminal A: existing Vault monitor
@@ -149,9 +149,17 @@ python3 scripts/andesite-api.py --state /absolute/private/state documents --tag 
 python3 scripts/andesite-api.py --state /absolute/private/state search phrase --property priority --value 5
 ```
 
-No LAN listener, CORS, TLS, remote auth, file creation/deletion API,
-remote restore endpoint, or sync is provided yet. See [the Hummingbird API contract](docs/andesite-http-server.md)
-and the end-to-end `scripts/test-api-server.sh` test.
+The same Swift backend can run in-process through `VaultSession.backend`
+or as the headless watcher behind the Hummingbird API. An opt-in
+authenticated peer archive transport now uploads/retrieves immutable
+revision events and recovery snapshots with durable per-peer receipts.
+**It does not yet apply or merge remote edits into the local Vault**.
+There is no public LAN listener, bundled TLS endpoint, multi-tenant
+remote authentication, file creation/deletion API or remote restore
+endpoint. See [backend deployment and sync](docs/andesite-backend-and-sync.md),
+[the Hummingbird API contract](docs/andesite-http-server.md) and the
+integration tests `scripts/test-api-server.sh` and
+`scripts/test-sync-server.sh`.
 Track what still differs from Obsidian in the
 [compatibility register](docs/obsidian-compatibility.md).
 The [work scheduler design](docs/andesite-work-queue.md) explains
@@ -240,7 +248,9 @@ maintenance/write operations.
 
 FSEvents is advisory; intermediate edits between scans are not guaranteed
 versions, and physical power-loss behavior is not qualified. Source Markdown
-is never modified by the watcher. There is no **TCP** listener or sync service.
+is never modified by observation alone. The watcher has no **TCP**
+listener; the optional loopback HTTP sidecar exposes authenticated
+archive transfer, but not automatic remote application or merging.
 
 ## What is integrated
 
@@ -251,7 +261,8 @@ owner; call from one blocking executor, never an NIO event loop. Throwing
 `shutdown()` flushes pending observed heads, closes resources, then releases
 ownership (even if flushing fails). Call it explicitly and handle its errors;
 `deinit` only releases resources. Startup errors release resources too.
-A future HTTP layer can use this coordinator behind serialized blocking offload.
+The same owner is shared by the in-process `AndesiteBackend`
+facade and the authenticated Unix-socket/Hummingbird API adapters.
 
 * A no-follow, descriptor-relative recursive scan discovers case-insensitive
   `.md` files. Attachments are not ingested in this milestone. Symlinks, special
@@ -467,10 +478,12 @@ mutate the vault; it is a local subset, not the full v1 mutation service.
 
 Not implemented: Linux inotify monitoring, automatic mutation retries, Linux in-place restoration,
 general-purpose server mutations (create/delete/rename),
-attachment scanning, quotas/GC, remote HTTP authentication and sync,
-full-vault sync manifests/cursors/offline synchronization or web client.
-The macOS-only Unix-socket API authorizes same-UID peers; it does not implement
-the planned multi-user, remotely authenticated v1 API.
+attachment scanning, quotas/GC, end-to-end encrypted collaboration,
+automatic remote history *application* and conflict merging, chunked
+large-object transfer, full-vault manifest/attachment sync or web client.
+The optional Hummingbird sidecar has bearer authentication on loopback
+and an archive transfer protocol, but no bundled public TLS endpoint
+or multi-tenant remote access-control policy.
 Invalid UTF-8 bytes remain incident history, not valid Markdown snapshots; a file
 that was never valid has no document snapshot yet. The basic
 extractor now supports typed YAML frontmatter and indexed inline/YAML
@@ -483,18 +496,20 @@ implementation decisions, verified boundaries and remaining risks.
 ## Verification and next milestone
 
 `swift build` and `swift test` pass on the macOS/APFS development host with
-**85 tests** (76 prior plus nine YAML frontmatter/tag/search and
-migration/HTTP compatibility tests). They exercise FSEvents, snapshot promotion, durable mutation recovery,
+**89 tests** (prior 85 plus four focused archive/transport and embedded-session tests). They exercise FSEvents, snapshot promotion, durable mutation recovery,
 same-UID HTTP access, live document heads, pagination, immutable
 content, syntax-only Obsidian links, and safe preservation of
 the .obsidian, .trash and .git folders.
 Prior journal/recovery SIGKILL tests remain in the suite. Additional watcher
 smoke tests use only temporary vaults and preserve source bytes.
 
-Next: journal-backed file creation/deletion/rename, Obsidian-complete
+Next: conflict-aware remote revision mapping and merge/application,
+chunked content-addressed transfer for large objects, then
+journal-backed file creation/deletion/rename, Obsidian-complete
 heading/block links and unlinked mentions, and typed Properties/tag
-editing in the eventual UI. Canvas and Bases are deferred by design.
+editing in the eventual UI. Canvas and Bases remain deferred.
 Large-Vault cache budgets, cross-volume migration and Linux inotify
 remain separate priorities.
-Network HTTP mutations, remote sync, physical power-loss qualification
-and object garbage collection remain separate milestones.
+Remote conflict-aware application and automatic sync scheduling,
+physical power-loss qualification and object garbage collection
+remain separate milestones.
