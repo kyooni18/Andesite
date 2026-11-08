@@ -1,7 +1,7 @@
 import Foundation
 import AndesiteCore
 
-// Local-only CLI. No HTTP listener is started, including with no arguments.
+// Local-only CLI. Only watch starts a private same-user Unix-domain HTTP socket.
 enum CLIError: Error { case usage; case invalidIdentifier; case invalidPolicy }
 func hex(_ bytes: Data) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
 func identifier(_ text: String) throws -> Data {
@@ -19,7 +19,7 @@ func describe(_ snapshot: RecoverySnapshot) -> String {
 let usage = """
 Usage: andesite-server <command> --vault /absolute/vault --state /absolute/private-state [arguments]
   init | reconcile | status | search <phrase>
-  watch    (macOS FSEvents continuous local reconciliation; SIGINT/SIGTERM to stop)
+  watch    (macOS FSEvents plus read-only HTTP on state/andesite-read.sock; SIGINT/SIGTERM to stop)
   snapshots [document-id-or-historical-path]
   snapshot-inspect <snapshot-id>
   snapshot-compare <before-id> <after-id>
@@ -33,7 +33,7 @@ Usage: andesite-server <command> --vault /absolute/vault --state /absolute/priva
   mutation-cleanup --dry-run | --retire  (stop external editors before --retire)
   snapshot-storage
   snapshot-config <minimum-interval-seconds> <retention-seconds>
-Directories must already exist; state must be mode 0700. No HTTP listener.
+Directories must already exist; state must be mode 0700. No TCP listener.
 Snapshot expiration is metadata only; no snapshots, revisions or objects are pruned.
 """
 let args = Array(CommandLine.arguments.dropFirst())
@@ -51,11 +51,16 @@ do {
             print("discovered=\(report.discovered) revisionsCreated=\(report.revisionsCreated) unchanged=\(report.unchanged) invalidMarkdown=\(report.invalidMarkdown) deleted=\(report.deleted) renamed=\(report.renamed) snapshotsCreated=\(report.snapshotsCreated)")
         case "watch":
             #if os(macOS)
-            // Keep the exclusive state lock and synchronous coordinator alive
-            // for the entire service lifetime. No network listener is started.
+            // The API and watcher share one synchronous owner; neither
+            // opens a second database connection or a TCP listening port.
             VaultMonitor.installTerminationHandlers()
             let monitor = try VaultMonitor(runtime: runtime, vaultDirectory: args[2])
-            try monitor.run(report: { line in
+            let api = try VaultLocalHTTP(runtime: runtime, stateDirectory: args[4])
+            FileHandle.standardOutput.write(Data(
+                "watch-api socket=\(api.socketPath) transport=unix-http access=same-user\n".utf8))
+            try monitor.run(onIdle: { ready in
+                try api.poll(indexReady: ready)
+            }, report: { line in
                 FileHandle.standardOutput.write(Data((line + "\n").utf8))
             })
             #else

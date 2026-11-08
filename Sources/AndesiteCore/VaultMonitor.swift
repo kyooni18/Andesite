@@ -84,6 +84,7 @@ public final class VaultMonitor {
     /// object-integrity or journal errors are also visible and cannot cause any
     /// automatic repair, conflict resolution or artifact retirement.
     public func run(shouldStop: () -> Bool = { VaultMonitor.stopRequested },
+                    onIdle: (Bool) throws -> Void = { _ in },
                     report: (String) -> Void = { _ in }) throws {
         let initial = try runtime.reconcile()
         report("watch-ready discovered=\(initial.discovered) revisions=\(initial.revisionsCreated) snapshots=\(initial.snapshotsCreated)")
@@ -147,6 +148,10 @@ public final class VaultMonitor {
                 }
                 nextSnapshot = ProcessInfo.processInfo.systemUptime + settings.snapshotTick
             }
+            // HTTP is polled on this same thread, after all due reconciliation
+            // work. Never expose the indexed view while a dirty/rescan hint
+            // remains unresolved. The HTTP transport owns no SQLite handle.
+            try onIdle(dirtySince == nil)
             Thread.sleep(forTimeInterval: settings.polling)
         }
         report("watch-stopping")

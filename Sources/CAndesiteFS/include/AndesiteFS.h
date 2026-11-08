@@ -16,6 +16,13 @@ typedef struct {
 andesite_fsevents_watch *andesite_fsevents_start(const char *root, double latency);
 int andesite_fsevents_drain(andesite_fsevents_watch *watch, andesite_fsevents_events *out);
 void andesite_fsevents_stop(andesite_fsevents_watch *watch);
+/* Local HTTP/1.1 over a private AF_UNIX socket, never TCP. */
+typedef struct andesite_local_http andesite_local_http;
+int andesite_local_http_resolve_path(const char *state_directory, char *path, unsigned long capacity);
+andesite_local_http *andesite_local_http_open(const char *state_directory);
+int andesite_local_http_accept(andesite_local_http *server); /* -2: idle, -3: unauthorized, -1: error */
+long andesite_local_http_read_headers(int client, char *buffer, unsigned long capacity);
+void andesite_local_http_close(andesite_local_http *server);
 void andesite_monitor_install_stop_handlers(void);
 int andesite_monitor_stop_requested(void);
 #endif

@@ -156,6 +156,16 @@ public final class VaultRuntime {
         return try SearchIndex.search(db: r.db, vaultID: vaultID, phrase: phrase, limit: limit)
     }
 
+    /// Catalog-only query for the in-process read-only local API. Unlike the
+    /// interactive CLI search, never starts a nested scan or opens another
+    /// SQLite owner while the watcher holds its exclusive state lock.
+    public func searchIndexed(_ phrase: String, limit: Int = 50) throws -> [SearchIndexHit] {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
+        try journal().assertResolved()
+        return try SearchIndex.search(db: r.db, vaultID: vaultID, phrase: phrase, limit: limit)
+    }
+
     public func reconcile(at date: Date = Date()) throws -> ReconciliationReport {
         guard let r = resources else { throw VaultRuntimeError.closed }
         try journal().recover()

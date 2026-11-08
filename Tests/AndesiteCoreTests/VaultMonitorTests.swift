@@ -73,7 +73,12 @@ private func fastMonitorSettings(fallback: TimeInterval = 5) -> VaultMonitorSett
             edited = true
         }
         if line.contains("cause=periodic") { observedPeriodic = true }
-        if line.hasPrefix("watch-snapshots-created") { observedDueSnapshot = true }
+        if line.hasPrefix("watch-snapshots-created") ||
+            (line.hasPrefix("watch-scan") && line.contains("snapshots=1")) {
+            // The periodic full scan may legitimately promote the due head
+            // before the separate timer; both satisfy the snapshot policy.
+            observedDueSnapshot = true
+        }
     })
     #expect(edited)
     #expect(observedPeriodic && observedDueSnapshot, "reports=\(reports)")
