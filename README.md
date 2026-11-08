@@ -8,6 +8,44 @@ Network HTTP serving and remote synchronization are not implemented.**
 Use temporary test vaults, not production notes; filesystem/power-loss
 qualification and full v1 recovery remain outstanding.
 
+## Selected Vault paths (no database registry)
+
+Andesite intentionally does **not** add a vault-directory registry to SQLite
+or build a second index of selected Vaults. The selection list is just an
+array of absolute directory-path strings in `~/.andesite/vaults.json`:
+
+```json
+[
+  "/absolute/path/to/one-vault",
+  "/absolute/path/to/another-vault"
+]
+```
+
+On first use, Andesite creates `~/.andesite` (0700) and `vaults.json`
+(0600). This folder is under the user's home directory, **not inside a
+Vault**. Only paths are stored: no file contents, metadata inventory, hashes,
+snapshot bytes, index, database or state-directory paths.
+
+Manage the path list without opening or scanning any selected Vault:
+
+```sh
+.build/debug/andesite-server vault-list
+.build/debug/andesite-server vault-add /absolute/path/to/vault
+.build/debug/andesite-server vault-remove /absolute/path/to/vault
+```
+
+Registration requires an existing physical directory without symlinks;
+listing/removal still work when an external-drive Vault is disconnected.
+Registering twice is idempotent. Removal forgets the selected path only—it
+does not delete the Vault, its note contents or any existing state/history.
+Updates use a private advisory lock and atomic file replacement.
+
+**This is separate from the existing optional per-Vault backend.** Running
+`watch`/`reconcile` explicitly still uses the prior
+`--vault` and `--state` arguments, and continues maintaining
+its existing search/snapshot catalog. This change does not start indexing,
+enable a watcher or create a new SQLite database for registered selections.
+
 ## Build and exercise
 
 Requires Swift 6.2+, SQLite >= 3.35 with FTS5 and development headers/pkg-config.

@@ -18,6 +18,9 @@ func describe(_ snapshot: RecoverySnapshot) -> String {
 }
 let usage = """
 Usage: andesite-server <command> --vault /absolute/vault --state /absolute/private-state [arguments]
+  vault-list                        (show selected paths from ~/.andesite/vaults.json)
+  vault-add /absolute/vault         (remember selected path without scanning)
+  vault-remove /absolute/vault      (forget path without changing vault or history)
   init | reconcile | status | search <phrase>
   watch    (macOS FSEvents plus read-only HTTP on state/andesite-read.sock; SIGINT/SIGTERM to stop)
   snapshots [document-id-or-historical-path]
@@ -38,6 +41,19 @@ Snapshot expiration is metadata only; no snapshots, revisions or objects are pru
 """
 let args = Array(CommandLine.arguments.dropFirst())
 do {
+    if let command = args.first, ["vault-list", "vault-add", "vault-remove"].contains(command) {
+        let expected = command == "vault-list" ? 1 : 2
+        guard args.count == expected else { throw CLIError.usage }
+        let registry = try VaultPathRegistry()
+        switch command {
+        case "vault-list":
+            for path in try registry.list() { print(path) }
+        case "vault-add":
+            print(try registry.add(args[1]) ? "Saved vault path: \(args[1])" : "Already registered: \(args[1])")
+        default:
+            print(try registry.remove(args[1]) ? "Removed saved path: \(args[1])" : "Not registered: \(args[1])")
+        }
+    } else {
     let counts: [String: ClosedRange<Int>] = ["init": 0...0, "reconcile": 0...0, "status": 0...0, "search": 1...1, "watch": 0...0,
         "snapshots": 0...1, "snapshot-inspect": 1...1, "snapshot-compare": 2...2, "snapshot-export": 2...2,
         "snapshot-restore": 2...2, "snapshot-storage": 0...0, "mutation-journal": 0...0, "snapshot-config": 2...2, "mutation-inspect": 1...1, "mutation-resolve": 3...3, "mutation-export": 3...3, "mutation-artifacts": 0...0, "mutation-cleanup": 1...1]
@@ -144,6 +160,7 @@ do {
         do { try runtime.shutdown() }
         catch { FileHandle.standardError.write(Data("Snapshot flush also failed (captured revisions retained): \(error)\n".utf8)) }
         throw operationError
+    }
     }
 } catch {
     FileHandle.standardError.write(Data("Andesite refused operation: \(error)\n".utf8))
