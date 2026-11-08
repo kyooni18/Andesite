@@ -455,11 +455,12 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
 }
 
 @Test func relocatedRecoveryUsesInodesNotNamesOrHashes() throws {
-    for mode in ["file", "case", "unicode", "parent", "nested", "completed-parent"] {
+    for mode in ["file", "case", "unicode", "normalization", "parent", "nested", "completed-parent"] {
         let f = try RuntimeFixture(); defer { f.clean() }
         let (initial, snapshot) = try f.seeded()
         try FileManager.default.createDirectory(at: f.vault.appendingPathComponent("a/deep"), withIntermediateDirectories: true)
-        try FileManager.default.moveItem(at: f.vault.appendingPathComponent("note.md"), to: f.vault.appendingPathComponent("a/deep/note.md"))
+        let initialName = mode == "normalization" ? "cafe\u{301}.md" : "note.md"
+        try FileManager.default.moveItem(at: f.vault.appendingPathComponent("note.md"), to: f.vault.appendingPathComponent("a/deep/" + initialName))
         _ = try initial.reconcile()
         if mode == "completed-parent" { _ = try initial.restoreSnapshot(snapshot.id) }
         try initial.shutdown()
@@ -476,8 +477,15 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
             try FileManager.default.createDirectory(at: f.vault.appendingPathComponent("other"), withIntermediateDirectories: false)
             try FileManager.default.moveItem(at: f.vault.appendingPathComponent("a/deep"), to: f.vault.appendingPathComponent("other/moved")); parent = "other/moved/"
         default:
-            name = mode == "case" ? "NOTE.MD" : (mode == "unicode" ? "cafe\u{301}.md" : "renamed.md")
-            try FileManager.default.moveItem(at: f.vault.appendingPathComponent(parent + "note.md"), to: f.vault.appendingPathComponent(parent + name))
+            name = mode == "case" ? "NOTE.MD" : (mode == "unicode" ? "cafe\u{301}.md" : (mode == "normalization" ? "café.md" : "renamed.md"))
+            if mode == "normalization" {
+                // APFS may canonicalize equivalent names. Use an intermediate
+                // spelling, and never infer document identity from normalization.
+                try FileManager.default.moveItem(at: f.vault.appendingPathComponent(parent + initialName), to: f.vault.appendingPathComponent(parent + "intermediate.md"))
+                try FileManager.default.moveItem(at: f.vault.appendingPathComponent(parent + "intermediate.md"), to: f.vault.appendingPathComponent(parent + name))
+            } else {
+                try FileManager.default.moveItem(at: f.vault.appendingPathComponent(parent + initialName), to: f.vault.appendingPathComponent(parent + name))
+            }
         }
         if mode != "case" {
             try FileManager.default.createDirectory(at: f.vault.appendingPathComponent("a/deep"), withIntermediateDirectories: true)

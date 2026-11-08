@@ -10,7 +10,9 @@ process lock. No listener, watcher or background scheduler is started.
 ## Storage and migration
 
 Catalog version **5** added `snapshot_policy` and `recovery_snapshots`; version
-**6** adds `mutation_journal` and its state index, transactionally. No existing entries, revisions,
+**6** adds `mutation_journal` and its state index; **7** additively adds stage-creation
+identity, `mutation_decisions`, `mutation_decision_history`, `mutation_versions` and
+`mutation_retirements`, transactionally. No existing entries, revisions,
 incidents, events or immutable objects are removed or rewritten. An older
 supported catalog upgrades in place; a newer schema is refused. Keep a coherent
 backup of state before upgrading (with Andesite stopped); this is not a backup
@@ -146,13 +148,17 @@ at restore boundaries; see the mutation-specific matrix below.
 `expires_at` is fixed using the creation-time policy. Configuration updates are
 persisted and affect future snapshots only. `snapshot-storage` reports expiration
 eligibility, pending document count, logical snapshot bytes, unique snapshot bytes,
-all registered object bytes, and per-object snapshot/revision/incident reference
-counts (including resolved incidents and expired snapshots).
+all registered object bytes, and per-object snapshot/revision/incident/mutation
+version reference counts (including resolved incidents and expired snapshots).
+Allocated object/transient and journal artifact diagnostics are reported separately
+from these logical quantities; see the lifecycle accounting contract below.
 
 **No expiration pruning or destructive GC runs.** Expired snapshots remain listed
 and recoverable. Revision/incident retention is independent and presently
-indefinite. Usage excludes catalog/WAL size and unregistered orphan/temporary
-files, including retained mutation artifacts. Future pruning must be explicit, account for every reference/pin, and have
+indefinite. Usage excludes catalog/WAL size. Object-directory block accounting
+includes unregistered hash objects and transient object files, and separately
+reports known journal artifacts; unknown ownership is flagged as incomplete.
+Future pruning must be explicit, account for every reference/pin, and have
 crash-tested mark-and-sweep before unlinking any object. Expiration eligibility is
 not permission to remove an object shared with any revision, snapshot or incident.
 
@@ -249,14 +255,14 @@ identified by the journal references. Normal interval/retention policy is unchan
 | --- | --- |
 | No intent (including interrupted preimage/intent transaction) | No source modification was authorized. Any committed preimage survives; normal captured-head recovery may register the head. |
 | `prepared`, artifact absent | Mark `cancelled`; never retry a source write automatically. |
-| `prepared`, artifact present | `quarantined`: partial or unregistered stage has no durable identity. Preserve it; do not adopt or delete it. |
+| `prepared`, artifact present | `quarantined`: partial or unregistered stage is not automatically publishable. A v7 creation identity can authorize explicit preservation, never automatic exchange. |
 | `staged`, original still at target with exact fingerprint, stage still at artifact with exact identity/bytes | Mark `cancelled`, retain staging artifact. No restart publishes an unpublished restore. |
 | `staged` or `published`, stage inode/content at target and original inode/content at artifact, parents unchanged | Exchange already happened. Re-sync filesystem, publish the fixed revision/catalog transaction and complete. |
 | `catalogued`, both files still verified | Finish sync/verification and mark `completed`; never reallocate history. |
 | `completed` | Never touch visible target. Verify retained displaced inode/bytes for late writes; normal external edits to the visible target are left to reconciliation. |
 | `cancelled` | No automatic mutation. Any registered stage remains excluded by exact artifact identity in ordinary scanning. |
 | Any ambiguity or mismatch | Mark `quarantined`, preserve filesystem/object evidence. No destructive rollback, overwrite or artifact cleanup. |
-| `quarantined` | Remain quarantined on repeated opens. Explicit administrator-reviewed resolution is not implemented. |
+| `quarantined` | Remain quarantined until explicit verified resolution. Inspection/export remain available. |
 
 A catalog lock/I/O/trigger error does not get mislabeled a filesystem conflict;
 it leaves the durable last phase available for another recovery attempt. Once
@@ -273,30 +279,130 @@ winner. Exchange retains the displaced inode, even if an unexpected regular
 file was raced into the target. No symlink target is ever followed. The journal
 never automatically rolls back or deletes a preimage/artifact.
 
-An editor holding a file descriptor to the displaced inode can write after
-exchange or completion. The artifact is therefore retained **indefinitely**, not
-unlinked after a hash check. Startup/reconciliation checks completed artifacts
-for such changes and quarantines them for manual review. Recovery cannot capture
-an intermediate writer version that disappears before observation, prevent
-another editor from overwriting its own file, or guarantee that the visible path
-never briefly holds the restored bytes during a last-instruction race. Parent
-reopening detects namespace replacement but is not a kernel namespace lock.
-The OS user/vault namespace and private state must remain trusted; protection
-against a malicious process with the same UID is not claimed. Never configure
-the same vault under a second state directory.
+An editor holding a descriptor to the displaced inode can write after exchange or
+completion. Startup/reconciliation verifies retained artifacts, quarantining late
+changes. Explicit cleanup therefore requires a **quiescent, trusted namespace**:
+stop editors and outstanding writers first. No POSIX unlink-by-inode/content-CAS
+primitive exists here. Checks before unlink cannot exclude a same-UID actor or
+an already-open writer in the final syscall window. No automatic retirement is
+enabled, and this command must not be used concurrently with external writers.
+Parent reopening detects replacement; it is not a kernel namespace lock.
+Snapshots/exports are byte recovery, not a backup of unique ACL/xattr metadata.
+Restoration still copies original metadata (including xattrs) onto the new inode;
+retain a filesystem backup if displaced metadata itself must be recoverable.
+Never configure the same vault under a second state directory.
 
-Only exact journal artifact path + matching device/inode/birthtime exceptions
-are passed to both read-only reconciliation scans; unknown `.andesite*` names
-still fail. Retained artifacts are not snapshot storage (immutable snapshots
-remain outside the vault). They add destination-disk usage, currently excluded
-from `snapshot-storage`. Do not rename/edit/delete them. Moving a restored file
-is supported; moving a directory containing an artifact currently quarantines
-its old journal namespace rather than guessing a relocation. Artifact retirement,
-relocation and administrator quarantine resolution remain unimplemented. For a
-quarantine: stop editors, preserve the vault **and** complete state, inspect
-`mutation-journal`, export supplier and preimage snapshots to new files, and
-review retained artifact/current bytes offline. Do not edit SQLite or remove
-artifacts as an automatic "fix"; there is no supported unquarantine command yet.
+### Explicit quarantine workflow (schema v7)
+
+1. Stop writers and take a coherent vault+state backup. Use `mutation-journal`
+   and `mutation-inspect --vault VAULT --state STATE OPERATION_ID`.
+2. Inspection shows journal state/document/path; supplier/preimage/revision and
+   parent IDs; expected original/stage identities; verified immutable hashes;
+   observed current/artifact fingerprints, paths and hashes; unrelated original
+   path occupants; preserved versions; refusal diagnostics; available strategies;
+   and decision strategy/outcome/base/result revision audit metadata. It does not
+   print document contents. A failed verification does not remove evidence.
+3. Export before deciding: `mutation-export --vault VAULT --state STATE ID ROLE
+   /absolute/new-file-outside-vault-and-state`. Roles are `intended`, `preimage`,
+   `current`, `artifact`, `path-occupant`, `retirement`, or `sha256:HASH` for any
+   preserved version from this operation. Existing destinations are never
+   overwritten; parent traversal and publication retain export's no-follow rules.
+   `current`/`artifact` prefer live observations when readable; use `sha256:HASH`
+   to select a specific earlier preserved observation after later external edits.
+4. `mutation-resolve --vault VAULT --state STATE ID --strategy STRATEGY` offers:
+   * `accept-current` or `preserve-current`: identical conservative policies,
+     accepting only an inode proven to belong to this document, valid UTF-8
+     Markdown and a collision-free catalog path. **Both preserve every observed
+     competing representation first**, even when only one is selected.
+   * `complete-published`: target birth identity must be the recorded stage and
+     its bytes must exactly match the intended immutable snapshot. If the restore
+     revision is absent, publish that fixed-ID child; otherwise preserve lineage
+     without duplicating it. Changed displaced bytes are separately preserved.
+   * `cancel-unpublished`: require original inode/preimage content, original
+     catalog parent and original path. Preserve any partial/staged bytes; update
+     filesystem hints/index consistently without inventing a content revision.
+5. Preservation uses the existing SHA-256 object store, verifies/syncs objects,
+   registers them, and pins them through `mutation_versions`. Evidence records
+   roles, hashes/lengths, paths and fingerprints; equal hashes share one object.
+   Then a durable `pending` decision pins the exact evidence and base revision.
+   In one later SQLite writer transaction, reobserve all pinned evidence, publish
+   head/revision/event/index/snapshot as needed, reobserve after the test hook,
+   mark the journal `completed` or `cancelled`, and record completed outcome plus
+   result revision. The original automatic-refusal diagnostic is retained in the
+   decision audit. **Resolution never writes a vault document.**
+6. A crash before outcome commit leaves quarantine and the pending selection.
+   Repeat the same command: identical evidence converges; changed evidence or
+   divergent lineage remains quarantined. Pending decisions cannot silently
+   switch strategies or adopt a newer edit. Export preserved versions for manual
+   review if this check refuses. Timestamp ordering never chooses a winner.
+   Completed retries are no-ops. A new late displaced-inode conflict can be
+   explicitly resolved again: archive the earlier decision atomically, retain
+   its immutable versions, and pin the next decision to the earlier result head.
+   All prior decisions and competing hashes remain inspectable/exportable.
+
+Missing/replaced document inodes, invalid Markdown, conflicting catalog paths,
+missing expected artifacts, unsafe parents/symlinks or unavailable birth identity
+refuse resolution. For a prepared intent with no durable stage identity and no
+observed artifact, cancellation may preserve the verified original; this gives
+**no authority** to discard a vanished or unregistered artifact. Pre-v7 partial
+stages without identity remain export-only/uncertain. No SQL edits or manual
+reserved-name deletion are part of the supported workflow.
+
+### Artifact ownership, relocation and retirement
+
+Each journal intent owns one exact `.andesite-mutation-ID` location. v7 records a
+creation fingerprint immediately after exclusive creation/directory sync, before
+writing stage contents; a crash before this registration is intentionally
+uncertain. Durable staging and publication retain the established original/stage
+identities. Unfinished and quarantined operations always retain their artifacts.
+No naming-pattern-based ownership inference or broad filesystem GC is used.
+
+A bounded (100000 entries, depth <128), descriptor-relative no-follow census can
+locate an original/stage file by device/inode/**birthtime**, and a displaced inode
+by its recorded parent identity plus its own birth identity. Parent/nested moves,
+file renames, Unicode and case-only spellings use actual directory entries, not
+hashes, normalization or timestamps to infer identity. Missing/replaced parents,
+ambiguous identity, mounts or unsafe directory ownership fail closed. Root
+relocation remains unsupported: the catalog binds the configured physical root.
+A pending cleanup whose parent moved can update its location only after exact
+artifact fingerprint/hash revalidation. An absent artifact in a relocated parent
+cannot supply that corroboration and remains unresolved.
+
+`mutation-artifacts` and `mutation-cleanup ... --dry-run` report known artifact
+logical/allocated bytes, active/quarantined/terminal eligibility, pending/retired
+receipts, and uncertain identity. `--dry-run` performs no retirement/preservation
+writes (normal safe startup recovery still runs when the CLI opens the runtime).
+`mutation-cleanup ... --retire` is the only unlink path:
+
+1. Require terminal journal state, proven file/parent ownership and expected
+   completion bytes (or the explicit decision's preserved artifact bytes).
+   Refuse artifacts referenced by any other unfinished/quarantined operation.
+2. Verify/preserve the entire artifact in immutable storage and register its
+   durable reference. Commit retirement intent with path, exact fingerprint and
+   content hash. Only this intent can authorize missing-file restart handling.
+3. Reopen no-follow parents and verify root/parent identity. Reobserve exact
+   fingerprint and bytes after the fault hook, verify the chain, then `unlinkat`
+   the single owned basename. A changed/replaced/symlink artifact is not deleted.
+4. Sync/verify parent, then commit `retired` receipt. A crash after unlink but
+   before receipt leaves a pending intent and verified immutable bytes. Explicit
+   retry rechecks parent/object evidence, syncs it and completes the receipt; an
+   absent file **without** such intent is never considered successful retirement.
+5. Pending cleanup blocks reconciliation/new restoration until explicitly resumed.
+   Completed receipts are idempotent and confer no ownership of any later path
+   occupant. Scans remove the retired exclusion: an unrelated reserved-name file
+   still fails the ordinary scan and is never cleaned by the old receipt.
+
+Accounting separates snapshot logical bytes, unique referenced object logical
+bytes, registered object bytes, observed immutable object allocated blocks,
+transient object allocated blocks, journal artifact blocks, retirement-eligible
+blocks and retained/unresolved blocks. Per-object reference diagnostics include
+mutation versions. Unknown ownership is a separate **uncertain count**, not a
+claim of zero bytes or reclaimable space. Immutable hashes and shared inodes are
+counted once within object accounting. Snapshot logical bytes are never added to
+physical usage. APFS clones/compression/open descriptors mean `st_blocks * 512`
+is an allocated-block estimate, **not exclusive reclaimable volume capacity**;
+releasing a redundant file may not immediately free that many volume bytes.
+Neither objects nor snapshot history are pruned by retirement.
 
 In-place restore requires **local macOS APFS for vault, state and objects**, with required directory
 `fsync`, file `F_FULLFSYNC`, metadata-copy and atomic-exchange support. Failures
@@ -322,7 +428,7 @@ qualification remain release gates.
   is counted unfinished even though automatic recovery intentionally stops.
 * Snapshot list/inspect/compare/export/storage/config retain their existing syntax.
 
-The macOS/APFS suite has **26 tests**, retaining the original 21 and adding five
+The macOS/APFS suite has **31 tests**, retaining all 26 prior tests and adding five
 focused test functions. The process-death matrix executes real CLI subprocesses
 with `ANDESITE_TEST_FAULTS=1` and `ANDESITE_TEST_KILL_POINT=<point>` at 16 points:
 `before-preimage`, `preimage-written`, `preimage-preserved`, `intent-written`,
@@ -343,7 +449,18 @@ restart convergence, history/event/snapshot counts, `PRAGMA integrity_check` and
 all platform filesystems or physical power failure. Disk-full/flush-failure and
 hardware fault qualification remain follow-up work, not proven guarantees.
 
-Recommended next milestone: non-destructive quarantine resolution and artifact
-lifecycle/relocation, Linux metadata/durability qualification, and cross-platform
-fault CI before continuous monitoring or HTTP mutation APIs. No watchers, HTTP,
-authentication, synchronization, automatic pruning or GC were added here.
+New SIGKILL points are `resolution-intent`, `resolution-written`,
+`resolution-completed`, `retirement-intent`, `retirement-before-unlink`,
+`retirement-unlinked`, `retirement-completed`. Tests also change pinned resolution
+evidence, re-quarantine/re-resolve a later displaced edit, export competing bytes
+after retirement, refuse active/quarantined/identity-mismatched/symlink artifacts,
+replace artifacts at the pre-unlink hook, reuse retired paths, move parents and
+nested directories, rename Unicode/case-only files, and check allocated accounting.
+They verify exact contents, snapshots, lineage, SQLite integrity/foreign keys,
+search consistency and absence of unrelated deletion using temporary data only.
+
+Next: macOS FSEvents monitoring through the existing serialized reconciliation
+boundary, overflow/full-rescan handling, then Linux inotify. Linux restoration
+metadata/durability qualification, disk-full/flush faults and hardware power-loss
+qualification remain separate work. No HTTP, authentication, synchronization,
+automatic history pruning or broad garbage collection was added here.

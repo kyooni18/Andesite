@@ -144,16 +144,61 @@ publication: `prepared → staged → published → catalogued → completed`. O
 restart, unpublished work is cancelled; verified, already-published work finishes
 idempotently. Ambiguity is **quarantined**, blocking reconciliation/search/new
 restores while snapshot inspection/export and `mutation-journal` remain available.
-There is no automatic destructive rollback or conflict-resolution command.
+There is no automatic destructive rollback. Schema v7 adds explicit, non-destructive
+quarantine decisions, preserved competing versions and verified artifact retirement.
 
 Restoration uses no-follow descriptor-relative traversal, exclusive same-directory
 staging, metadata copying, atomic **exchange**, file durability barriers and
 parent-directory synchronization. The displaced inode remains at
-`.andesite-mutation-OPERATION_ID` indefinitely, including after success: do not
-remove or edit these artifacts. Only exact journal-owned paths/inodes are ignored
-by ordinary read-only scans. They can consume space equal to the preimage (not
-included in `snapshot-storage`). Moving their parent directory currently requires
-manual recovery review; moving the restored file itself remains supported.
+`.andesite-mutation-OPERATION_ID` until explicitly retired: do not remove or edit
+these artifacts manually. Only exact journal-owned paths/inodes are ignored by
+ordinary scans. `snapshot-storage` includes their allocated-block estimates.
+Owned inodes and their parent directories can be located after renames/nested
+moves without adopting unrelated files at reused paths. Ambiguous identity stays
+quarantined; matching names, timestamps or content alone never establish identity.
+
+### Resolve a quarantine and retire redundant artifacts
+
+Stop editors (including processes holding the old inode open), and back up vault
+and state together before maintenance. Inspection never prints document contents:
+
+```sh
+.build/debug/andesite-server mutation-journal --vault "$sample/vault" --state "$sample/state"
+.build/debug/andesite-server mutation-inspect --vault "$sample/vault" --state "$sample/state" OPERATION_ID
+.build/debug/andesite-server mutation-export --vault "$sample/vault" --state "$sample/state" OPERATION_ID artifact /absolute/new-export
+.build/debug/andesite-server mutation-resolve --vault "$sample/vault" --state "$sample/state" OPERATION_ID --strategy preserve-current
+.build/debug/andesite-server mutation-artifacts --vault "$sample/vault" --state "$sample/state"
+.build/debug/andesite-server mutation-cleanup --vault "$sample/vault" --state "$sample/state" --dry-run
+.build/debug/andesite-server mutation-cleanup --vault "$sample/vault" --state "$sample/state" --retire
+```
+
+Only choose a strategy offered by inspection:
+
+* `accept-current` / `preserve-current`: accept the verified document inode's
+  current valid Markdown, preserving **all observed competing bytes** in immutable
+  storage first. Both intentionally have the same non-destructive preservation
+  policy; neither rewrites the file.
+* `complete-published`: finish a verifiably published intended restoration; reuse
+  its allocated restore revision if not already catalogued.
+* `cancel-unpublished`: keep the original unchanged document, preserve staging
+  bytes, and cancel without a new content revision.
+
+`mutation-export` supports `intended`, `preimage`, `current`, `artifact`,
+`path-occupant`, `retirement`, and `sha256:HASH` for any preserved version listed
+by inspection. Export is outside vault/state, no-follow and no-overwrite.
+Resolution publishes catalog/head/index/snapshot/outcome atomically. A repeated
+completed selection is a no-op; a crashed pending decision pins exact evidence
+and refuses changed evidence rather than silently changing the selection.
+
+Cleanup is **never automatic**. Only terminal operations with verified owned
+artifacts and expected content are eligible. Exact bytes are durably preserved
+before a cleanup intent commits; identity/content are rechecked before unlink,
+parent sync precedes a durable receipt. Repeat `--retire` after an interrupted
+cleanup; pending cleanup blocks reconciliation/restoration. Unfinished,
+quarantined, missing-without-intent or uncertain artifacts are retained/refused.
+This is not filesystem or object-store GC. Allocated APFS blocks are estimates,
+not a promise of exclusive reclaimable volume space (clones/compression/open FDs).
+Snapshots/exports preserve file bytes, not a general metadata/ACL backup.
 
 **Platform/concurrency limits:** in-place restoration is currently enabled only
 when vault and state use local **macOS/APFS**. Linux and other filesystems fail closed; export remains
@@ -168,8 +213,8 @@ for recovery states, handling conflicts and remaining limits.
 
 ## Recovery contract and limits
 
-Ordinary reconciliation remains read-only. Only explicit journaled restoration
-mutates source files; it is a local subset, not the full v1 mutation service.
+Ordinary reconciliation remains read-only. Only explicit journaled restoration and artifact retirement
+mutate the vault; it is a local subset, not the full v1 mutation service.
 
 * Object contents and directory are synced before catalog references are
   committed. Per-file revision/head/object metadata/event/sequence publication
@@ -217,7 +262,7 @@ mutates source files; it is a local subset, not the full v1 mutation service.
   physical power loss. This is not a coherent online backup tool.
 
 Not implemented: watchers, automatic mutation retries, Linux in-place restoration,
-quarantine resolution/artifact retirement, general-purpose server mutations,
+general-purpose server mutations,
 attachment scanning, quotas/GC, authentication,
 HTTP API, full-vault sync manifests/cursors/offline synchronization or web client.
 Invalid UTF-8 bytes remain incident history, not valid Markdown snapshots; a file
@@ -225,46 +270,26 @@ that was never valid has no document snapshot yet. The basic
 extractor lacks complete v1 frontmatter/wiki syntax/tags/link resolution,
 backlinks, snippets, pagination and index generations.
 
+The [milestone engineering report](docs/andesite-quarantine-milestone.md) records
+implementation decisions, verified boundaries and remaining risks.
+
 ## Verification and next milestone
 
-The test suite preserves the 14 prior tests and adds focused integration coverage
-for spacing/coalescing, shutdown/restart, deletion/recreation, reliable and
-ambiguous moves, Unicode/case-only renames, path reuse/swaps, interrupted snapshot
-registration, atomic tombstone publication, quarantine, hash corruption,
-no-overwrite export/restore refusal, retention eligibility, shared references,
-process ownership and SQLite writer contention. All use temporary vaults/state.
-No production notes are used. See the file-recovery contract for failure boundaries.
+`swift build` and `swift test` pass on the development macOS/APFS host: **31 tests**,
+retaining all 26 prior tests and adding five focused recovery/maintenance tests.
+The suite executes real SIGKILL subprocesses at the original 16 restoration
+points and seven new resolution/retirement points, including transaction rollback,
+pinned evidence, repeated decisions, cleanup receipts, competing version exports,
+lineage/index/SQLite integrity, unsafe paths, relocation and storage accounting.
+All fixtures use temporary vaults and private state, never production notes.
+SIGKILL testing does **not** establish physical power-loss durability. Linux
+restoration, disk-full/flush/hardware fault qualification and cross-platform CI
+remain unqualified. Existing SwiftPM dependency/host SQLite deployment warnings
+are not restoration platform qualification.
 
-Local macOS arm64 verification: **`swift build` and all 21 `swift test` tests pass**
-(14 prior + 7 new integration tests). CLI smoke checks cover every new command,
-and an actual SIGKILL between revision commit and snapshot registration verified
-WAL recovery before a newer disk version was ingested, without overwriting it.
-Existing unused-dependency/test and Homebrew SQLite deployment-version warnings
-remain; Linux execution and actual power-loss behavior have not been qualified.
-
-Next: implement and fault-test the mutation journal/preimage preservation before
-in-place restore; qualify filesystem race/power-loss behavior and Linux birthtime
-support. Watchers and authenticated read-only HTTP can build on the separated
-observation, durable capture and snapshot scheduler afterward.
-See `docs/andesite-file-recovery.md` for the implemented local contract and storage
-migration. `docs/andesite-server-spec.md` and
-`docs/andesite-protocol-v1.schema.json` describe the **planned** v1 HTTP/sync
-contract, not an implemented listener. Their 24-hour full-vault sync snapshots are
-not these 7-day individual-file recovery snapshots.
-
-## Verification and next work
-
-`swift build` and `swift test` pass on the development macOS/APFS host: **26 tests**
-(the original 21 plus five focused journal tests). The journal matrix terminates
-real CLI subprocesses with **SIGKILL at 16 lifecycle points**, including inside
-SQLite transactions and immediately after exchange; additional cases kill during
-startup redo and introduce post-publication external/open-descriptor writes.
-Repeated restarts check stable history counts, exact bytes, SQLite integrity and
-foreign keys. Other cases cover preimages, lineage, identical/repeated restores,
-Unicode/nested renamed paths, search, permissions/xattrs, unsafe paths, lock
-conflicts, corrupt/missing objects and catalog/index publication failure.
-
-Recommended next milestone: explicit, non-destructive quarantine resolution and
-artifact lifecycle/relocation, Linux metadata qualification and cross-platform
-fault CI. Qualify physical power-loss/storage behavior separately before adding
-continuous watchers or mutation HTTP APIs.
+Next: introduce serialized continuous monitoring beginning with macOS FSEvents
+(full rescan on overflow/lost events), then Linux inotify. Keep the same
+reconciliation, immutable-capture and quarantine boundaries; no watcher should
+implicitly resolve a conflict or retire an artifact. Linux restoration needs a
+separate metadata/durability implementation and test qualification, not a rename
+fallback. HTTP APIs, authentication, remote sync and broad GC remain out of scope.
