@@ -30,5 +30,11 @@ int andesite_monitor_stop_requested(void);
 int andesite_http_relay_get(const char *socket_path, const char *target,
                            unsigned char *out, unsigned long capacity,
                            unsigned long *length);
+/* Bounded authenticated-sidecar PUT relay and bounded owner request reader. */
+long andesite_local_http_read_request(int client, char *buffer, unsigned long capacity);
+int andesite_http_relay_put(const char *socket_path, const char *target,
+                           const char *revision, const unsigned char *body,
+                           unsigned long body_length, unsigned char *out,
+                           unsigned long capacity, unsigned long *length);
 #endif /* __APPLE__ */
 #endif /* ANDESITE_FS_H */

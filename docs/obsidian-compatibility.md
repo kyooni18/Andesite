@@ -2,8 +2,8 @@
 
 **Baseline checked:** 2026-11-08, against official Obsidian Help.
 **Conclusion:** Andesite is not feature-equivalent to Obsidian. It is
-currently a Swift 6 macOS file-observation, recovery and read-only HTTP
-backend, not a replacement Markdown editor. Never claim overall parity
+currently a Swift 6 macOS file-observation, recovery and limited
+conditional-edit HTTP backend, not a replacement Markdown editor. Never claim overall parity
 until the same observable behavior has been verified side by side.
 
 ## Official reference contracts
@@ -44,7 +44,7 @@ means no equivalent. Backend data compatibility is not desktop UI parity.
 | Content search | **Partial** | SQLite FTS phrase search returns Vault-relative path; Obsidian search operators, property/tag filters and snippets absent |
 | Tags, outgoing links panel, outline UI | **Partial** | Raw headings/link syntax only; no tag index or app panel |
 | File recovery | **Partial** | SHA-256 immutable revisions, snapshots and APFS restore; settings and UX not identical |
-| Create, edit, rename, delete by API | **Missing** | Current HTTP intentionally GET-only; journal-safe mutation API pending |
+| Create, edit, rename, delete by API | **Partial** | Existing-note revision-conditioned PUT is journal backed and tested under SIGKILL; create/delete/rename remain missing, no editor UI |
 | Daily notes, templates, bookmarks, quick switcher | **Missing** | No matching app-level workflows |
 | Page preview, command palette, workspaces | **Missing** | No editor UI |
 | Plugins, themes, CSS snippets | **Missing** | No user extension runtime |
@@ -62,8 +62,9 @@ area is recovery integrity, not Obsidian's linked knowledge UI.
   .trash and .git preservation, lexical Obsidian wiki syntax.
 - `VaultLocalHTTPTests.swift`: read-only document routes, page guards,
   stale-index refusal, exact immutable bytes, partial heading/link extraction.
-- `scripts/test-api-server.sh`: Hummingbird and FSEvents against
-  temporary Vaults, auth, live GETs, and HTTP method rejection.
+- scripts/test-api-server.sh: Hummingbird and FSEvents against
+  temporary Vaults, authenticated GETs and conditional PUT,
+  stale-precondition rejection and original snapshot retention.
 - Existing VaultSessionTests, RecoverySnapshotTests, VaultMonitorTests and
   journal/SIGKILL tests protect persistence and single-owner guarantees.
 
@@ -80,7 +81,8 @@ area is recovery integrity, not Obsidian's linked knowledge UI.
    bytes and their existing default Obsidian configuration.
 5. Update this matrix in the same commit as new features.
 
-**Next priority:** cooperative time-sliced link cache for large Vaults
-and full Obsidian heading/block/path/rename semantics, unlinked mentions, and
+**Next priority:** verified create/delete/rename journal operations,
+full Obsidian heading/block/path/rename semantics, unlinked mentions, and
 typed frontmatter/Properties and search filters; then attachment and
-Canvas/Bases indexing, journal-safe write APIs, and editor/plugin parity.
+Canvas/Bases indexing, the remaining safe create/delete/rename APIs,
+and editor/plugin parity.

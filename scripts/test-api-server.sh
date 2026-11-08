@@ -23,7 +23,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 status() {
-  curl --silent --show-error --max-time 4 -o "$demo/response" -w '%{http_code}' "$@"
+  curl --silent --show-error --max-time 10 -o "$demo/response" -w '%{http_code}' "$@"
 }
 
 "${ANDESITE_SERVER_BIN:-.build/debug/andesite-server}" vault-watch "$demo/vault" > "$demo/watch.log" 2>&1 &
@@ -90,6 +90,72 @@ while test "$i" -lt 256; do
   i=$((i+1))
 done
 test "$(status -H "Authorization: Bearer $extended" "$url/v1/status")" = 401
+
+# One authorized existing-document edit, guarded by exact revision and
+# journaled APFS exchange. Other mutating verbs remain disallowed.
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents?limit=10")" = 200
+original_revision=$(python3 - "$demo/response" <<'PYDOC'
+import json,sys
+notes=json.load(open(sys.argv[1]))["documents"]
+print(next(note["revision"] for note in notes if note["path"]=="note.md"))
+PYDOC
+)
+printf '# Updated via API\nchanged-through-edit-api\n' > "$demo/new-note.md"
+test "$(status -X PUT -H 'Authorization: Bearer wrong' -H "If-Match: \"$original_revision\"" -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @"$demo/new-note.md" "$url/v1/documents/$document_id/content")" = 401
+test "$(status -X DELETE -H "Authorization: Bearer $token" "$url/v1/documents/$document_id/content")" = 405
+test "$(status -X PUT -H "Authorization: Bearer $token" -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @"$demo/new-note.md" "$url/v1/documents/$document_id/content")" = 428
+test "$(status -X PUT -H "Authorization: Bearer $token" -H 'If-Match: "00000000000000000000000000000000"' -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @"$demo/new-note.md" "$url/v1/documents/$document_id/content")" = 412
+test "$(status -X PUT -H "Authorization: Bearer $token" -H "If-Match: \"$original_revision\"" -H 'Content-Type: application/octet-stream' --data-binary @"$demo/new-note.md" "$url/v1/documents/$document_id/content")" = 400
+test "$(status -X PUT -H "Authorization: Bearer $token" -H "If-Match: \"$original_revision\"" -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @"$demo/new-note.md" "$url/v1/documents/$document_id/content")" = 200
+grep -q '"state":"completed"' "$demo/response"
+grep -q '"indexReady":false' "$demo/response"
+grep -q 'changed-through-edit-api' "$demo/vault/note.md"
+# A second write with the old revision must either see pending indexing
+# or fail the optimistic precondition, never overwrite a newer head.
+again=$(status -X PUT -H "Authorization: Bearer $token" -H "If-Match: \"$original_revision\"" -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @"$demo/new-note.md" "$url/v1/documents/$document_id/content")
+test "$again" = 503 || test "$again" = 412
+
+# Await the committed new head; the original snapshot remains immutable.
+tries=0
+while test "$tries" -lt 60; do
+  test "$(status -H "Authorization: Bearer $token" "$url/v1/status")" = 200
+  if grep -q '"indexedReadable":true' "$demo/response"; then break; fi
+  sleep 0.15
+  tries=$((tries+1))
+done
+test "$tries" -lt 60
+test "$(status -H "Authorization: Bearer $token" "$url/v1/search?q=changed-through-edit-api")" = 200
+grep -q 'Updated via API' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents/$document_id/content")" = 200
+grep -q 'changed-through-edit-api' "$demo/response"
+test "$(status -X PUT -H "Authorization: Bearer $token" -H "If-Match: \"$original_revision\"" -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @"$demo/new-note.md" "$url/v1/documents/$document_id/content")" = 412
+test "$(status -H "Authorization: Bearer $token" "$url/v1/snapshots/$id/content")" = 200
+grep -q 'api-contract-search-unique' "$demo/response"
+
+# A body much larger than the private header limit must still be
+# accepted when a single Unix recv coalesces headers and request bytes.
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents?limit=10")" = 200
+current_revision=$(python3 - "$demo/response" <<'PYDOC'
+import json,sys
+notes=json.load(open(sys.argv[1]))["documents"]
+print(next(note["revision"] for note in notes if note["path"]=="note.md"))
+PYDOC
+)
+python3 - "$demo/large.md" <<'PYDOC'
+import sys
+with open(sys.argv[1],"wb") as file:
+    file.write(b"# Longer update\n" + b"x"*131072)
+PYDOC
+test "$(status -X PUT -H "Authorization: Bearer $token" -H "If-Match: \"$current_revision\"" -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @"$demo/large.md" "$url/v1/documents/$document_id/content")" = 200
+cmp "$demo/large.md" "$demo/vault/note.md"
+# Explicit foreground success is independently reported to the work
+# scheduler; FSEvents delivery is not the only scan trigger.
+tries=0
+while ! grep -q 'watch-foreground-mutation' "$demo/watch.log" && test "$tries" -lt 40; do
+  sleep 0.1
+  tries=$((tries+1))
+done
+grep -q 'watch-foreground-mutation' "$demo/watch.log"
 
 # After watch stops, the HTTP API cannot serve stale indexed data.
 kill -TERM "$watch_pid"

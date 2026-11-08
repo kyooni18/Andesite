@@ -27,13 +27,25 @@ private struct AndesiteBearerAuthorization: RouterMiddleware {
         guard authorized(request.headers[.authorization]) else {
             return Self.failure(.unauthorized, "authentication_required")
         }
-        guard request.method == .get else {
-            return Self.failure(.methodNotAllowed, "read_only")
+        let editPath = request.uri.path.hasPrefix("/v1/documents/") &&
+                       request.uri.path.hasSuffix("/content")
+        guard request.method == .get || (request.method == .put && editPath) else {
+            return Self.failure(.methodNotAllowed, "method_not_allowed")
         }
-        guard request.headers[.contentLength] == nil,
-              request.headers[.transferEncoding] == nil,
+        guard request.headers[.transferEncoding] == nil,
               request.headers[.upgrade] == nil else {
-            return Self.failure(.badRequest, "request_body_not_supported")
+            return Self.failure(.badRequest, "unsupported_request_framing")
+        }
+        if request.method == .get {
+            guard request.headers[.contentLength] == nil else {
+                return Self.failure(.badRequest, "request_body_not_supported")
+            }
+        } else {
+            guard let value = request.headers[.contentLength],
+                  let size = Int(value), (0...262144).contains(size),
+                  request.headers[.contentType] == "text/markdown; charset=utf-8" else {
+                return Self.failure(.badRequest, "invalid_edit_content")
+            }
         }
         return try await next(request, context)
     }
@@ -75,6 +87,40 @@ enum AndesiteHTTPAPI {
         )
     }
 
+    private static func forwardEdit(_ request: Request,
+                                    via relay: VaultHTTPRelay) async -> Response {
+        let matchHeader = request.headers[.init("if-match")!]
+        guard let matchHeader, matchHeader.count == 34,
+              matchHeader.hasPrefix("\""), matchHeader.hasSuffix("\"") else {
+            return AndesiteBearerAuthorization.failure(
+                HTTPResponse.Status(code: 428), "revision_precondition_required")
+        }
+        let revision = String(matchHeader.dropFirst().dropLast())
+        let body: Data
+        do {
+            let buffer = try await request.body.collect(upTo: 256 * 1024 + 1)
+            body = Data(buffer.readableBytesView)
+        } catch {
+            return AndesiteBearerAuthorization.failure(
+                HTTPResponse.Status(code: 413), "edit_too_large")
+        }
+        guard body.count <= 256 * 1024 else {
+            return AndesiteBearerAuthorization.failure(
+                HTTPResponse.Status(code: 413), "edit_too_large")
+        }
+        let result = await relay.put(request.uri.path, expectedRevision: revision,
+                                     contents: body)
+        return Response(
+            status: HTTPResponse.Status(code: result.status),
+            headers: [
+                .contentType: result.contentType,
+                .cacheControl: "no-store",
+                .init("x-content-type-options")!: "nosniff"
+            ],
+            body: .init(byteBuffer: ByteBuffer(bytes: result.body))
+        )
+    }
+
     static func run(vault: String, state: String?, port: Int) async throws {
         guard (1024...65535).contains(port) else { throw ConfigurationError.invalidPort }
         guard let rawToken = ProcessInfo.processInfo.environment["ANDESITE_API_TOKEN"] else {
@@ -104,6 +150,7 @@ enum AndesiteHTTPAPI {
         router.get("/v1/documents") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/documents/{id}") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/documents/{id}/content") { request, _ in await Self.forward(request, via: relay) }
+        router.put("/v1/documents/{id}/content") { request, _ in await Self.forwardEdit(request, via: relay) }
         router.get("/v1/documents/{id}/links") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/documents/{id}/backlinks") { request, _ in await Self.forward(request, via: relay) }
         router.get("/v1/snapshots") { request, _ in await Self.forward(request, via: relay) }
@@ -119,7 +166,7 @@ enum AndesiteHTTPAPI {
             ),
             onServerRunning: { _ in
                 FileHandle.standardOutput.write(
-                    Data("api-ready host=127.0.0.1 port=\(port) transport=http1 authentication=bearer readOnly=true\n".utf8)
+                    Data("api-ready host=127.0.0.1 port=\(port) transport=http1 authentication=bearer edits=conditional-put-only\n".utf8)
                 )
             }
         )

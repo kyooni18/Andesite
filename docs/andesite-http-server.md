@@ -2,8 +2,9 @@
 
 The HTTP API is written in Swift 6 using the pinned Hummingbird 2.28.0
 dependency. It listens on **127.0.0.1 only** and serves authenticated,
-GET-only access to the existing single-owner Vault index and snapshots.
-It does not expose restoration, file mutation, SQL access, or sync.
+GET access to the existing single-owner Vault index and snapshots,
+plus one revision-conditional Markdown edit route. It does not expose
+creation, deletion, restoration, arbitrary file paths, SQL access or sync.
 
 ## Run
 
@@ -93,11 +94,23 @@ No source note is modified by refresh. The serial cache refresh can
 still delay read APIs for large Vaults; see
 [work scheduler architecture](andesite-work-queue.md).
 
+One narrow write route is also supported: PUT /v1/documents/ID/content.
+It requires the same bearer token, a quoted exact If-Match revision
+from GET /v1/documents, Content-Type text/markdown; charset=utf-8,
+and at most 256 KiB of full Markdown bytes. It uses the same durable
+preimage/APFS-exchange journal as restoration; it does not overwrite
+unobserved external edits. The returned state has indexReady=false
+until the subsequent scan and cache jobs complete. All other mutating
+methods are rejected. See
+[conditional edit and recovery](andesite-conditional-edit.md).
+
 The payload format and resource limits follow the existing
 [private Unix-socket API](andesite-local-http.md).
 
-Missing or invalid authentication returns 401. Other HTTP methods return
+Missing or invalid authentication returns 401. Unsupported methods return
 405. GET requests with body/upload or upgrade indicators return 400.
+Stale If-Match yields 412, a conflicting live edit yields 409, missing
+preconditions yield 428, invalid UTF-8 yields 422, oversized upload 413.
 Out-of-scope routes return 404; unavailable watcher or index gives 503.
 Responses include `Cache-Control: no-store` and
 `X-Content-Type-Options: nosniff`.
@@ -115,8 +128,10 @@ HTTP route delegates a bounded GET operation through a Swift actor to
 the watcher's private same-UID Unix socket. The actor permits one
 in-flight backend query and rejects concurrent attempts with 503 rather
 than creating a second writer or unbounded queue. Synchronous socket I/O
-runs off NIO event loops. The bridge never forwards arbitrary headers,
-credentials, request bodies or mutating HTTP methods to the backend.
+runs off NIO event loops. The bridge never forwards arbitrary headers or bearer credentials.
+Its PUT transport is restricted to a single exact-document edit route
+with a version precondition and bounded Markdown body; no other
+mutation methods reach the backend.
 
 The bridge verifies the response status, content length and content type
 and caps the entire reply at 1.1 MiB. If the watcher stops, the server
@@ -124,9 +139,8 @@ fails closed with 503 instead of serving a stale cache. The owner watcher
 remains solely responsible for all SQLite and filesystem operations.
 
 This API requires macOS 14 or later for the pinned Hummingbird version.
-Other existing macOS 13 CLI features remain buildable. Remote access,
-authorization policy for multiple users, mutation endpoints, subscription
-streams and full sync are deliberately deferred.
+Other existing macOS 13 CLI features remain buildable. Remote access, multi-user authorization, general mutation endpoints,
+subscription streams and full sync are deliberately deferred.
 
 ## Test
 

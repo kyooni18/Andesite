@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <limits.h>
@@ -162,6 +163,86 @@ long andesite_local_http_read_headers(int client, char *buffer, unsigned long ca
                 if (i + 1 != used) { errno = EINVAL; return -1; }
                 return (long)used;
             }
+        }
+    }
+    errno = EMSGSIZE;
+    return -1;
+}
+
+
+/* GET keeps the existing header-only contract; PUT can carry at most
+   256 KiB of UTF-8 Markdown, with an absolute one-second body deadline.
+   The Swift decoder independently validates every header and byte count. */
+long andesite_local_http_read_request(int client, char *buffer,
+                                     unsigned long capacity) {
+    if (client < 0 || !buffer || capacity < 8192 + 262144 ||
+        capacity > 1048576) { errno = EINVAL; return -1; }
+    long long started = monotonic_millis();
+    if (started < 0) return -1;
+    size_t used = 0, header_end = 0, expected = 0;
+    int is_put = -1;
+    struct pollfd pending = {.fd = client, .events = POLLIN, .revents = 0};
+    while (used < capacity) {
+        long long remaining = (header_end ? 1200 : 200) -
+                              (monotonic_millis() - started);
+        if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
+        int ready = poll(&pending, 1, (int)remaining);
+        if (ready <= 0) { errno = ready == 0 ? ETIMEDOUT : errno; return -1; }
+        ssize_t n = recv(client, buffer + used, capacity - used, MSG_DONTWAIT);
+        if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+        if (n <= 0) { errno = n == 0 ? ECONNRESET : errno; return -1; }
+        used += (size_t)n;
+        if (!header_end) {
+            // The first recv may contain headers AND a complete body.
+            // Locate the terminator before judging the 8 KiB header cap.
+            for (size_t i = 3; i < used; i++) {
+                if (buffer[i-3] == '\r' && buffer[i-2] == '\n' &&
+                    buffer[i-1] == '\r' && buffer[i] == '\n') {
+                    header_end = i + 1;
+                    break;
+                }
+            }
+            if (!header_end) {
+                if (used > 8192) { errno = EMSGSIZE; return -1; }
+                continue;
+            }
+            if (header_end > 8192) { errno = EMSGSIZE; return -1; }
+            is_put = header_end >= 4 && memcmp(buffer, "PUT ", 4) == 0;
+            if (is_put) {
+                int matched = 0;
+                size_t offset = 0;
+                while (offset + 1 < header_end) {
+                    size_t ending = offset;
+                    while (ending + 1 < header_end &&
+                           !(buffer[ending] == '\r' && buffer[ending+1] == '\n')) {
+                        ending++;
+                    }
+                    if (ending + 1 >= header_end) { errno = EINVAL; return -1; }
+                    size_t line_length = ending - offset;
+                    const char *line = buffer + offset;
+                    if (line_length >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
+                        if (matched++) { errno = EINVAL; return -1; }
+                        size_t start = 15;
+                        while (start < line_length && (line[start] == ' ' || line[start] == '\t')) start++;
+                        if (start == line_length) { errno = EINVAL; return -1; }
+                        size_t value = 0;
+                        for (size_t j = start; j < line_length; j++) {
+                            if (line[j] < '0' || line[j] > '9') {
+                                errno = EINVAL; return -1;
+                            }
+                            value = value * 10 + (size_t)(line[j] - '0');
+                            if (value > 262144) { errno = EMSGSIZE; return -1; }
+                        }
+                        expected = value;
+                    }
+                    offset = ending + 2;
+                }
+                if (matched != 1) { errno = EINVAL; return -1; }
+            }
+        }
+        if (header_end) {
+            if (used > header_end + expected) { errno = EINVAL; return -1; }
+            if (used == header_end + expected) return (long)used;
         }
     }
     errno = EMSGSIZE;

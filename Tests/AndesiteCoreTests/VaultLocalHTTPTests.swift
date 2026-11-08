@@ -462,3 +462,57 @@ private final class WatchProcessFixture {
     f.stop(SIGTERM)
 }
 #endif
+
+#if os(macOS)
+@Test func localConditionalPUTRequiresRevisionAndRetainsHistory() throws {
+    let f = try RuntimeFixture(); defer { f.clean() }
+    let initial = "# Before\nprivatebaseline\n"
+    let requested = "# After\nnewindexedtoken\n"
+    try f.write("note.md", initial)
+    let runtime = try VaultRuntime(configuration: f.configuration)
+    _ = try runtime.reconcile()
+    let document = try #require(try runtime.documents().documents.first)
+    let id = document.id.map { String(format: "%02x", $0) }.joined()
+    let revision = document.revisionID.map { String(format: "%02x", $0) }.joined()
+    let api = try VaultLocalHTTP(runtime: runtime, stateDirectory: f.state.path)
+
+    func editRequest(_ bytes: Data, match: String?, type: String = "text/markdown; charset=utf-8",
+                     lengthOverride: Int? = nil, method: String = "PUT") -> Data {
+        var text = "\(method) /v1/documents/\(id)/content HTTP/1.1\r\nHost: localhost\r\n"
+        if let match { text += "If-Match: \(match)\r\n" }
+        text += "Content-Type: \(type)\r\n"
+        text += "Content-Length: \(lengthOverride ?? bytes.count)\r\n\r\n"
+        return Data(text.utf8) + bytes
+    }
+    let payload = Data(requested.utf8)
+    let validMatch = "\"\(revision)\""
+    #expect(api.handle(request: editRequest(payload, match: nil), indexReady: true).status == 428)
+    #expect(api.handle(request: editRequest(payload, match: "\"wrong\""),
+                       indexReady: true).status == 428)
+    #expect(api.handle(request: editRequest(payload, match: validMatch, lengthOverride: 2),
+                       indexReady: true).status == 400)
+    #expect(api.handle(request: editRequest(payload, match: validMatch,
+                                           type: "application/octet-stream"),
+                       indexReady: true).status == 400)
+    #expect(api.handle(request: editRequest(payload, match: validMatch, method: "DELETE"),
+                       indexReady: true).status == 405)
+    #expect(api.handle(request: editRequest(Data([0xff, 0xfe]), match: validMatch),
+                       indexReady: true).status == 422)
+    #expect(api.handle(request: editRequest(payload, match: validMatch), indexReady: false).status == 503)
+    #expect(try runtime.documentContents(document.id) == Data(initial.utf8))
+
+    let response = api.handle(request: editRequest(payload, match: validMatch), indexReady: true)
+    #expect(response.status == 200)
+    let body = try #require(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+    #expect(body["state"] as? String == "completed")
+    #expect(body["indexReady"] as? Bool == false)
+    #expect(try Data(contentsOf: f.vault.appendingPathComponent("note.md")) == payload)
+    #expect(api.handle(request: editRequest(payload, match: validMatch), indexReady: true).status == 503)
+    _ = try runtime.reconcile()
+    #expect(api.handle(request: editRequest(payload, match: validMatch), indexReady: true).status == 412)
+    #expect(try runtime.searchIndexed("newindexedtoken").count == 1)
+    #expect(try runtime.snapshotContents(try #require(runtime.snapshots(path: "note.md").first).id)
+            == Data(initial.utf8))
+    try runtime.shutdown()
+}
+#endif

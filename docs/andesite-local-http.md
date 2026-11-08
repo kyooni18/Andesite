@@ -1,6 +1,6 @@
-# Andesite read-only local HTTP API (macOS)
+# Andesite same-user local HTTP API (macOS)
 
-Andesite implements a small **same-user, read-only** HTTP/1.1 API over a
+Andesite implements a small **same-user, bounded** HTTP/1.1 API over a
 Unix domain socket inside the running FSEvents watcher. This is not the
 Hummingbird loopback server, multi-user authentication or v1 sync protocol.
 The watcher itself opens no TCP port. The separate authenticated Hummingbird
@@ -115,3 +115,8 @@ Link GETs use an in-memory graph refreshed at low priority by
 VaultWorkScheduler after successful reconciliation. They do not parse
 or scan on a request. GET /v1/status includes linksIndexed and
 linkCacheGeneration; see [the scheduler architecture](andesite-work-queue.md).
+
+A single, exact-revision conditional PUT is available at
+/v1/documents/ID/content, accepting at most 256 KiB of Markdown.
+It is processed on the VaultRuntime owner thread and uses the existing
+durable mutation journal. See [conditional edit and recovery](andesite-conditional-edit.md). Other writes are rejected.

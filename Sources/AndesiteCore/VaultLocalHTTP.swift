@@ -37,7 +37,8 @@ public struct VaultHTTPResponse {
     }
 }
 
-/// GET-only HTTP/1.1 over a private Unix domain socket in the already
+/// Bounded HTTP/1.1 GET and revision-conditional Markdown PUT over a private
+/// Unix domain socket in the already
 /// validated 0700 state directory. The OS verifies same-UID peer credentials.
 /// No TCP listener, extra database connection, executor, or background thread.
 public final class VaultLocalHTTP {
@@ -45,6 +46,7 @@ public final class VaultLocalHTTP {
     private let server: OpaquePointer
     public static let socketName = "andesite-read.sock"
     private let maximumHeaders = 8192
+    private let maximumEditBody = 256 * 1024
     private let maximumResponse = 1024 * 1024
     public let socketPath: String
 
@@ -76,9 +78,9 @@ public final class VaultLocalHTTP {
         guard client >= 0 else { throw VaultLocalHTTPError.cannotAccept(errno) }
         defer { _ = Darwin.close(client) }
 
-        var request = [CChar](repeating: 0, count: maximumHeaders)
+        var request = [CChar](repeating: 0, count: maximumHeaders + maximumEditBody)
         let length = request.withUnsafeMutableBufferPointer {
-            andesite_local_http_read_headers(client, $0.baseAddress, UInt($0.count))
+            andesite_local_http_read_request(client, $0.baseAddress, UInt($0.count))
         }
         let response: VaultHTTPResponse
         if length <= 0 {
@@ -93,7 +95,9 @@ public final class VaultLocalHTTP {
     private func write(_ response: VaultHTTPResponse, to client: Int32) {
         let messages: [Int: String] = [
             200: "OK", 400: "Bad Request", 404: "Not Found",
-            405: "Method Not Allowed", 413: "Content Too Large",
+            405: "Method Not Allowed", 409: "Conflict",
+            412: "Precondition Failed", 413: "Content Too Large",
+            422: "Unprocessable Content", 428: "Precondition Required",
             503: "Service Unavailable", 500: "Internal Server Error"
         ]
         var head = "HTTP/1.1 \(response.status) \(messages[response.status] ?? "Error")\r\n"
@@ -249,19 +253,28 @@ public final class VaultLocalHTTP {
     /// Internal pure request decoding, with runtime access restricted to the
     /// synchronous watcher owner. Does not read current source files.
     func handle(request: Data, indexReady: Bool) -> VaultHTTPResponse {
-        guard request.count <= maximumHeaders,
-              let raw = String(data: request, encoding: .utf8),
-              raw.hasSuffix("\r\n\r\n"),
+        let boundary = Data([13, 10, 13, 10])
+        guard request.count <= maximumHeaders + maximumEditBody,
+              let delimiter = request.range(of: boundary),
+              delimiter.upperBound <= maximumHeaders,
+              let raw = String(data: request.prefix(upTo: delimiter.upperBound),
+                               encoding: .utf8),
               !raw.contains("\0") else { return .error(400, "invalid_request") }
-
+        let body = Data(request.suffix(from: delimiter.upperBound))
         let lines = raw.components(separatedBy: "\r\n")
         guard let first = lines.first else { return .error(400, "invalid_request") }
         let words = first.split(separator: " ", omittingEmptySubsequences: false)
         guard words.count == 3, words[2] == "HTTP/1.1",
               first.utf8.count <= 4096 else { return .error(400, "invalid_request") }
-        guard words[0] == "GET" else { return .error(405, "read_only") }
+        let method = String(words[0])
+        guard method == "GET" || method == "PUT" else {
+            return .error(405, "method_not_allowed")
+        }
 
         var hostCount = 0
+        var contentLength: Int?
+        var contentType: String?
+        var ifMatch: String?
         for header in lines.dropFirst().dropLast(2) {
             guard let separator = header.firstIndex(of: ":"), header.first != " ",
                   header.first != "\t" else { return .error(400, "invalid_headers") }
@@ -270,14 +283,43 @@ public final class VaultLocalHTTP {
                 (65...90).contains($0) || (97...122).contains($0) ||
                 (48...57).contains($0) || $0 == 45
             }) else { return .error(400, "invalid_headers") }
+            let value = String(header[header.index(after: separator)...])
+                .trimmingCharacters(in: .whitespaces)
             switch name.lowercased() {
-            case "host": hostCount += 1
-            case "content-length", "transfer-encoding", "expect", "upgrade":
-                return .error(400, "request_body_not_supported")
+            case "host":
+                hostCount += 1
+                guard !value.isEmpty else { return .error(400, "invalid_headers") }
+            case "content-length":
+                guard method == "PUT", contentLength == nil, !value.isEmpty,
+                      value.utf8.allSatisfy({ (48...57).contains($0) }),
+                      let count = Int(value), count <= maximumEditBody else {
+                    return .error(400, "invalid_content_length")
+                }
+                contentLength = count
+            case "content-type":
+                guard method == "PUT", contentType == nil else {
+                    return .error(400, "invalid_content_type")
+                }
+                contentType = value
+            case "if-match":
+                guard method == "PUT", ifMatch == nil else {
+                    return .error(400, "invalid_precondition")
+                }
+                ifMatch = value
+            case "transfer-encoding", "expect", "upgrade":
+                return .error(400, "unsupported_request_framing")
             default: break
             }
         }
         guard hostCount == 1 else { return .error(400, "invalid_headers") }
+        if method == "GET" {
+            guard body.isEmpty else { return .error(400, "request_body_not_supported") }
+        } else {
+            guard let count = contentLength, count == body.count,
+                  contentType == "text/markdown; charset=utf-8" else {
+                return .error(400, "invalid_edit_request")
+            }
+        }
 
         let target = String(words[1])
         let fragments = target.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
@@ -290,6 +332,34 @@ public final class VaultLocalHTTP {
         }
 
         do {
+            if method == "PUT" {
+                let fields = path.split(separator: "/", omittingEmptySubsequences: false)
+                guard fields.count == 5, fields[1] == "v1",
+                      fields[2] == "documents", fields[4] == "content",
+                      args.isEmpty, let documentID = id(String(fields[3])) else {
+                    return .error(405, "method_not_allowed")
+                }
+                guard indexReady else { return .error(503, "rescan_pending") }
+                guard let ifMatch, ifMatch.count == 34,
+                      ifMatch.hasPrefix("\""), ifMatch.hasSuffix("\""),
+                      let expected = id(String(ifMatch.dropFirst().dropLast())) else {
+                    return .error(428, "revision_precondition_required")
+                }
+                let current = try runtime.inspectDocument(documentID)
+                guard current.revisionID == expected else {
+                    return .error(412, "revision_mismatch")
+                }
+                let operation = try runtime.editDocument(documentID,
+                                                         expectedRevision: expected,
+                                                         contents: body)
+                return .json(200, [
+                    "operation": hex(operation.id), "document": hex(operation.entryID),
+                    "revision": hex(operation.revisionID),
+                    "preimage": hex(operation.preimageID),
+                    "state": operation.state,
+                    "indexReady": false
+                ])
+            }
             if path == "/v1/status" {
                 guard args.isEmpty else { return .error(400, "unsupported_parameter") }
                 let status = try runtime.status()
@@ -301,6 +371,11 @@ public final class VaultLocalHTTP {
                     "indexedReadable": indexReady && status.state == "ready",
                     "linksIndexed": indexReady && runtime.linksIndexed,
                     "linkCacheGeneration": runtime.linkCacheGeneration,
+                    "linkCacheProgress": runtime.linkCacheProgress.map {
+                        ["processedHeads": $0.processedHeads,
+                         "totalHeads": $0.totalHeads,
+                         "resolvedHeads": $0.resolvedHeads] as [String: Int]
+                    } as Any? ?? NSNull(),
                     "source": "last_completed_reconciliation"
                 ])
             }
@@ -447,6 +522,14 @@ public final class VaultLocalHTTP {
             return .error(503, "link_index_pending")
         } catch VaultLinkGraphError.inconsistentCatalog {
             return .error(503, "link_graph_inconsistent")
+        } catch MarkdownAnalysisError.invalidUTF8 {
+            return .error(422, "invalid_markdown_utf8")
+        } catch MutationError.conflict {
+            return .error(409, "edit_conflict_or_unsafe_target")
+        } catch MutationError.unfinished {
+            return .error(409, "unfinished_mutation")
+        } catch MutationError.unsupportedPlatform {
+            return .error(503, "unsupported_filesystem")
         } catch DocumentCatalogError.notFound {
             return .error(404, "document_not_found")
         } catch DocumentCatalogError.contentTooLarge {

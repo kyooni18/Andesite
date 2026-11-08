@@ -3,8 +3,9 @@
 A Swift 6 headless Markdown vault backend. **Local CLI ingestion, search,
 per-file recovery snapshots, journaled in-place restoration (macOS/APFS),
 tombstones, conservative external moves, macOS FSEvents monitoring and
-same-user read-only HTTP over Unix sockets and an opt-in authenticated
-Hummingbird HTTP server on 127.0.0.1 work end-to-end. Remote/public HTTP
+same-user HTTP over Unix sockets and an opt-in authenticated
+Hummingbird HTTP server on 127.0.0.1 work end-to-end, including
+existing-document conditional edits. Remote/public HTTP
 serving and synchronization are not implemented.**
 Use temporary test vaults, not production notes; filesystem/power-loss
 qualification and full v1 recovery remain outstanding.
@@ -81,7 +82,7 @@ python3 scripts/andesite-vault.py status /absolute/path/to/vault
 python3 scripts/andesite-vault.py close /absolute/path/to/vault
 ```
 
-Opening starts the existing FSEvents watcher and same-user read-only HTTP.
+Opening starts the existing FSEvents watcher and same-user HTTP.
 Closing unloads the LaunchAgent, waits for graceful termination and snapshot
 flush, and leaves notes, markers, SQLite state and snapshots intact.
 
@@ -101,10 +102,10 @@ See the [Vault session lifecycle](docs/andesite-vault-session.md).
 
 ## Authenticated local HTTP server (Hummingbird)
 
-Andesite now offers an optional **read-only Hummingbird HTTP/1.1 server**
-bound to 127.0.0.1. It authenticates with a 64-hex-character bearer token,
-and proxies requests into the already-running Vault watcher without
-opening an independent SQLite connection or exposing file mutations.
+Andesite offers an optional **authenticated Hummingbird HTTP/1.1 server**
+bound to 127.0.0.1, with a 64-hex-character bearer token. It forwards
+GET requests and a narrow existing-note conditional PUT into the
+already-running watcher without opening a second SQLite connection.
 
 ```sh
 # Terminal A: existing Vault monitor
@@ -115,7 +116,8 @@ export ANDESITE_API_TOKEN="$(openssl rand -hex 32)"
 .build/debug/andesite-server api-serve /absolute/path/to/vault --port 8788
 
 # Client shell using that same token
-curl -H "Authorization: Bearer $ANDESITE_API_TOKEN"   http://127.0.0.1:8788/v1/status
+curl -H "Authorization: Bearer $ANDESITE_API_TOKEN" \
+  http://127.0.0.1:8788/v1/status
 ```
 
 The server requires the existing watcher to be healthy and exposes
@@ -139,14 +141,20 @@ python3 scripts/andesite-api.py --state /absolute/private/state links DOCUMENT_I
 python3 scripts/andesite-api.py --state /absolute/private/state backlinks DOCUMENT_ID
 ```
 
-No LAN listener, CORS, TLS, remote auth, write API, restoration or sync
-is provided yet. See [the Hummingbird API contract](docs/andesite-http-server.md)
+No LAN listener, CORS, TLS, remote auth, file creation/deletion API,
+remote restore endpoint, or sync is provided yet. See [the Hummingbird API contract](docs/andesite-http-server.md)
 and the end-to-end `scripts/test-api-server.sh` test.
 Track what still differs from Obsidian in the
 [compatibility register](docs/obsidian-compatibility.md).
 The [work scheduler design](docs/andesite-work-queue.md) explains
 immediate filesystem edits, deferred indexing, priority and cache
 invalidation without a second SQLite owner.
+The first authorized edit route is
+PUT /v1/documents/ID/content with a required exact If-Match revision,
+limited to 256 KiB. Existing Markdown notes are journaled through the
+verified APFS exchange path and re-indexed afterward. File creation,
+deletion and rename remain unavailable over HTTP. See
+[conditional edit and recovery](docs/andesite-conditional-edit.md).
 
 
 ## Build and exercise
@@ -204,7 +212,7 @@ For opt-in background execution via a per-vault macOS LaunchAgent, see
 [watcher operations](docs/andesite-watcher.md). An agent is **not automatically
 installed**: explicitly choose a test vault and private state directory.
 
-The watcher serves **read-only HTTP/1.1 over a private Unix socket**, with no
+The watcher serves **bounded HTTP/1.1 over a private Unix socket**, with no
 TCP port and no second database connection. While watching, query it using:
 
 ```sh
@@ -213,7 +221,7 @@ python3 scripts/andesite-api.py --state "$sample/state" search 'initial phrase'
 python3 scripts/andesite-api.py --state "$sample/state" snapshots --path note.md
 ```
 
-See [read-only local API](docs/andesite-local-http.md) for endpoints and
+See [local API](docs/andesite-local-http.md) for endpoints and
 authorization. A separate `andesite-server` CLI still cannot open the same
 state while watching; use the bundled client for reads or stop watch for
 maintenance/write operations.
@@ -446,8 +454,8 @@ mutate the vault; it is a local subset, not the full v1 mutation service.
   physical power loss. This is not a coherent online backup tool.
 
 Not implemented: Linux inotify monitoring, automatic mutation retries, Linux in-place restoration,
-general-purpose server mutations,
-attachment scanning, quotas/GC, remote HTTP authentication and write API,
+general-purpose server mutations (create/delete/rename),
+attachment scanning, quotas/GC, remote HTTP authentication and sync,
 full-vault sync manifests/cursors/offline synchronization or web client.
 The macOS-only Unix-socket API authorizes same-UID peers; it does not implement
 the planned multi-user, remotely authenticated v1 API.
@@ -462,17 +470,17 @@ implementation decisions, verified boundaries and remaining risks.
 ## Verification and next milestone
 
 `swift build` and `swift test` pass on the macOS/APFS development host with
-**67 tests** (61 prior plus three scheduler, two cache and one real
-FSEvents cache test). They exercise FSEvents, snapshot promotion, durable mutation recovery,
+**76 tests** (67 prior plus three cooperative-cache and six
+conditional-edit/journal/API tests). They exercise FSEvents, snapshot promotion, durable mutation recovery,
 same-UID HTTP access, live document heads, pagination, immutable
 content, syntax-only Obsidian links, and safe preservation of
 the .obsidian, .trash and .git folders.
 Prior journal/recovery SIGKILL tests remain in the suite. Additional watcher
 smoke tests use only temporary vaults and preserve source bytes.
 
-Next: cooperative time-sliced cache refresh for large Vaults,
+Next: verified crash-safe file creation/deletion and rename semantics,
 Obsidian-complete heading/block anchors, unlinked mentions and typed
-Properties/frontmatter. Safe journal-backed edits, Bases/Canvas, cross-volume
+Properties/frontmatter. Large-Vault cache limits, Bases/Canvas, cross-volume
 migration and Linux inotify remain separate priorities.
 Network HTTP mutations, remote sync, physical power-loss qualification
 and object garbage collection remain separate milestones.
