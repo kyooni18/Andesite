@@ -3,8 +3,9 @@
 A Swift 6 headless Markdown vault backend. **Local CLI ingestion, search,
 per-file recovery snapshots, journaled in-place restoration (macOS/APFS),
 tombstones, conservative external moves, macOS FSEvents monitoring and
-same-user read-only HTTP over Unix sockets work end-to-end.
-Network HTTP serving and remote synchronization are not implemented.**
+same-user read-only HTTP over Unix sockets and an opt-in authenticated
+Hummingbird HTTP server on 127.0.0.1 work end-to-end. Remote/public HTTP
+serving and synchronization are not implemented.**
 Use temporary test vaults, not production notes; filesystem/power-loss
 qualification and full v1 recovery remain outstanding.
 
@@ -96,6 +97,31 @@ or resetting its DB, use
 `vault-open /path/to/vault --state /existing/private/state`.
 See the [Vault session lifecycle](docs/andesite-vault-session.md).
 
+## Authenticated local HTTP server (Hummingbird)
+
+Andesite now offers an optional **read-only Hummingbird HTTP/1.1 server**
+bound to 127.0.0.1. It authenticates with a 64-hex-character bearer token,
+and proxies requests into the already-running Vault watcher without
+opening an independent SQLite connection or exposing file mutations.
+
+```sh
+# Terminal A: existing Vault monitor
+.build/debug/andesite-server vault-watch /absolute/path/to/vault
+
+# Terminal B: HTTP server (macOS 14+)
+export ANDESITE_API_TOKEN="$(openssl rand -hex 32)"
+.build/debug/andesite-server api-serve /absolute/path/to/vault --port 8788
+
+# Client shell using that same token
+curl -H "Authorization: Bearer $ANDESITE_API_TOKEN"   http://127.0.0.1:8788/v1/status
+```
+
+The server requires the existing watcher to be healthy, and only exposes
+GET status/search/snapshot metadata and exact immutable snapshot content.
+No LAN listener, CORS, TLS, remote auth, write API, restoration or sync
+is provided yet. See [the Hummingbird API contract](docs/andesite-http-server.md) and the real-process contract test
+`scripts/test-api-server.sh`.
+
 ## Build and exercise
 
 Requires Swift 6.2+, SQLite >= 3.35 with FTS5 and development headers/pkg-config.
@@ -126,7 +152,8 @@ open marks the vault `scanRequired`; `reconcile` produces `ready` or
 first, so an unsuccessful scan fails search rather than presenting an old
 index as current. Invalid UTF-8 Markdown is retained as an incident object;
 other valid files remain searchable. CLI prints entry IDs and heading titles.
-No arguments/unknown commands fail closed; no command opens a network listener.
+No arguments/unknown commands fail closed; only the opt-in
+`api-serve` opens an authenticated loopback TCP listener.
 
 ## Continuous monitoring (macOS)
 
@@ -393,7 +420,7 @@ mutate the vault; it is a local subset, not the full v1 mutation service.
 
 Not implemented: Linux inotify monitoring, automatic mutation retries, Linux in-place restoration,
 general-purpose server mutations,
-attachment scanning, quotas/GC, network HTTP authentication and API,
+attachment scanning, quotas/GC, remote HTTP authentication and write API,
 full-vault sync manifests/cursors/offline synchronization or web client.
 The macOS-only Unix-socket API authorizes same-UID peers; it does not implement
 the planned multi-user, remotely authenticated v1 API.
@@ -408,7 +435,7 @@ implementation decisions, verified boundaries and remaining risks.
 ## Verification and next milestone
 
 `swift build` and `swift test` pass on the macOS/APFS development host with
-**47 tests** (42 prior plus five Vault session tests). They exercise
+**48 tests** (47 prior plus one Unix HTTP relay test). They exercise
 FSEvents edits/moves/deletions, snapshot promotion, periodic scans,
 same-UID socket ownership, restricted HTTP methods, malformed requests,
 quarantine, SIGKILL recovery, path-only selection, session shutdown,
@@ -416,8 +443,7 @@ same-filesystem relocation and copied-Vault identity refusal.
 Prior journal/recovery SIGKILL tests remain in the suite. Additional watcher
 smoke tests use only temporary vaults and preserve source bytes.
 
-Next: robust state migration for verified cross-volume moves, Linux inotify
-with the same scan/loss-recovery boundaries, and fault/performance
-qualification for file-event storms and unsupported filesystems.
+Next: safe mutation API contracts, large-vault pagination, verified
+cross-volume state migration, and Linux inotify.
 Network HTTP mutations, remote sync, physical power-loss qualification
 and object garbage collection remain separate milestones.

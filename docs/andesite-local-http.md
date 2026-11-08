@@ -2,8 +2,9 @@
 
 Andesite implements a small **same-user, read-only** HTTP/1.1 API over a
 Unix domain socket inside the running FSEvents watcher. This is not the
-planned Hummingbird network service, multi-user authentication or v1 sync
-protocol. No TCP port is opened.
+Hummingbird loopback server, multi-user authentication or v1 sync protocol.
+The watcher itself opens no TCP port. The separate authenticated Hummingbird
+sidecar is documented in [the HTTP server contract](andesite-http-server.md).
 
 ## Start and query it
 
