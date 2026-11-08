@@ -462,5 +462,6 @@ search consistency and absence of unrelated deletion using temporary data only.
 Next: macOS FSEvents monitoring through the existing serialized reconciliation
 boundary, overflow/full-rescan handling, then Linux inotify. Linux restoration
 metadata/durability qualification, disk-full/flush faults and hardware power-loss
-qualification remain separate work. No HTTP, authentication, synchronization,
+qualification remain separate work. The watcher offers same-user
+read-only HTTP over Unix sockets; network HTTP, remote authentication, synchronization,
 automatic history pruning or broad garbage collection was added here.

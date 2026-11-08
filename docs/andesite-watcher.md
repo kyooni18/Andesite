@@ -3,7 +3,9 @@
 ## Implementation and behavior
 
 `andesite-server watch --vault ABSOLUTE_VAULT --state ABSOLUTE_PRIVATE_STATE`
-is a foreground, single-owner FSEvents-driven service. No HTTP port is opened.
+is a foreground, single-owner FSEvents-driven service. No TCP port is opened.
+A private read-only Unix-socket HTTP endpoint runs on the same owner thread
+(see [local HTTP API](andesite-local-http.md)).
 `VaultRuntime` owns all observation, immutable object capture, SQLite/journal,
 FTS and snapshot publication. FSEvents runs on a private dispatch queue and
 only increments a thread-safe generation and records advisory event flags.
@@ -33,10 +35,11 @@ process does not automatically resolve quarantined journal operations, restore
 files, retire artifacts or prune history. Root replacement is fatal. Repeated
 filesystem/catalog errors remain visible and require operator investigation.
 
-The watcher keeps the state's exclusive process lock, so other CLI commands
-using that state **cannot** run while the watch command is active. Stop it
-before inspecting snapshots through the local CLI, then start it again. A future
-read-only local API can solve this without defeating single-writer ownership.
+The watcher keeps the state's exclusive process lock, so a second
+`andesite-server` instance **cannot** open the same state. The same-user
+local HTTP API supports status, search and snapshot reads while watching.
+Use `scripts/andesite-api.py` to query it. Stop the watcher before mutation
+or maintenance CLI commands. The API cannot perform restores or cleanup.
 
 FSEvents is a hint, not a comprehensive file edit journal. Transient edits not
 present at a scan can be unobserved. The five-minute fallback bounds the time
@@ -96,9 +99,10 @@ state directories. Keep the vault and private state on trusted local storage.
 
 The new Swift integration tests cover a live FSEvents stream and file changes,
 rename/delete history, snapshot due promotion, periodic fallback and re-launch
-after a real SIGKILL. Full suite: 34 tests on the development Mac; existing
-mutation-journal SIGKILL coverage is retained. Dropped-event flags are handled
-in code but actual kernel queue overflow and physical power loss have **not**
-been reproduced. Linux inotify, network-backed filesystems and authenticated
-read-only HTTP access are not implemented. The watcher is not an online backup
-for intermediate versions that were never captured.
+after a real SIGKILL. The development Mac passes all **38 tests** (the
+original 34 plus four local HTTP tests), including earlier mutation-journal
+SIGKILL coverage. Dropped-event flags are handled in code, but actual kernel
+queue overflow and physical power loss have **not** been reproduced. Linux
+inotify, network-backed filesystems and authenticated network HTTP access are
+not implemented. The watcher is not a backup for intermediate versions never
+observed by the scanner.

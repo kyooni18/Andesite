@@ -2,8 +2,9 @@
 
 A Swift 6 headless Markdown vault backend. **Local CLI ingestion, search,
 per-file recovery snapshots, journaled in-place restoration (macOS/APFS),
-tombstones, conservative external moves and continuous macOS FSEvents monitoring
-work end-to-end. HTTP serving, authentication and sync are not implemented.**
+tombstones, conservative external moves, macOS FSEvents monitoring and
+same-user read-only HTTP over Unix sockets work end-to-end.
+Network HTTP serving and remote synchronization are not implemented.**
 Use temporary test vaults, not production notes; filesystem/power-loss
 qualification and full v1 recovery remain outstanding.
 
@@ -59,13 +60,25 @@ pending captured content. No callback reads files or mutates the catalog.
 
 For opt-in background execution via a per-vault macOS LaunchAgent, see
 [watcher operations](docs/andesite-watcher.md). An agent is **not automatically
-installed**: explicitly choose a test vault and private state directory. While
-watching, separate `andesite-server` CLI operations on the same state directory
-are blocked by the exclusive lock; stop the watcher before using those commands.
+installed**: explicitly choose a test vault and private state directory.
+
+The watcher serves **read-only HTTP/1.1 over a private Unix socket**, with no
+TCP port and no second database connection. While watching, query it using:
+
+```sh
+python3 scripts/andesite-api.py --state "$sample/state" status
+python3 scripts/andesite-api.py --state "$sample/state" search 'initial phrase'
+python3 scripts/andesite-api.py --state "$sample/state" snapshots --path note.md
+```
+
+See [read-only local API](docs/andesite-local-http.md) for endpoints and
+authorization. A separate `andesite-server` CLI still cannot open the same
+state while watching; use the bundled client for reads or stop watch for
+maintenance/write operations.
 
 FSEvents is advisory; intermediate edits between scans are not guaranteed
 versions, and physical power-loss behavior is not qualified. Source Markdown
-is never modified by the watcher. There is no HTTP listener or sync service.
+is never modified by the watcher. There is no **TCP** listener or sync service.
 
 ## What is integrated
 
@@ -291,8 +304,10 @@ mutate the vault; it is a local subset, not the full v1 mutation service.
 
 Not implemented: Linux inotify monitoring, automatic mutation retries, Linux in-place restoration,
 general-purpose server mutations,
-attachment scanning, quotas/GC, authentication,
-HTTP API, full-vault sync manifests/cursors/offline synchronization or web client.
+attachment scanning, quotas/GC, network HTTP authentication and API,
+full-vault sync manifests/cursors/offline synchronization or web client.
+The macOS-only Unix-socket API authorizes same-UID peers; it does not implement
+the planned multi-user, remotely authenticated v1 API.
 Invalid UTF-8 bytes remain incident history, not valid Markdown snapshots; a file
 that was never valid has no document snapshot yet. The basic
 extractor lacks complete v1 frontmatter/wiki syntax/tags/link resolution,
@@ -304,14 +319,15 @@ implementation decisions, verified boundaries and remaining risks.
 ## Verification and next milestone
 
 `swift build` and `swift test` pass on the macOS/APFS development host with
-**34 tests** (31 prior plus three watcher tests). The new tests exercise
-live FSEvents edit/move/creation/deletion, scheduled snapshot promotion,
-periodic full scans, SIGKILL downtime and startup re-observation.
+**38 tests** (34 prior plus four local HTTP tests). They exercise
+FSEvents edits/moves/deletions, snapshot promotion, periodic scans,
+same-UID socket ownership, restricted HTTP methods, malformed requests,
+quarantine and SIGKILL downtime/startup re-observation.
 Prior journal/recovery SIGKILL tests remain in the suite. Additional watcher
 smoke tests use only temporary vaults and preserve source bytes.
 
 Next: Linux inotify with the same scan/loss-recovery boundaries, fault
-qualification for file-event storms and unsupported filesystems, and a
-read-only API so clients can inspect the catalog while the exclusive watcher
-process owns it. HTTP mutations, remote sync, physical power-loss qualification
+qualification for file-event storms and unsupported filesystems, and
+stricter performance/capability qualification for local HTTP queries.
+Network HTTP mutations, remote sync, physical power-loss qualification
 and object garbage collection remain separate milestones.

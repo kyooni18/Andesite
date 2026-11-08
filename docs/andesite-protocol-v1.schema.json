@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://andesite.invalid/protocol/v1.schema.json",
   "title": "Andesite sync v1 named wire schemas",
-  "$comment": "Planned HTTP/sync contract, not an implemented listener. Select #/$defs/<name>; semantic validation is also required. snapshot/snapshotPending describe full-vault sync manifests, NOT the implemented CLI's individual-file recovery snapshots; see andesite-file-recovery.md. No recovery-snapshot HTTP API is exposed yet.",
+  "$comment": "Planned HTTP/sync contract, not an implemented listener. Select #/$defs/<name>; semantic validation is also required. snapshot/snapshotPending describe full-vault sync manifests, NOT the implemented CLI's individual-file recovery snapshots; see andesite-file-recovery.md. A limited same-user read-only Unix-socket recovery-snapshot API is implemented separately from the planned v1 network/sync contract.",
   "$defs": {
     "uuid": {
       "type": "string",
