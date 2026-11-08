@@ -327,7 +327,12 @@ private extension RuntimeFixture {
         try runtime.shutdown()
     }
     let db = try f.database()
-    // Fixture for an actual v4 operational catalog: no recovery tables existed.
+    // Rebuild the actual historical v4 layout; newly introduced derived
+    // metadata tables did not exist in that catalog.
+    for table in ["document_property_values", "document_property_keys",
+                  "document_tags", "document_properties"] {
+        try db.execute("DROP TABLE " + table)
+    }
     // These test-only drops remove empty new tables, never operational history.
     try db.execute("DROP TABLE mutation_decision_history")
     try db.execute("DROP TABLE mutation_versions")
@@ -348,7 +353,7 @@ private extension RuntimeFixture {
     #expect(throws: ExternalCaptureError.invalidMarkdown) { try ExternalCapture.capture(db: db, reader: reader, objects: store, vaultID: identity, path: path, maximumBytes: 1024, debounce: 0) }
     let upgraded = try VaultRuntime(configuration: f.configuration)
     #expect(upgraded.vaultID == identity)
-    #expect(try db.scalarText("PRAGMA user_version") == "8")
+    #expect(try db.scalarText("PRAGMA user_version") == "9")
     #expect(try upgraded.status().revisions == 2 && upgraded.status().openIncidents == 1)
     let snapshot = try #require(upgraded.snapshots().first)
     #expect(snapshot.reason == "recovery" && snapshot.entryID == old.entryID)

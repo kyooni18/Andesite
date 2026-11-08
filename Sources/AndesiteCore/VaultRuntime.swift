@@ -217,20 +217,24 @@ public final class VaultRuntime {
     /// Catalog-only query for the in-process read-only local API. Unlike the
     /// interactive CLI search, never starts a nested scan or opens another
     /// SQLite owner while the watcher holds its exclusive state lock.
-    public func searchIndexed(_ phrase: String, limit: Int = 50) throws -> [SearchIndexHit] {
+    public func searchIndexed(_ phrase: String, limit: Int = 50,
+                              filter: ObsidianFilter? = nil) throws -> [SearchIndexHit] {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
         try journal().assertResolved()
-        return try SearchIndex.search(db: r.db, vaultID: vaultID, phrase: phrase, limit: limit)
+        return try SearchIndex.search(db: r.db, vaultID: vaultID,
+                                      phrase: phrase, limit: limit, filter: filter)
     }
 
     /// Current live Markdown heads, read from the same owner SQLite connection
     /// and never from source notes. No nested reconciliation takes place.
-    public func documents(limit: Int = 50, offset: Int = 0) throws -> DocumentPage {
+    public func documents(limit: Int = 50, offset: Int = 0,
+                          filter: ObsidianFilter? = nil) throws -> DocumentPage {
         guard let r = resources else { throw VaultRuntimeError.closed }
         guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
         try journal().assertResolved()
-        return try DocumentCatalog.list(db: r.db, vaultID: vaultID, limit: limit, offset: offset)
+        return try DocumentCatalog.list(db: r.db, vaultID: vaultID,
+                                        limit: limit, offset: offset, filter: filter)
     }
 
     public func inspectDocument(_ id: Data) throws -> IndexedDocument {
@@ -244,6 +248,31 @@ public final class VaultRuntime {
         guard let r = resources else { throw VaultRuntimeError.closed }
         let document = try inspectDocument(id)
         return try DocumentCatalog.content(objects: r.objects, document: document, maximumBytes: maximumBytes)
+    }
+
+    /// The immutable, revision-aligned YAML/tags projection. No source reads,
+    /// parser invocation or reconciliation happens on the HTTP request path.
+    public func documentMetadata(_ id: Data) throws -> [String: Any] {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        let note = try inspectDocument(id)
+        return try ObsidianMetadataIndex.document(db: r.db, vaultID: vaultID,
+                                                   id: id, revision: note.revisionID)
+    }
+
+    public func tags(limit: Int = 50, offset: Int = 0) throws -> [String: Any] {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
+        try journal().assertResolved()
+        return try ObsidianMetadataIndex.tags(db: r.db, vaultID: vaultID,
+                                               limit: limit, offset: offset)
+    }
+
+    public func properties(limit: Int = 50, offset: Int = 0) throws -> [String: Any] {
+        guard let r = resources else { throw VaultRuntimeError.closed }
+        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
+        try journal().assertResolved()
+        return try ObsidianMetadataIndex.properties(db: r.db, vaultID: vaultID,
+                                                     limit: limit, offset: offset)
     }
 
     /// Cooperative background maintenance: advance one bounded parse/resolve
@@ -396,6 +425,12 @@ public final class VaultRuntime {
                 return results
             }
             for captured in results { try index(captured) }
+            // v9 metadata migration: populate missing properties/tag rows
+            // from already verified immutable revisions, never source files.
+            // Do not declare the index ready with a partial backfill.
+            _ = try SearchIndex.backfillMetadata(
+                db: r.db, objects: r.objects, vaultID: vaultID,
+                maximumBytes: configuration.maximumBytes)
             // Deleted/quarantined incident bytes are retained; an unresolved
             // incident remains visible even when its original path disappears.
             let incidents = try status().openIncidents

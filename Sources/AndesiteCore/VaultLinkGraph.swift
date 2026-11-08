@@ -85,55 +85,6 @@ public enum VaultLinkGraph {
         return key(stripped)
     }
 
-    private static func unquote(_ text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespaces)
-        if trimmed.count >= 2,
-           (trimmed.first == "\"" && trimmed.last == "\"" ||
-            trimmed.first == "'" && trimmed.last == "'") {
-            return String(trimmed.dropFirst().dropLast())
-        }
-        return trimmed
-    }
-
-    /// Restricted extraction of the well-defined Obsidian aliases YAML list.
-    /// This is NOT a full YAML parser, and alias-only target names never
-    /// silently resolve to the aliased document. Obsidian uses aliases for
-    /// link suggestions and writes canonical targets with display labels.
-    private static func aliases(_ text: String) -> [String] {
-        let lines = text.components(separatedBy: .newlines)
-        guard lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) == "---" else { return [] }
-        var values: [String] = []
-        var insideAliases = false
-        var foundEnd = false
-        for line in lines.dropFirst().prefix(200) {
-            if line == "---" || line == "..." { foundEnd = true; break }
-            if line.hasPrefix("aliases:") {
-                insideAliases = true
-                let rest = String(line.dropFirst("aliases:".count)).trimmingCharacters(in: .whitespaces)
-                if rest.hasPrefix("["), rest.hasSuffix("]") {
-                    let inner = rest.dropFirst().dropLast()
-                    values += inner.split(separator: ",").map { unquote(String($0)) }
-                    insideAliases = false
-                } else if !rest.isEmpty {
-                    // Only list syntax is compatible with current Obsidian.
-                    insideAliases = false
-                }
-                continue
-            }
-            if insideAliases {
-                if line.hasPrefix("  - ") || line.hasPrefix("- ") {
-                    let token = line.hasPrefix("  - ") ?
-                        String(line.dropFirst(4)) : String(line.dropFirst(2))
-                    values.append(unquote(token))
-                } else if !line.trimmingCharacters(in: .whitespaces).isEmpty {
-                    insideAliases = false
-                }
-            }
-        }
-        guard foundEnd else { return [] }
-        return Array(Set(values.filter { !$0.isEmpty && $0.utf8.count <= 256 })).sorted()
-    }
-
     private static func blockIDs(_ text: String) -> [String] {
         // Only explicit Latin-letter/digit/hyphen block identifiers. Do not
         // extract from fenced or indented CommonMark code. Other nonstandard
@@ -308,13 +259,30 @@ public enum VaultLinkGraph {
                         let bytes = try DocumentCatalog.content(
                             objects: objects, document: head,
                             maximumBytes: maximumDocumentBytes)
-                        guard let text = String(data: bytes, encoding: .utf8) else {
-                            throw VaultLinkGraphError.inconsistentCatalog
-                        }
-                        let facts = try MarkdownAnalyzer.analyze(bytes)
-                        var refs = ObsidianLinks.extract(text).map {
+                        let metadata = try ObsidianMetadataParser.parse(bytes)
+                        let body = metadata.body
+                        let facts = try MarkdownAnalyzer.analyze(Data(body.utf8))
+                        var refs = ObsidianLinks.extract(body).map {
                             RawReference(syntax: "wikilink", target: $0.target,
                                          fragment: $0.fragment, display: $0.alias, embed: $0.embed)
+                        }
+                        // Obsidian also permits quoted [[internal links]] in
+                        // YAML text and list properties. Use decoded values
+                        // instead of treating the YAML source as note prose.
+                        for property in metadata.properties {
+                            let values: [String]
+                            if let scalar = property["value"] as? String {
+                                values = [scalar]
+                            } else {
+                                values = property["value"] as? [String] ?? []
+                            }
+                            for value in values {
+                                refs += ObsidianLinks.extract(value).map {
+                                    RawReference(syntax: "wikilink", target: $0.target,
+                                                 fragment: $0.fragment, display: $0.alias,
+                                                 embed: $0.embed)
+                                }
+                            }
                         }
                         for destination in facts.linkDestinations {
                             let parts = destination.split(separator: "#", maxSplits: 1,
@@ -324,9 +292,14 @@ public enum VaultLinkGraph {
                                 fragment: parts.count == 2 ? String(parts[1]) : nil,
                                 display: nil, embed: false))
                         }
+                        let aliasProperty = metadata.properties.first {
+                            ObsidianMetadataParser.canonicalProperty(
+                                $0["name"] as? String ?? "") == "aliases"
+                        }
+                        let aliases = aliasProperty?["value"] as? [String] ?? []
                         node = Node(document: head, references: refs,
                                     headings: facts.headings.map(\.text),
-                                    blocks: blockIDs(text), aliases: aliases(text))
+                                    blocks: blockIDs(body), aliases: aliases)
                         parsed += 1
                         cost += head.byteLength
                     }

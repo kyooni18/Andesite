@@ -6,8 +6,8 @@ cd "$(dirname "$0")/.."
 
 demo=$(mktemp -d /private/tmp/andesite-api-contract.XXXXXX)
 mkdir "$demo/vault"
-printf '# Sample\napi-contract-search-unique\n[[Other note#Part|Label]]\n' > "$demo/vault/note.md"
-printf '# Link target\n## Part\nA block ^block-3\n' > "$demo/vault/Other note.md"
+printf '%s\n' '---' 'tags: [Project/Work, research]' 'rating: 5' 'status: active' '---' '# Sample' 'api-contract-search-unique' '[[Other note#Part|Label]]' '#Project/Work' > "$demo/vault/note.md"
+printf '# Link target\n## Part\nA block ^block-3\n#project/other\n' > "$demo/vault/Other note.md"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 token=$(openssl rand -hex 32)
 state=$("${ANDESITE_SERVER_BIN:-.build/debug/andesite-server}" vault-state "$demo/vault")
@@ -54,6 +54,26 @@ grep -q '"structureAvailable":true' "$demo/response"
 grep -q 'Other note' "$demo/response"
 test "$(status -H "Authorization: Bearer $token" "$url/v1/documents/$document_id/content")" = 200
 grep -q 'api-contract-search-unique' "$demo/response"
+# YAML Properties and tags must be revision-indexed and queryable.
+test "$(status -H "Authorization: Bearer $token" "$url/v1/tags")" = 200
+python3 - "$demo/response" <<'PYDOC'
+import json,sys
+tags={item["canonical"] for item in json.load(open(sys.argv[1]))["tags"]}
+assert {"project/work","project/other","research"} <= tags, tags
+PYDOC
+test "$(status -H "Authorization: Bearer $token" "$url/v1/properties")" = 200
+grep -q '"canonical":"rating"' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents/$document_id/properties")" = 200
+grep -q '"state":"valid"' "$demo/response"
+grep -q '"type":"number"' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents?tag=project")" = 200
+grep -q '"total":2' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents?tag=project/work&property=rating&value=5")" = 200
+grep -q '"total":1' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/search?q=api-contract-search-unique&tag=project")" = 200
+grep -q 'note.md' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents?tag=1984")" = 400
+
 # Resolve a real target and its incoming mentions via the public HTTP API.
 test "$(status -H "Authorization: Bearer $token" "$url/v1/documents?limit=10")" = 200
 target_id=$(python3 - "$demo/response" <<'PYDOC'
@@ -126,6 +146,8 @@ done
 test "$tries" -lt 60
 test "$(status -H "Authorization: Bearer $token" "$url/v1/search?q=changed-through-edit-api")" = 200
 grep -q 'Updated via API' "$demo/response"
+test "$(status -H "Authorization: Bearer $token" "$url/v1/documents?tag=project/work")" = 200
+grep -q '"total":0' "$demo/response"
 test "$(status -H "Authorization: Bearer $token" "$url/v1/documents/$document_id/content")" = 200
 grep -q 'changed-through-edit-api' "$demo/response"
 test "$(status -X PUT -H "Authorization: Bearer $token" -H "If-Match: \"$original_revision\"" -H 'Content-Type: text/markdown; charset=utf-8' --data-binary @"$demo/new-note.md" "$url/v1/documents/$document_id/content")" = 412

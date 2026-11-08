@@ -46,11 +46,20 @@ def main() -> int:
     parser.add_argument("--state", required=True, help="absolute private state directory")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    for command in ("tags", "properties"):
+        summary = sub.add_parser(command)
+        summary.add_argument("--limit", type=int, default=50)
+        summary.add_argument("--offset", type=int, default=0)
     documents = sub.add_parser("documents")
     documents.add_argument("--limit", type=int, default=50)
     documents.add_argument("--offset", type=int, default=0)
+    documents.add_argument("--tag")
+    documents.add_argument("--property")
+    documents.add_argument("--value")
     document = sub.add_parser("document")
     document.add_argument("id")
+    document_properties = sub.add_parser("document-properties")
+    document_properties.add_argument("id")
     document_content = sub.add_parser("document-content")
     document_content.add_argument("id")
     for command in ("links", "backlinks"):
@@ -61,6 +70,9 @@ def main() -> int:
     search = sub.add_parser("search")
     search.add_argument("phrase")
     search.add_argument("--limit", type=int, default=50)
+    search.add_argument("--tag")
+    search.add_argument("--property")
+    search.add_argument("--value")
     listing = sub.add_parser("snapshots")
     selection = listing.add_mutually_exclusive_group()
     selection.add_argument("--path", help="historical vault-relative Markdown path")
@@ -77,10 +89,19 @@ def main() -> int:
         path = socket_path(args.state)
         if args.command == "status":
             url = "/v1/status"
+        elif args.command in ("tags", "properties"):
+            url = "/v1/" + args.command + "?" + urlencode({
+                "limit": args.limit, "offset": args.offset})
         elif args.command == "documents":
-            url = "/v1/documents?" + urlencode({"limit": args.limit, "offset": args.offset})
+            query = {"limit": args.limit, "offset": args.offset}
+            query.update({k: v for k, v in {
+                "tag": args.tag, "property": args.property, "value": args.value
+            }.items() if v is not None})
+            url = "/v1/documents?" + urlencode(query)
         elif args.command == "document":
             url = "/v1/documents/" + args.id
+        elif args.command == "document-properties":
+            url = "/v1/documents/" + args.id + "/properties"
         elif args.command == "document-content":
             url = "/v1/documents/" + args.id + "/content"
         elif args.command in ("links", "backlinks"):
@@ -88,7 +109,11 @@ def main() -> int:
                 "limit": args.limit, "offset": args.offset
             })
         elif args.command == "search":
-            url = "/v1/search?" + urlencode({"q": args.phrase, "limit": args.limit})
+            query = {"q": args.phrase, "limit": args.limit}
+            query.update({k: v for k, v in {
+                "tag": args.tag, "property": args.property, "value": args.value
+            }.items() if v is not None})
+            url = "/v1/search?" + urlencode(query)
         elif args.command == "snapshots":
             filters = {"limit": args.limit, "offset": args.offset}
             if args.path is not None:

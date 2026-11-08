@@ -9,7 +9,7 @@ public enum CatalogMigrationError: Error, Equatable {
 /// safe to use as a sync service until general operations/recovery and the
 /// remaining protocol tables are implemented (the local restore journal is v6). Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 8
+    public static let currentVersion = 9
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -110,6 +110,53 @@ public enum CatalogSchema {
                 try db.execute("ALTER TABLE mutation_journal ADD COLUMN replacement_hash BLOB REFERENCES objects(hash)")
                 try db.execute("ALTER TABLE mutation_journal ADD COLUMN intent_kind TEXT NOT NULL DEFAULT 'restore' CHECK(intent_kind IN ('restore','edit'))")
                 try db.execute("PRAGMA user_version=8")
+            }
+            if version < 9 {
+                // Entirely derived and rebuilt from immutable head revisions.
+                // No source Markdown or .obsidian settings are touched.
+                try db.execute("""
+                    CREATE TABLE document_properties (
+                      vault_id BLOB NOT NULL, entry_id BLOB NOT NULL,
+                      indexed_revision BLOB NOT NULL CHECK(length(indexed_revision)=16),
+                      state TEXT NOT NULL CHECK(state IN ('valid','invalid','absent')),
+                      properties_json TEXT NOT NULL, diagnostic TEXT,
+                      PRIMARY KEY(vault_id,entry_id),
+                      FOREIGN KEY(vault_id,entry_id) REFERENCES entries(vault_id,id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("""
+                    CREATE TABLE document_tags (
+                      vault_id BLOB NOT NULL, entry_id BLOB NOT NULL,
+                      indexed_revision BLOB NOT NULL CHECK(length(indexed_revision)=16),
+                      canonical TEXT NOT NULL, display TEXT NOT NULL,
+                      origin TEXT NOT NULL CHECK(origin IN ('inline','frontmatter')),
+                      PRIMARY KEY(vault_id,entry_id,canonical,origin),
+                      FOREIGN KEY(vault_id,entry_id) REFERENCES entries(vault_id,id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("CREATE INDEX document_tags_by_tag ON document_tags(vault_id,canonical,entry_id)")
+                try db.execute("""
+                    CREATE TABLE document_property_values (
+                      vault_id BLOB NOT NULL, entry_id BLOB NOT NULL,
+                      indexed_revision BLOB NOT NULL CHECK(length(indexed_revision)=16),
+                      name_key TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                      value_type TEXT NOT NULL, value_text TEXT NOT NULL,
+                      PRIMARY KEY(vault_id,entry_id,name_key,ordinal),
+                      FOREIGN KEY(vault_id,entry_id) REFERENCES entries(vault_id,id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("CREATE INDEX document_property_lookup ON document_property_values(vault_id,name_key,value_text,entry_id)")
+                try db.execute("""
+                    CREATE TABLE document_property_keys (
+                      vault_id BLOB NOT NULL, entry_id BLOB NOT NULL,
+                      indexed_revision BLOB NOT NULL CHECK(length(indexed_revision)=16),
+                      name_key TEXT NOT NULL, display TEXT NOT NULL, kind TEXT NOT NULL,
+                      PRIMARY KEY(vault_id,entry_id,name_key),
+                      FOREIGN KEY(vault_id,entry_id) REFERENCES entries(vault_id,id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("CREATE INDEX document_property_keys_by_name ON document_property_keys(vault_id,name_key,entry_id)")
+                try db.execute("PRAGMA user_version=9")
             }
         }
     }

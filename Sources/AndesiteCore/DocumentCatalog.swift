@@ -82,13 +82,31 @@ public enum DocumentCatalog {
     }
 
     public static func list(db: SQLiteConnection, vaultID: Data,
-                            limit: Int = 50, offset: Int = 0) throws -> DocumentPage {
+                            limit: Int = 50, offset: Int = 0,
+                            filter: ObsidianFilter? = nil) throws -> DocumentPage {
         guard (1...100).contains(limit), (0...100_000).contains(offset),
               vaultID.count == 16 else { throw DocumentCatalogError.invalidPage }
-        let total = try availableCount(db: db, vaultID: vaultID)
+        let baseCount = try availableCount(db: db, vaultID: vaultID)
+        let suffix = filter?.sql ?? ""
+        let filters = filter?.bindings ?? []
+        let total: Int
+        if filter == nil {
+            total = baseCount
+        } else {
+            let rows = try db.queryValues(
+                "SELECT count(*) " + liveJoin + suffix,
+                bindings: [.blob(vaultID)] + filters)
+            guard rows.count == 1, case .integer(let count) = rows[0][0],
+                  count >= 0, count <= baseCount else {
+                throw DocumentCatalogError.inconsistentMetadata
+            }
+            total = Int(count)
+        }
         let rows = try db.queryValues(
-            fields + " " + liveJoin + " ORDER BY e.path COLLATE BINARY, e.id LIMIT ? OFFSET ?",
-            bindings: [.blob(vaultID), .integer(Int64(limit)), .integer(Int64(offset))])
+            fields + " " + liveJoin + suffix +
+            " ORDER BY e.path COLLATE BINARY, e.id LIMIT ? OFFSET ?",
+            bindings: [.blob(vaultID)] + filters +
+                [.integer(Int64(limit)), .integer(Int64(offset))])
         return DocumentPage(documents: try rows.map(decode), total: total, offset: offset)
     }
 

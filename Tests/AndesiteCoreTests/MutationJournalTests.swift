@@ -377,6 +377,10 @@ private func killMaintenance(_ f: RuntimeFixture, command: String, arguments: [S
         try runtime.shutdown()
         if point == "retirement-intent" {
             let legacy = try f.catalog()
+            for table in ["document_property_values", "document_property_keys",
+                          "document_tags", "document_properties"] {
+                try legacy.execute("DROP TABLE " + table)
+            }
             for table in ["mutation_decision_history", "mutation_versions", "mutation_retirements", "mutation_decisions"] { try legacy.execute("DROP TABLE " + table) }
             // Reconstruct a genuine v6 journal shape before exercising
             // the v6 -> v7 -> v8 transactional upgrade in a child process.

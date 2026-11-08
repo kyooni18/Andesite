@@ -170,6 +170,7 @@ public final class VaultLocalHTTP {
     private func preview(_ id: Data, of d: IndexedDocument) throws -> [String: Any] {
         var detail: [String: Any] = [
             "document": documentJSON(d),
+            "metadata": try runtime.documentMetadata(id),
             "structureAvailable": false,
             "source": "last_completed_reconciliation"
         ]
@@ -179,16 +180,16 @@ public final class VaultLocalHTTP {
             return detail
         }
         let bytes = try runtime.documentContents(id, maximumBytes: maximumStructureBytes)
-        let facts = try MarkdownAnalyzer.analyze(bytes)
-        let text = String(decoding: bytes, as: UTF8.self)
-        let wiki = ObsidianLinks.extract(text)
+        let parsed = try ObsidianMetadataParser.parse(bytes)
+        let facts = try MarkdownAnalyzer.analyze(Data(parsed.body.utf8))
+        let wiki = ObsidianLinks.extract(parsed.body)
         detail["structureTruncated"] = facts.headings.count > 256 ||
             facts.linkDestinations.count > 256 || wiki.count > 256
         detail["headings"] = facts.headings.prefix(256).map { heading -> [String: Any] in
             [
                 "level": heading.level, "text": String(heading.text.prefix(512)),
-                "startLine": heading.startLine.map { $0 as Any } ?? NSNull(),
-                "endLine": heading.endLine.map { $0 as Any } ?? NSNull()
+                 "startLine": heading.startLine.map { ($0 + parsed.bodyLineOffset) as Any } ?? NSNull(),
+                "endLine": heading.endLine.map { ($0 + parsed.bodyLineOffset) as Any } ?? NSNull()
             ]
         }
         // These are lexical references, NOT resolved Obsidian links.
@@ -248,6 +249,22 @@ public final class VaultLocalHTTP {
               value.utf8.allSatisfy({ (48...57).contains($0) }),
               let n = Int(value), (1...100).contains(n) else { return nil }
         return n
+    }
+
+    private func validatedOffset(_ text: String?) -> Int? {
+        guard let text else { return 0 }
+        guard !text.isEmpty, text.utf8.count <= 6,
+              text.utf8.allSatisfy({ (48...57).contains($0) }),
+              let number = Int(text), number <= 100_000 else { return nil }
+        return number
+    }
+
+    private func validatedFilter(_ args: [String: String]) throws -> ObsidianFilter? {
+        if args["tag"] == nil && args["property"] == nil && args["value"] == nil {
+            return nil
+        }
+        return try ObsidianFilter(tag: args["tag"], property: args["property"],
+                                  value: args["value"])
     }
 
     /// Internal pure request decoding, with runtime access restricted to the
@@ -380,34 +397,54 @@ public final class VaultLocalHTTP {
                 ])
             }
             if path == "/v1/search" {
-                guard Set(args.keys).isSubset(of: ["q", "limit"]),
-                      let phrase = args["q"], let count = limit(args["limit"]),
-                      !phrase.isEmpty, phrase.utf8.count <= 1024 else {
+                guard Set(args.keys).isSubset(of: ["q", "limit", "tag", "property", "value"]),
+                      let count = limit(args["limit"]) else {
                     return .error(400, "invalid_search")
                 }
                 guard indexReady else { return .error(503, "rescan_pending") }
-                let found = try runtime.searchIndexed(phrase, limit: count).map {
-                    ["document": hex($0.entryID), "revision": hex($0.revisionID),
-                     "title": $0.title, "path": $0.path]
+                let search = try ObsidianSearchQuery.parse(
+                    args["q"] ?? "", explicitTag: args["tag"],
+                    explicitProperty: args["property"], explicitValue: args["value"])
+                let found: [[String: String]]
+                if let phrase = search.phrase {
+                    found = try runtime.searchIndexed(phrase, limit: count,
+                                                     filter: search.filter).map {
+                        ["document": hex($0.entryID), "revision": hex($0.revisionID),
+                         "title": $0.title, "path": $0.path]
+                    }
+                } else {
+                    let page = try runtime.documents(limit: count,
+                                                     filter: search.filter)
+                    found = page.documents.map {
+                        ["document": hex($0.id), "revision": hex($0.revisionID),
+                         "title": $0.title, "path": $0.path]
+                    }
                 }
                 return .json(200, ["hits": found, "source": "last_completed_reconciliation"])
             }
-            if path == "/v1/documents" {
+            if path == "/v1/tags" || path == "/v1/properties" {
                 guard Set(args.keys).isSubset(of: ["limit", "offset"]),
+                      let count = limit(args["limit"]),
+                      let offset = validatedOffset(args["offset"]) else {
+                    return .error(400, "invalid_metadata_query")
+                }
+                guard indexReady else { return .error(503, "rescan_pending") }
+                return .json(200, try path == "/v1/tags" ?
+                    runtime.tags(limit: count, offset: offset) :
+                    runtime.properties(limit: count, offset: offset))
+            }
+            if path == "/v1/documents" {
+                guard Set(args.keys).isSubset(of: ["limit", "offset", "tag", "property", "value"]),
                       let count = limit(args["limit"]) else {
                     return .error(400, "invalid_document_query")
                 }
-                let offset: Int
-                if let raw = args["offset"] {
-                    guard !raw.isEmpty, raw.utf8.count <= 6,
-                          raw.utf8.allSatisfy({ (48...57).contains($0) }),
-                          let parsed = Int(raw), parsed <= 100_000 else {
-                        return .error(400, "invalid_offset")
-                    }
-                    offset = parsed
-                } else { offset = 0 }
+                guard let offset = validatedOffset(args["offset"]) else {
+                    return .error(400, "invalid_offset")
+                }
                 guard indexReady else { return .error(503, "rescan_pending") }
-                let page = try runtime.documents(limit: count, offset: offset)
+                let filter = try validatedFilter(args)
+                let page = try runtime.documents(limit: count, offset: offset,
+                                                 filter: filter)
                 return .json(200, [
                     "documents": page.documents.map(documentJSON),
                     "total": page.total, "offset": page.offset,
@@ -425,6 +462,10 @@ public final class VaultLocalHTTP {
                 if documentPath.count == 4 {
                     guard args.isEmpty else { return .error(400, "unsupported_parameter") }
                     return .json(200, try preview(document, of: runtime.inspectDocument(document)))
+                }
+                if documentPath.count == 5 && documentPath[4] == "properties" {
+                    guard args.isEmpty else { return .error(400, "unsupported_parameter") }
+                    return .json(200, try runtime.documentMetadata(document))
                 }
                 if documentPath.count == 5 &&
                    (documentPath[4] == "links" || documentPath[4] == "backlinks") {
@@ -530,6 +571,10 @@ public final class VaultLocalHTTP {
             return .error(409, "unfinished_mutation")
         } catch MutationError.unsupportedPlatform {
             return .error(503, "unsupported_filesystem")
+        } catch ObsidianIndexError.invalidQuery {
+            return .error(400, "invalid_metadata_query")
+        } catch ObsidianIndexError.inconsistentIndex {
+            return .error(503, "metadata_index_inconsistent")
         } catch DocumentCatalogError.notFound {
             return .error(404, "document_not_found")
         } catch DocumentCatalogError.contentTooLarge {
