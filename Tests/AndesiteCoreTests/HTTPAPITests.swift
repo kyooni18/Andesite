@@ -238,3 +238,49 @@ private func converged(_ a: Vault, _ ra: URL, _ b: Vault, _ rb: URL) throws -> B
     await server.stop()
     try a.close(); try b.close()
 }
+
+@Test func aServerHostsSeveralVaultsThatDevicesListCreateAndDownload() async throws {
+    let fs = try RuntimeFixture(), fa = try RuntimeFixture(), fc = try RuntimeFixture()
+    defer { fs.clean(); fa.clean(); fc.clean() }
+    // A folder of vaults, one with a name stored decomposed (as macOS may).
+    let decomposed = "서고".decomposedStringWithCanonicalMapping
+    try FileManager.default.createDirectory(at: fs.vault.appendingPathComponent(decomposed), withIntermediateDirectories: false)
+    try Data("# Shelf\n".utf8).write(to: fs.vault.appendingPathComponent(decomposed).appendingPathComponent("shelf.md"))
+    try FileManager.default.createDirectory(at: fs.vault.appendingPathComponent(".hidden"), withIntermediateDirectories: false)
+    let library = VaultLibrary(root: fs.vault.path, stateRoot: fs.state.path)
+    let token = String(repeating: "5a", count: 32)
+    let port = Locked(0)
+    let task = Task { try await AndesiteHTTPServer.run(library: library, token: token, port: 0) { port.set($0) } }
+    while port.get() == 0 { try await Task.sleep(for: .milliseconds(10)) }
+    let url = URL(string: "http://127.0.0.1:\(port.get())")!
+
+    let any = try SyncClient(destination: url, token: token)
+    #expect(try await any.vaults() == ["서고"])
+    try await any.createVault("Work")
+    await #expect(throws: SyncTransportError.self) { try await any.createVault("Work") }
+    #expect(try await any.vaults() == ["Work", "서고"])
+
+    // A device downloads 서고 into an empty folder, then edits flow both ways.
+    let c = try fc.open()
+    #expect(try await c.sync(with: url, token: token, vault: "서고").received == 1)
+    #expect(try String(contentsOf: fc.vault.appendingPathComponent("shelf.md"), encoding: .utf8) == "# Shelf\n")
+    // Work stays separate from 서고.
+    let a = try fa.open()
+    try fa.write("work.md", "# Work\n")
+    _ = try await a.sync(with: url, token: token, vault: "Work")
+    #expect(try await c.sync(with: url, token: token, vault: "서고").received == 0)
+    #expect(FileManager.default.fileExists(atPath: fs.vault.appendingPathComponent("Work/work.md").path))
+    await #expect(throws: SyncTransportError.self) { _ = try await c.sync(with: url, token: token, vault: "missing") }
+
+    task.cancel(); _ = await task.result
+    await library.close()
+    try a.close(); try c.close()
+}
+
+final class Locked<T: Sendable>: @unchecked Sendable {
+    private var value: T
+    private let lock = NSLock()
+    init(_ value: T) { self.value = value }
+    func get() -> T { lock.withLock { value } }
+    func set(_ new: T) { lock.withLock { value = new } }
+}

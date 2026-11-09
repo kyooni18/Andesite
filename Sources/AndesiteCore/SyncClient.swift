@@ -28,8 +28,12 @@ public final class SyncClient: Sendable {
     private let endpoint: URL
     private let token: String
     private let http: URLSession
+    /// Where this vault's sync API lives on the server.
+    private let prefix: String
 
-    public init(destination: URL, token: String) throws {
+    /// `vault` names one vault of a server that hosts several
+    /// (`andesite-server serve-all`); nil is the server's only (or `main`) vault.
+    public init(destination: URL, token: String, vault: String? = nil) throws {
         let host = destination.host?.lowercased() ?? ""
         let loopback = ["localhost", "127.0.0.1", "::1", "[::1]"].contains(host)
         guard destination.scheme == "https" || (destination.scheme == "http" && loopback), !host.isEmpty,
@@ -40,6 +44,15 @@ public final class SyncClient: Sendable {
         }
         endpoint = destination
         self.token = token
+        if let vault {
+            guard !vault.isEmpty, !vault.hasPrefix("."), !vault.contains("/"),
+                  let escaped = vault.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+                throw SyncTransportError.invalidResponse
+            }
+            prefix = "/sync/vaults/" + escaped
+        } else {
+            prefix = "/sync"
+        }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 30
         configuration.httpCookieAcceptPolicy = .never
@@ -52,12 +65,12 @@ public final class SyncClient: Sendable {
     /// them locally, then push local revisions for the peer to resolve.
     public func sync(_ vault: Vault) async throws -> SyncReport {
         try await vault.refresh()
-        let peer: SyncIdentity = try decode(await request("GET", "/sync/identity"))
+        let peer: SyncIdentity = try decode(await request("GET", "\(prefix)/identity"))
 
         var report = SyncReport()
         var cursor = try await vault.perform(.background) { try $0.syncCursor(peer) }
         while true {
-            let batch: SyncBatch = try decode(await request("GET", "/sync/changes?after=\(cursor)&limit=\(VaultRuntime.syncPageLimit)"))
+            let batch: SyncBatch = try decode(await request("GET", "\(prefix)/changes?after=\(cursor)&limit=\(VaultRuntime.syncPageLimit)"))
             guard batch.vault == peer.vault, batch.epoch == peer.epoch, batch.through >= cursor else { throw SyncTransportError.invalidResponse }
             try await download(batch.records, into: vault)
             report.received += try await vault.perform(.background) { try $0.receive(batch) }
@@ -72,7 +85,7 @@ public final class SyncClient: Sendable {
             let batch = try await vault.perform(.background) { try $0.syncFeed(after: after) }
             if !batch.records.isEmpty {
                 try await upload(batch.records, from: vault)
-                let remote: SyncReport = try decode(await request("POST", "/sync/changes", body: try JSONEncoder().encode(batch)))
+                let remote: SyncReport = try decode(await request("POST", "\(prefix)/changes", body: try JSONEncoder().encode(batch)))
                 report.sent += remote.received
             }
             try await vault.perform(.background) { try $0.acknowledge(peer, through: batch.through) }
@@ -82,14 +95,26 @@ public final class SyncClient: Sendable {
         return report
     }
 
+    /// The vaults a `serve-all` server hosts, by name.
+    public func vaults() async throws -> [String] {
+        struct Listing: Decodable { struct Entry: Decodable { var name: String }; var vaults: [Entry] }
+        let listing: Listing = try decode(await request("GET", "/sync/vaults"))
+        return listing.vaults.map(\.name)
+    }
+
+    /// Adds an empty vault called `name` to a `serve-all` server.
+    public func createVault(_ name: String) async throws {
+        _ = try await request("POST", "/sync/vaults", body: try JSONEncoder().encode(["name": name]), expecting: 201)
+    }
+
     /// Waits up to `seconds` (at most 55) for the server to record changes
     /// this Vault has not pulled yet, and says whether there are any. A
     /// sync loop calls this between syncs so other devices' edits arrive
     /// at once, with one idle request open instead of frequent polling.
     public func waitForChanges(_ vault: Vault, seconds: Int = 25) async throws -> Bool {
-        let peer: SyncIdentity = try decode(await request("GET", "/sync/identity"))
+        let peer: SyncIdentity = try decode(await request("GET", "\(prefix)/identity"))
         let cursor = try await vault.perform(.background) { try $0.syncCursor(peer) }
-        let batch: SyncBatch = try decode(await request("GET", "/sync/changes?after=\(cursor)&limit=1&wait=\(seconds)",
+        let batch: SyncBatch = try decode(await request("GET", "\(prefix)/changes?after=\(cursor)&limit=1&wait=\(seconds)",
                                                         timeout: TimeInterval(seconds + 30)))
         guard batch.vault == peer.vault, batch.epoch == peer.epoch else { throw SyncTransportError.invalidResponse }
         return batch.head > cursor
@@ -105,7 +130,7 @@ public final class SyncClient: Sendable {
         let missing = try await vault.perform(.background, { [hashes = Array(sizes.keys)] in try $0.missingObjects(hashes) })
         let (small, large) = Self.split(missing, sizes)
         try await forEachConcurrently(Self.bundles(small, sizes)) { hashes in
-            let bundle = try await self.request("POST", "/sync/objects/fetch", body: try JSONEncoder().encode(hashes))
+            let bundle = try await self.request("POST", "\(self.prefix)/objects/fetch", body: try JSONEncoder().encode(hashes))
             let stored = try await vault.perform(.background) { try $0.receiveBundle(bundle) }
             guard stored == hashes.count else { throw SyncTransportError.invalidResponse }
         }
@@ -114,7 +139,7 @@ public final class SyncClient: Sendable {
             var offset = item.received
             repeat {
                 let at = offset, length = Int(min(Int64(VaultRuntime.chunkLimit), size - at))
-                let data = try await self.request("GET", "/sync/objects/\(item.hash)?offset=\(at)&length=\(length)")
+                let data = try await self.request("GET", "\(self.prefix)/objects/\(item.hash)?offset=\(at)&length=\(length)")
                 guard data.count == length else { throw SyncTransportError.invalidResponse }
                 offset = try await vault.perform(.background) { try $0.receiveChunk(item.hash, size: size, offset: at, data) }
                 guard offset > at || size == 0 else { throw SyncTransportError.invalidResponse }
@@ -125,12 +150,12 @@ public final class SyncClient: Sendable {
     /// Sends the content the peer lacks, resuming partial transfers.
     private func upload(_ records: [SyncRecord], from vault: Vault) async throws {
         let sizes = Self.sizes(records)
-        let missing: [ObjectProgress] = try decode(await request("POST", "/sync/objects/missing",
+        let missing: [ObjectProgress] = try decode(await request("POST", "\(prefix)/objects/missing",
                                                                  body: try JSONEncoder().encode(sizes.keys.sorted())))
         let (small, large) = Self.split(missing.filter { sizes[$0.hash] != nil }, sizes)
         try await forEachConcurrently(Self.bundles(small, sizes)) { hashes in
             let bundle = try await vault.perform(.background) { try $0.objectBundle(hashes) }
-            let reply = try await self.request("POST", "/sync/objects/bundle", body: bundle)
+            let reply = try await self.request("POST", "\(self.prefix)/objects/bundle", body: bundle)
             guard (try? JSONSerialization.jsonObject(with: reply) as? [String: Int])?["received"] == hashes.count else {
                 throw SyncTransportError.invalidResponse
             }
@@ -142,7 +167,7 @@ public final class SyncClient: Sendable {
                 let at = offset, length = Int(min(Int64(VaultRuntime.chunkLimit), size - at))
                 let data = try await vault.perform(.background) { try $0.objectChunk(item.hash, offset: at, length: length) }
                 let reply: ObjectProgress = try self.decode(await self.request(
-                    "PUT", "/sync/objects/\(item.hash)?size=\(size)&offset=\(at)", body: data,
+                    "PUT", "\(self.prefix)/objects/\(item.hash)?size=\(size)&offset=\(at)", body: data,
                     headers: ["X-Chunk-SHA256": ObjectStore.hash(data)]))
                 offset = reply.received
                 guard offset > at || size == 0 else { throw SyncTransportError.invalidResponse }
@@ -190,7 +215,7 @@ public final class SyncClient: Sendable {
     }
 
     private func request(_ method: String, _ path: String, body: Data? = nil, headers: [String: String] = [:],
-                         timeout: TimeInterval? = nil) async throws -> Data {
+                         timeout: TimeInterval? = nil, expecting status: Int = 200) async throws -> Data {
         var request = URLRequest(url: URL(string: endpoint.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path)!)
         request.httpMethod = method
         if let timeout { request.timeoutInterval = timeout }
@@ -199,7 +224,7 @@ public final class SyncClient: Sendable {
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         let (data, response) = try await http.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw SyncTransportError.invalidResponse }
-        guard response.statusCode == 200 else {
+        guard response.statusCode == status else {
             throw SyncTransportError.rejected(response.statusCode, String(decoding: data.prefix(512), as: UTF8.self))
         }
         return data

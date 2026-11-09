@@ -75,3 +75,15 @@ Errors return `{"error": code}`:
 A bundle is a sequence of frames, one per object: the 64-character hex hash,
 the object's length as 8 bytes big-endian, then its bytes. Each object is
 checked against its hash before it is stored.
+
+## Several vaults
+
+`andesite-server serve-all <folder> --state <dir>` serves every folder inside
+`<folder>` as its own vault (hidden folders excepted), opening each when it is
+first used. Each vault's sync API is at `/sync/vaults/<name>/…` (the same
+routes as above); `/sync/…` is the vault named `main`.
+
+| Route | Purpose |
+|---|---|
+| `GET /sync/vaults` | `{"vaults": [{"name": …}]}` |
+| `POST /sync/vaults` `{"name": …}` | add an empty vault; 201, or 409 when it exists |

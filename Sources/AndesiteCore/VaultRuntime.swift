@@ -134,14 +134,18 @@ public final class VaultRuntime {
                 // Same-filesystem renames preserve the directory's inode.
                 // Require that identity AND the path-only marker that moved
                 // with the Vault. Existing revisions and IDs are preserved.
+                // At the same path, the marker alone is enough: some file
+                // systems (a folder shared into a VM) renumber inodes on
+                // every mount, while the marker lives inside the folder.
                 let pieces = recorded.split(separator: "\n", omittingEmptySubsequences: false)
                 let priorIdentity = "\(rootInfo.st_dev):\(rootInfo.st_ino)"
-                guard pieces.count == 2, String(pieces[1]) == priorIdentity,
-                      let oldPath = pieces.first.map(String.init), oldPath != vault,
-                      let selected = try VaultPathRegistry(vaultDirectory: vault).storedPath(),
-                      selected == oldPath || selected == vault else {
+                guard pieces.count == 2, let oldPath = pieces.first.map(String.init),
+                      let selected = try VaultPathRegistry(vaultDirectory: vault).storedPath() else {
                     throw VaultRuntimeError.identityMismatch
                 }
+                let moved = String(pieces[1]) == priorIdentity && oldPath != vault && (selected == oldPath || selected == vault)
+                let renumbered = oldPath == vault && selected == vault
+                guard moved || renumbered else { throw VaultRuntimeError.identityMismatch }
                 try db.transaction {
                     try db.executeValues(
                         "UPDATE vaults SET root_config=? WHERE id=? AND root_config=?",

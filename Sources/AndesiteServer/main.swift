@@ -35,8 +35,10 @@ Snapshots:
 Services (stop with SIGINT or SIGTERM):
   watch                                 monitor the Vault
   serve [--port 8788]                   watch and serve the HTTP API on 127.0.0.1
-  sync <https://host[:port]> [--every <seconds>]
-                                        two-way sync with a served Vault
+  serve-all [--port 8788]               <vault> is a folder of vaults: serve sync for each
+                                        (state in --state <dir>/<name>, required)
+  sync <https://host[:port]> [--every <seconds>] [--vault <name>]
+                                        two-way sync with a served Vault (--vault: one of a serve-all server's)
 serve and sync read the bearer token from ANDESITE_API_TOKEN (64 hex digits).
 """
 
@@ -121,6 +123,19 @@ func main() async throws {
     default: break
     }
 
+    if command == "serve-all" {
+        try expect(0...0)
+        guard let state = options["state"], let port = Int(options["port"] ?? "8788"), (0...65535).contains(port) else {
+            throw UsageError()
+        }
+        let library = VaultLibrary(root: vaultPath, stateRoot: state, report: report)
+        try await AndesiteHTTPServer.run(library: library, token: try token(), port: port) { bound in
+            report("api-ready host=127.0.0.1 port=\(bound) vaults=\(vaultPath)")
+        }
+        await library.close()
+        return
+    }
+
     let vault = try Vault(at: vaultPath, options: .init(stateDirectory: options["state"], watch: false))
     defer {
         do { try vault.close() } catch { FileHandle.standardError.write(Data("closing failed: \(error)\n".utf8)) }
@@ -147,7 +162,7 @@ func main() async throws {
             for failure in r.failures { report("sync-pending \(failure)") }
         }
         guard let interval = options["every"].flatMap(Double.init) else {
-            return describe(try await vault.sync(with: url, token: token()))
+            return describe(try await vault.sync(with: url, token: token(), vault: options["vault"]))
         }
         // Offline or interrupted: progress so far is kept; retried later.
         let waitForTermination = terminationSignals()

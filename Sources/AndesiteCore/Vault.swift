@@ -341,8 +341,9 @@ public final class Vault: @unchecked Sendable {
 
     /// One two-way sync with a server (`andesite-server serve`). Requires
     /// HTTPS unless the server is on this machine.
-    public func sync(with server: URL, token: String) async throws -> SyncReport {
-        try await SyncClient(destination: server, token: token).sync(self)
+    /// `vault` names one vault of a server hosting several (`serve-all`).
+    public func sync(with server: URL, token: String, vault: String? = nil) async throws -> SyncReport {
+        try await SyncClient(destination: server, token: token, vault: vault).sync(self)
     }
 
     /// Syncs now and then every `interval` seconds until `stopSyncing` or
