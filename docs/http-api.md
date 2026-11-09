@@ -5,6 +5,11 @@ request needs `Authorization: Bearer <token>`, where the token is the
 `ANDESITE_API_TOKEN` the server was started with. Revisions are 32-hex-digit
 IDs. Writes require the current revision, or `If-None-Match: *` to create.
 
+The server answers as soon as it starts. Document and index routes run as
+user requests, ahead of indexing and sync; sync routes run as background
+work (see [architecture.md](architecture.md#scheduling)). Until the first
+scan completes, index routes return 503 `index_not_ready`.
+
 ## Documents
 
 | Route | Request | Response |
@@ -62,5 +67,5 @@ Errors return `{"error": code}`:
 | 412 | `revision_conflict` with `current` | the document changed; read it again |
 | 413 | `too_large` | over the size limit |
 | 422 | `unsupported` | for example invalid UTF-8 or unparsable frontmatter |
-| 503 | `index_not_ready` | catalog inconsistent or session closed |
+| 503 | `index_not_ready` | the first scan has not finished, the last scan failed, or the vault is closing |
 | 507 | `storage_full` | disk or quota full; see architecture.md |

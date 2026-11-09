@@ -6,12 +6,48 @@ indexes notes for search, links, tags and properties, and synchronises
 vaults with each other over authenticated HTTP.
 
 There is one implementation, `VaultRuntime` in `AndesiteCore`. An app embeds it
-through `VaultSession`. The `andesite-server` CLI, the HTTP server and the sync
-client all call the same `VaultSession`.
+through the `Vault` class. The `andesite-server` CLI, the HTTP server and the
+sync client all call the same `Vault`.
 
 - [docs/architecture.md](docs/architecture.md): how it works, guarantees and
   limitations
 - [docs/http-api.md](docs/http-api.md): the HTTP API
+
+## Use it from Swift
+
+Add the `AndesiteCore` library product. Opening a vault starts everything it
+needs: the folder watcher, indexing, recovery snapshots and crash recovery.
+Calls from your app run before background work, which pauses to let them in.
+
+```swift
+import AndesiteCore
+
+let vault = try Vault(at: "/Users/me/Notes")
+let note = try await vault.create("Ideas.md", "# Ideas\n")
+try await vault.update("Ideas.md", "# Ideas\nSee [[Plans]]\n", revision: note.revisionID)
+try await vault.move("Plans.md", to: "Projects/Plans.md",
+                     revision: vault.document("Plans.md").revisionID)  // links are rewritten
+let hits = try await vault.search("plans")
+let backlinks = try await vault.links("Projects/Plans.md", direction: .incoming)
+try vault.close()
+```
+
+Every change takes the revision it is based on and throws
+`VaultError.conflict(current:)` if the document changed meanwhile. Index
+queries throw `VaultRuntimeError.indexNotReady` until the first scan has
+finished; `try await vault.refresh()` waits for a scan.
+
+For finer control:
+
+- `Vault.Options`: state directory, `watch: false`, watcher timing
+  (`VaultMonitorSettings`), size limits, and a `report` callback for
+  background events.
+- `startWatching` / `stopWatching`, `refresh`, `collectGarbage`,
+  `configureSnapshots`.
+- `sync(with:token:)` once, or `startSyncing(with:token:every:)` in the
+  background.
+- `perform(.read | .write | .background) { runtime in ... }` (async) and
+  `run` (blocking) to call `VaultRuntime` directly, with that priority.
 
 ## Build and test
 
@@ -24,6 +60,7 @@ scripts/test-api-server.sh    # CLI + HTTP server smoke test, including SIGKILL/
 scripts/test-sync-server.sh   # two servers syncing over HTTP
 scripts/test-linux.sh         # the suite on Linux in Docker, including a real full-disk test
 scripts/benchmark.sh 10000    # timings on a generated vault
+scripts/latency.sh 10000      # request latency while indexing and during edits
 ```
 
 All tests and scripts use disposable temporary vaults.

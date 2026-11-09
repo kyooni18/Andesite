@@ -3,11 +3,41 @@
 ## One owner
 
 `VaultRuntime` (AndesiteCore) is the whole backend. It is synchronous and owns
-one SQLite connection. `VaultSession` wraps it in one serial dispatch queue.
-`run` is the synchronous entry point and `perform` the async one. The CLI, the
-HTTP server (`AndesiteHTTP`, Hummingbird), the sync client and the watcher are
-all callers of one session. A process lock in the state directory makes sure a
-second process cannot open the same catalog.
+one SQLite connection. `Vault` is the public Swift API: it owns the runtime and
+runs every call on one thread per vault (`VaultExecutor`). Its async methods
+(`create`, `search`, `links`, ...) are what an app calls; `perform` and `run`
+give direct access to the runtime. The CLI, the HTTP server (`AndesiteHTTP`,
+Hummingbird), the sync client and the watcher are all callers of one `Vault`.
+A process lock in the state directory makes sure a second process cannot open
+the same catalog.
+
+## Scheduling
+
+Each call is user work (`.read` or `.write`) or `.background` work. The
+vault's thread runs:
+
+1. User requests, in arrival order.
+2. Queued background work (sync steps, `refresh`, garbage collection), then
+   the watcher.
+
+Background work that has waited 0.5 s runs next anyway, so steady traffic
+cannot stall indexing. While background work runs, waiting user requests
+enter at safe points outside transactions:
+
+- **Reads** enter at any of them: between files, between folders while the
+  vault is enumerated, while a scan waits for files to settle. They run with
+  catalog writes refused (`PRAGMA query_only`).
+- **Writes** enter between a scan's batches. A waiting write ends the batch
+  early, and notes are parsed before the batch commits, so the write waits
+  only for that batch's SQL.
+
+A write that entered a scan may have changed what the scan saw. The scan
+keeps its captures, leaves moves and deletions to the next pass and reports
+itself incomplete; so does a scan that saw a file change while it ran. The
+index stays usable meanwhile. The watcher scans again after the usual quiet
+period; after three incomplete scans in a row, writes wait during the next
+one, so moves and deletions are always applied. Sync and other background
+work let reads in, not writes.
 
 State directory (private, outside the vault):
 
@@ -50,13 +80,17 @@ External edits are captured by reconcile:
 
 ## Watching
 
-`VaultWatcher` runs on the session queue:
+`Vault` starts the watcher when it opens (unless `Options.watch` is false).
+`VaultWatcher` runs on the vault's thread as background work:
 
 - File events come from FSEvents on macOS and from recursive inotify on Linux.
   An inotify queue overflow, or a folder that can't be watched, triggers a
   rescan.
 - A scheduler coalesces bursts: it waits 0.4 s after the last event, and at
   most 2 s while events keep arriving.
+- The first scan starts at once; until it completes, index queries throw
+  `VaultRuntimeError.indexNotReady` (HTTP 503). Document reads and writes
+  work meanwhile.
 - It retries failures with backoff and runs a fallback rescan every 5 minutes.
 - The full catalog/object cross-check runs on a runtime's first scan and then
   at most every 5 minutes.
@@ -136,14 +170,28 @@ notes with 5 links each):
 | Rename with link updates | 0.26 s | 0.72 s |
 | Peak memory | 38 MB | 120 MB |
 
-While the watcher captures continuous edits in a 10,000-note vault, served
-requests take 8.5 ms at p95. The worst request waited 583 ms, behind one
-whole-vault scan.
+Request latency over HTTP, measured with `scripts/latency.sh 10000` (10,000
+notes; one read and one write about every 70 ms; the edits phase also appends
+to a note every 50 ms). Before is the single serial queue (commit fdeb94d).
+
+| | Before | Now |
+|---|---|---|
+| API reachable after start | 20.8 s (after the initial index) | 0.5 s |
+| Read during initial index | unavailable | p95 8 ms, max 11 ms |
+| Write during initial index | unavailable | p50 58 ms, p95 80 ms, max 0.39 s |
+| Search during edits | 188 of 216 failed (503) during rescans; max 0.55 s | none failed; p95 32 ms, max 41 ms |
+| Write during edits | p95 28 ms, max 53 ms | p95 42 ms, max 0.49 s |
+
+Search itself takes about 30 ms at this size. The worst writes wait for one
+whole scan pass that holds writes back (one in four under continuous
+writes). The initial index took 34 s while serving these requests, against
+25 s without them.
 
 ## Known limitations
 
-- The session is one serial queue. A large initial scan blocks requests until
-  it ends, and every watcher scan stats the whole vault.
+- Every watcher scan stats the whole vault. Writes cannot enter while the
+  folder is enumerated (about 0.2 s at 10,000 notes) or during a pass that
+  holds them back, so the worst write waits about 0.5 s at that size.
 - Swap cycles among pending sync entries are broken with a conflict-copy path,
   which can differ between peers.
 - Inline body `#tags` are not edited. Link rewriting does not touch links
