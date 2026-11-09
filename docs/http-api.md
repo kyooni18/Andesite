@@ -48,9 +48,11 @@ These routes are used by `SyncClient`; see [architecture.md](architecture.md#syn
 | Route | Purpose |
 |---|---|
 | `GET /sync/identity` | vault ID and epoch |
-| `GET /sync/changes?after=&limit=` | revision feed page |
+| `GET /sync/changes?after=&limit=&wait=` | revision feed page; with `wait` (seconds, at most 55) the reply is held until the feed moves past `after` |
 | `POST /sync/changes` | receive a batch from a peer, then resolve it |
 | `POST /sync/objects/missing` | which of the given objects are absent or partial |
+| `POST /sync/objects/fetch` | whole objects (each at most 1 MiB) for a JSON list of hashes, as a bundle of at most 4 MiB |
+| `POST /sync/objects/bundle` | store a bundle of whole objects; replies `{"received": n}` |
 | `GET /sync/objects/{hash}?offset=&length=` | object chunk (at most 4 MiB) |
 | `PUT /sync/objects/{hash}?size=&offset=` | upload a chunk; optional `X-Chunk-SHA256` header |
 
@@ -69,3 +71,7 @@ Errors return `{"error": code}`:
 | 422 | `unsupported` | for example invalid UTF-8 or unparsable frontmatter |
 | 503 | `index_not_ready` | the first scan has not finished, the last scan failed, or the vault is closing |
 | 507 | `storage_full` | disk or quota full; see architecture.md |
+
+A bundle is a sequence of frames, one per object: the 64-character hex hash,
+the object's length as 8 bytes big-endian, then its bytes. Each object is
+checked against its hash before it is stored.

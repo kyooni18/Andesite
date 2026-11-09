@@ -150,6 +150,50 @@ extension VaultRuntime {
         return try requireOpen().objects.chunk(hash, offset: offset, length: length)
     }
 
+    // MARK: Bundles
+
+    /// Objects up to this size travel whole, many to a request, in bundles
+    /// of at most `chunkLimit` bytes. Larger ones use resumable chunks.
+    public static let bundledObjectLimit: Int64 = 1024 * 1024
+
+    /// The whole objects `hashes`, framed as `ObjectBundle`. Absent ones
+    /// are skipped; the bundle stops before it would exceed `chunkLimit`.
+    public func objectBundle(_ hashes: [String]) throws -> Data {
+        guard hashes.count <= 5000, hashes.allSatisfy(ObjectStore.validHash) else { throw SyncError.invalidBatch("hashes") }
+        let objects = try requireOpen().objects
+        var bundle = Data()
+        for hash in hashes where objects.contains(hash) {
+            guard let size = objects.size(hash), size <= Self.bundledObjectLimit,
+                  bundle.count + ObjectBundle.frameOverhead + Int(size) <= Self.chunkLimit else { continue }
+            ObjectBundle.append(hash, try objects.chunk(hash, offset: 0, length: Int(size)), to: &bundle)
+        }
+        return bundle
+    }
+
+    /// Stores every object of a bundle, checking each against its hash.
+    /// Returns how many were stored.
+    @discardableResult
+    public func receiveBundle(_ bundle: Data) throws -> Int {
+        guard bundle.count <= Self.chunkLimit + 1024 * 1024 else { throw SyncError.invalidBatch("bundle") }
+        let objects = try requireOpen().objects
+        let frames = try ObjectBundle.frames(bundle)
+        for (hash, bytes) in frames {
+            guard Int64(bytes.count) <= min(Self.bundledObjectLimit, Int64(configuration.maximumFileBytes)),
+                  ObjectStore.hash(bytes) == hash else { throw SyncError.invalidBatch("object \(hash) does not match its hash") }
+            if !objects.contains(hash) { try objects.put(bytes) }
+        }
+        return frames.count
+    }
+
+    /// The newest feed position, for waiting on changes.
+    public func syncHead() throws -> Int64 {
+        guard case .integer(let next) = try requireOpen().db.queryValues("SELECT next_seq FROM vaults WHERE id=?",
+                                                                         bindings: [.blob(vaultID)]).first?.first else {
+            throw VaultRuntimeError.inconsistentCatalog
+        }
+        return next - 1
+    }
+
     // MARK: Progress
 
     /// How far this Vault has received the feed of `peer`.
@@ -251,28 +295,36 @@ extension VaultRuntime {
     public func resolvePending() throws -> SyncReport {
         var report = SyncReport()
         try journal().recover()
-        var waiting = Set<Data>(), failed: [Data: String] = [:], forced = false
+        var failed: [Data: String] = [:], forced = false
+        // Works through the pending documents in passes over one ordered
+        // list, instead of querying for the next one after every document.
         while true {
-            _ = cooperation.yield(false)
-            guard let entry = try pendingEntries().first(where: { !waiting.contains($0) && failed[$0] == nil }) else {
-                // Only documents waiting on each other remain (for example
-                // two that swapped names): resolve them without waiting.
-                if !forced, !waiting.isEmpty { forced = true; waiting.removeAll(); continue }
-                break
-            }
-            do {
-                if try resolve(entry, forced: forced, &report) {
-                    try requireOpen().db.executeValues("DELETE FROM sync_pending WHERE vault_id=? AND entry_id=?",
-                                                       bindings: [.blob(vaultID), .blob(entry)])
-                    waiting.removeAll()
-                    forced = false
-                } else {
-                    waiting.insert(entry)
+            let ordered = try pendingEntries().filter { failed[$0] == nil }
+            guard !ordered.isEmpty else { break }
+            var pending = Set(ordered), progressed = false
+            for entry in ordered where pending.contains(entry) {
+                _ = cooperation.yield(false)
+                do {
+                    if try resolve(entry, forced: forced, pending: pending, &report) {
+                        try requireOpen().db.executeValues("DELETE FROM sync_pending WHERE vault_id=? AND entry_id=?",
+                                                           bindings: [.blob(vaultID), .blob(entry)])
+                        pending.remove(entry)
+                        progressed = true
+                        forced = false
+                    }
+                } catch VaultRuntimeError.closed {
+                    throw VaultRuntimeError.closed
+                } catch {
+                    failed[entry] = "\(error)"
+                    pending.remove(entry)
+                    progressed = true
                 }
-            } catch VaultRuntimeError.closed {
-                throw VaultRuntimeError.closed
-            } catch {
-                failed[entry] = "\(error)"
+            }
+            // Only documents waiting on each other remain (for example two
+            // that swapped names): resolve them without waiting.
+            if !progressed {
+                if forced { break }
+                forced = true
             }
         }
         report.pending = try pendingEntries().count
@@ -291,7 +343,7 @@ extension VaultRuntime {
 
     /// Returns false when the document must wait for another pending
     /// document to leave its path first.
-    private func resolve(_ id: Data, forced: Bool, _ report: inout SyncReport) throws -> Bool {
+    private func resolve(_ id: Data, forced: Bool, pending: Set<Data>, _ report: inout SyncReport) throws -> Bool {
         let db = try requireOpen().db
         for _ in 0..<4 {
             var graph = try RevisionGraph(db: db, vaultID: vaultID, entry: id)
@@ -308,7 +360,7 @@ extension VaultRuntime {
             if !revision.deleted {
                 let path = try vaultPath(revision.path)
                 if let occupant = try Catalog.live(db: db, vaultID: vaultID, path: path), occupant.id != id {
-                    if !forced, try pendingEntries().contains(occupant.id) { return false }
+                    if !forced, pending.contains(occupant.id) { return false }
                     if !live, occupant.hash == revision.hash {
                         do { try adopt(id, target: revision, path: path, occupant: occupant) } catch VaultError.conflict { continue }
                         report.applied += 1

@@ -148,6 +148,30 @@ private func converged(_ a: Vault, _ ra: URL, _ b: Vault, _ rb: URL) throws -> B
     try a.close(); try b.close()
 }
 
+@Test func aWaitingDeviceWakesAsSoonAsAnotherPushes() async throws {
+    let fs = try RuntimeFixture(), fa = try RuntimeFixture(), fc = try RuntimeFixture()
+    defer { fs.clean(); fa.clean(); fc.clean() }
+    let s = try Vault(at: fs.vault.path, options: .init(stateDirectory: fs.state.path, watch: false))
+    let a = try Vault(at: fa.vault.path, options: .init(stateDirectory: fa.state.path, watch: false))
+    let c = try Vault(at: fc.vault.path, options: .init(stateDirectory: fc.state.path, watch: false))
+    let server = try await TestServer(s)
+    let client = try SyncClient(destination: server.url, token: server.token)
+    _ = try await client.sync(c)
+    #expect(try await client.waitForChanges(c, seconds: 1) == false)
+
+    let waiting = Task { try await client.waitForChanges(c, seconds: 30) }
+    try await Task.sleep(for: .milliseconds(300))
+    for i in 0..<30 { try fa.write("note-\(i).md", "# \(i)\n") } // several notes go in one bundle
+    let start = ContinuousClock.now
+    _ = try await client.sync(a)
+    #expect(try await waiting.value == true)
+    #expect(ContinuousClock.now - start < .seconds(5))
+    #expect(try await client.sync(c).received == 30)
+    #expect(try converged(a, fa.vault, c, fc.vault))
+    await server.stop()
+    try s.close(); try a.close(); try c.close()
+}
+
 @Test func syncKilledWhileApplyingResumesConsistently() async throws {
     let fa = try RuntimeFixture(), fb = try RuntimeFixture(); defer { fa.clean(); fb.clean() }
     try fa.write("note.md", "one\ntwo\n")

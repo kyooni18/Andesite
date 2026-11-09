@@ -15,6 +15,9 @@ public enum AndesiteHTTPServer {
     /// Largest file accepted by PUT /v1/file; the Vault's own limits also apply.
     public static let maximumUpload = 4 * 1024 * 1024 * 1024
 
+    /// Longest a `GET /sync/changes?wait=` request is held, in seconds.
+    public static let maximumSyncWait = 55
+
     public static func isValidToken(_ token: String) -> Bool {
         token.utf8.count == 64 && token.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) || (65...70).contains($0) }
     }
@@ -228,7 +231,18 @@ public enum AndesiteHTTPServer {
         router.get("/sync/changes") { request, _ in
             let q = request.uri.queryParameters
             let (after, limit) = (q["after"].flatMap { Int64($0) } ?? 0, int(q["limit"]) ?? VaultRuntime.syncPageLimit)
-            return await respond { try encoded(await vault.perform(.background) { try $0.syncFeed(after: after, limit: limit) }) }
+            // With `wait`, hold the request until the feed moves past `after`
+            // (at most `maximumSyncWait` seconds), so clients learn of
+            // changes at once instead of on their next poll.
+            let wait = min(max(int(q["wait"]) ?? 0, 0), maximumSyncWait)
+            return await respond {
+                let deadline = ContinuousClock.now + .seconds(wait)
+                while wait > 0, ContinuousClock.now < deadline,
+                      try await vault.perform(.background, { try $0.syncHead() }) <= after {
+                    try await Task.sleep(for: .milliseconds(200))
+                }
+                return try encoded(await vault.perform(.background) { try $0.syncFeed(after: after, limit: limit) })
+            }
         }
         router.post("/sync/changes") { request, _ in
             let body = try await Data(buffer: request.body.collect(upTo: 8 * 1024 * 1024))
@@ -247,6 +261,20 @@ public enum AndesiteHTTPServer {
             return await respond {
                 guard let hashes = try? JSONDecoder().decode([String].self, from: body) else { throw APIError(.badRequest, "invalid_json") }
                 return try encoded(await vault.perform(.background) { try $0.missingObjects(hashes) })
+            }
+        }
+        router.post("/sync/objects/fetch") { request, _ in
+            let body = try await Data(buffer: request.body.collect(upTo: 1024 * 1024))
+            return await respond {
+                guard let hashes = try? JSONDecoder().decode([String].self, from: body) else { throw APIError(.badRequest, "invalid_json") }
+                return Reply(body: try await vault.perform(.background) { try $0.objectBundle(hashes) },
+                             contentType: "application/octet-stream")
+            }
+        }
+        router.post("/sync/objects/bundle") { request, _ in
+            let body = try await Data(buffer: request.body.collect(upTo: VaultRuntime.chunkLimit + 1024 * 1024))
+            return await respond {
+                try json(["received": try await vault.perform(.background) { try $0.receiveBundle(body) }])
             }
         }
         router.get("/sync/objects/{hash}") { request, context in
