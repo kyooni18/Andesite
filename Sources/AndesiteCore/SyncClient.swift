@@ -52,12 +52,12 @@ public final class SyncClient: Sendable {
     /// them locally, then push local revisions for the peer to resolve.
     public func sync(_ vault: Vault) async throws -> SyncReport {
         try await vault.refresh()
-        let peer: SyncIdentity = try decode(await request("GET", "/v1/sync/identity"))
+        let peer: SyncIdentity = try decode(await request("GET", "/sync/identity"))
 
         var report = SyncReport()
         var cursor = try await vault.perform(.background) { try $0.syncCursor(peer) }
         while true {
-            let batch: SyncBatch = try decode(await request("GET", "/v1/sync/changes?after=\(cursor)&limit=\(VaultRuntime.syncPageLimit)"))
+            let batch: SyncBatch = try decode(await request("GET", "/sync/changes?after=\(cursor)&limit=\(VaultRuntime.syncPageLimit)"))
             guard batch.vault == peer.vault, batch.epoch == peer.epoch, batch.through >= cursor else { throw SyncTransportError.invalidResponse }
             try await download(batch.records, into: vault)
             report.received += try await vault.perform(.background) { try $0.receive(batch) }
@@ -72,7 +72,7 @@ public final class SyncClient: Sendable {
             let batch = try await vault.perform(.background) { try $0.syncFeed(after: after) }
             if !batch.records.isEmpty {
                 try await upload(batch.records, from: vault)
-                let remote: SyncReport = try decode(await request("POST", "/v1/sync/changes", body: try JSONEncoder().encode(batch)))
+                let remote: SyncReport = try decode(await request("POST", "/sync/changes", body: try JSONEncoder().encode(batch)))
                 report.sent += remote.received
             }
             try await vault.perform(.background) { try $0.acknowledge(peer, through: batch.through) }
@@ -91,7 +91,7 @@ public final class SyncClient: Sendable {
             var offset = missing.received
             repeat {
                 let at = offset, length = Int(min(Int64(VaultRuntime.chunkLimit), size - at))
-                let data = try await request("GET", "/v1/sync/objects/\(hash)?offset=\(at)&length=\(length)")
+                let data = try await request("GET", "/sync/objects/\(hash)?offset=\(at)&length=\(length)")
                 guard data.count == length else { throw SyncTransportError.invalidResponse }
                 offset = try await vault.perform(.background) { try $0.receiveChunk(hash, size: size, offset: at, data) }
                 guard offset > at || size == 0 else { throw SyncTransportError.invalidResponse }
@@ -102,7 +102,7 @@ public final class SyncClient: Sendable {
     /// Sends the content the peer lacks, resuming partial transfers.
     private func upload(_ records: [SyncRecord], from vault: Vault) async throws {
         let sizes = Dictionary(records.compactMap { r in r.hash.map { ($0, r.size ?? 0) } }, uniquingKeysWith: { a, _ in a })
-        let missing: [ObjectProgress] = try decode(await request("POST", "/v1/sync/objects/missing",
+        let missing: [ObjectProgress] = try decode(await request("POST", "/sync/objects/missing",
                                                                  body: try JSONEncoder().encode(sizes.keys.sorted())))
         for item in missing {
             guard let size = sizes[item.hash] else { continue }
@@ -111,7 +111,7 @@ public final class SyncClient: Sendable {
                 let at = offset, length = Int(min(Int64(VaultRuntime.chunkLimit), size - at))
                 let data = try await vault.perform(.background) { try $0.objectChunk(item.hash, offset: at, length: length) }
                 let reply: ObjectProgress = try decode(await request(
-                    "PUT", "/v1/sync/objects/\(item.hash)?size=\(size)&offset=\(at)", body: data,
+                    "PUT", "/sync/objects/\(item.hash)?size=\(size)&offset=\(at)", body: data,
                     headers: ["X-Chunk-SHA256": ObjectStore.hash(data)]))
                 offset = reply.received
                 guard offset > at || size == 0 else { throw SyncTransportError.invalidResponse }

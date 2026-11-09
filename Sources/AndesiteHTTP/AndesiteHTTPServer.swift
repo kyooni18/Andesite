@@ -222,15 +222,15 @@ public enum AndesiteHTTPServer {
             }
         }
         // Sync: the feed, content objects and receiving a peer's feed.
-        router.get("/v1/sync/identity") { _, _ in
+        router.get("/sync/identity") { _, _ in
             await respond { try encoded(await vault.perform(.background) { try $0.syncIdentity() }) }
         }
-        router.get("/v1/sync/changes") { request, _ in
+        router.get("/sync/changes") { request, _ in
             let q = request.uri.queryParameters
             let (after, limit) = (q["after"].flatMap { Int64($0) } ?? 0, int(q["limit"]) ?? VaultRuntime.syncPageLimit)
             return await respond { try encoded(await vault.perform(.background) { try $0.syncFeed(after: after, limit: limit) }) }
         }
-        router.post("/v1/sync/changes") { request, _ in
+        router.post("/sync/changes") { request, _ in
             let body = try await Data(buffer: request.body.collect(upTo: 8 * 1024 * 1024))
             return await respond {
                 guard let batch = try? JSONDecoder().decode(SyncBatch.self, from: body) else { throw APIError(.badRequest, "invalid_json") }
@@ -242,14 +242,14 @@ public enum AndesiteHTTPServer {
                 })
             }
         }
-        router.post("/v1/sync/objects/missing") { request, _ in
+        router.post("/sync/objects/missing") { request, _ in
             let body = try await Data(buffer: request.body.collect(upTo: 1024 * 1024))
             return await respond {
                 guard let hashes = try? JSONDecoder().decode([String].self, from: body) else { throw APIError(.badRequest, "invalid_json") }
                 return try encoded(await vault.perform(.background) { try $0.missingObjects(hashes) })
             }
         }
-        router.get("/v1/sync/objects/{hash}") { request, context in
+        router.get("/sync/objects/{hash}") { request, context in
             let hash = context.parameters.get("hash") ?? ""
             let q = request.uri.queryParameters
             let (offset, length) = (q["offset"].flatMap { Int64($0) } ?? 0, int(q["length"]) ?? VaultRuntime.chunkLimit)
@@ -258,7 +258,7 @@ public enum AndesiteHTTPServer {
                       contentType: "application/octet-stream")
             }
         }
-        router.put("/v1/sync/objects/{hash}") { request, context in
+        router.put("/sync/objects/{hash}") { request, context in
             let hash = context.parameters.get("hash") ?? ""
             let q = request.uri.queryParameters
             let size = q["size"].flatMap { Int64($0) }, offset = q["offset"].flatMap { Int64($0) } ?? 0

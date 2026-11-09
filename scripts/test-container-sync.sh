@@ -33,7 +33,7 @@ start() {
   container run -d --name "$name" -p "127.0.0.1:$port:8790" \
     -e ANDESITE_API_TOKEN="$ANDESITE_API_TOKEN" -v "$volume:/data" "$image" >/dev/null
   i=0
-  until test "$(curl -s -o /dev/null -w '%{http_code}' "$url/v1/sync/identity")" = 401; do
+  until test "$(curl -s -o /dev/null -w '%{http_code}' "$url/sync/identity")" = 401; do
     i=$((i + 1)); test "$i" -lt 100 || { container logs "$name"; exit 1; }; sleep 0.2
   done
 }
@@ -102,7 +102,7 @@ same later.md 'after restart'
 test "$(sync a)" = "sync received=0 sent=0 applied=0 merged=0 conflicts=0 pending=0"
 
 step "requests without the right token are refused"
-test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$url/v1/sync/changes" -d '{}')" = 401
+test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$url/sync/changes" -d '{}')" = 401
 test "$(ANDESITE_API_TOKEN=$(openssl rand -hex 32) "$client" sync "$demo/a" "$url" --state "$demo/state-a" 2>&1 >/dev/null | grep -c 401)" = 1
 
 diff -r -x .andesite "$demo/a" "$demo/b"

@@ -1,7 +1,8 @@
 # andesite-server for Linux, serving one Vault over HTTP.
 #
 # The server only listens on the container's loopback (by design); nginx
-# forwards the container's port 8790 to it. Publish that port to the host's
+# forwards the container's port 8790 to it: /sync/ for sync, /v1/ for the
+# vault API, and everything else is the web frontend in deploy/www. Publish that port to the host's
 # loopback only (-p 127.0.0.1:8790:8790): the sync client accepts plain HTTP
 # only to loopback, and anything wider needs a TLS-terminating proxy.
 #
@@ -29,6 +30,7 @@ RUN apt-get update -qq \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --create-home --home-dir /home/andesite andesite
 COPY --from=build /andesite-server /usr/local/bin/andesite-server
+COPY deploy/www /srv/www
 COPY deploy/nginx.conf /etc/nginx/andesite.conf
 COPY deploy/entrypoint.sh /usr/local/bin/andesite-entrypoint
 EXPOSE 8790

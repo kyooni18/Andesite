@@ -47,12 +47,12 @@ These routes are used by `SyncClient`; see [architecture.md](architecture.md#syn
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/sync/identity` | vault ID and epoch |
-| `GET /v1/sync/changes?after=&limit=` | revision feed page |
-| `POST /v1/sync/changes` | receive a batch from a peer, then resolve it |
-| `POST /v1/sync/objects/missing` | which of the given objects are absent or partial |
-| `GET /v1/sync/objects/{hash}?offset=&length=` | object chunk (at most 4 MiB) |
-| `PUT /v1/sync/objects/{hash}?size=&offset=` | upload a chunk; optional `X-Chunk-SHA256` header |
+| `GET /sync/identity` | vault ID and epoch |
+| `GET /sync/changes?after=&limit=` | revision feed page |
+| `POST /sync/changes` | receive a batch from a peer, then resolve it |
+| `POST /sync/objects/missing` | which of the given objects are absent or partial |
+| `GET /sync/objects/{hash}?offset=&length=` | object chunk (at most 4 MiB) |
+| `PUT /sync/objects/{hash}?size=&offset=` | upload a chunk; optional `X-Chunk-SHA256` header |
 
 ## Errors
 

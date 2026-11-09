@@ -54,7 +54,7 @@ cat "$demo/a/shared.md" "$demo/a/"*conflict* | grep -q 'from a'
 cat "$demo/a/shared.md" "$demo/a/"*conflict* | grep -q 'from b'
 
 # Unauthenticated and wrongly authenticated writes are refused.
-test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$url/v1/sync/changes" -d '{}')" = 401
+test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$url/sync/changes" -d '{}')" = 401
 test "$(ANDESITE_API_TOKEN=$(openssl rand -hex 32) "$server" sync "$demo/a" "$url" --state "$demo/state-a" 2>&1 >/dev/null | grep -c 401)" = 1
 diff -r -x .andesite "$demo/a" "$demo/b"
 echo "sync smoke test passed"

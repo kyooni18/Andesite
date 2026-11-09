@@ -119,7 +119,7 @@ private func converged(_ a: Vault, _ ra: URL, _ b: Vault, _ rb: URL) throws -> B
     #expect(throws: SyncTransportError.insecureDestination) { try SyncClient(destination: URL(string: "http://example.com")!, token: server.token) }
     let stranger = try SyncClient(destination: server.url, token: String(repeating: "0", count: 64))
     await #expect(throws: SyncTransportError.self) { try await stranger.sync(a) }
-    #expect(try await server.request("POST", "/v1/sync/changes", body: Data("{}".utf8), token: "").status == 401)
+    #expect(try await server.request("POST", "/sync/changes", body: Data("{}".utf8), token: "").status == 401)
 
     let report = try await SyncClient(destination: server.url, token: server.token).sync(a)
     #expect(report.received == 1 && report.sent == 1 && report.pending == 0)
@@ -201,10 +201,10 @@ private func converged(_ a: Vault, _ ra: URL, _ b: Vault, _ rb: URL) throws -> B
     // A second attachment on A, whose upload to B is interrupted halfway.
     let other = Data((0..<(VaultRuntime.chunkLimit + 99)).map { UInt8(truncatingIfNeeded: $0 &* 13) })
     let created = try a.run { try $0.create("media/other.bin", other) }
-    let half = try await server.request("PUT", "/v1/sync/objects/\(created.hash)?size=\(other.count)&offset=0",
+    let half = try await server.request("PUT", "/sync/objects/\(created.hash)?size=\(other.count)&offset=0",
                                         body: other.prefix(VaultRuntime.chunkLimit))
     #expect(half.status == 200)
-    let progress = try await server.json("POST", "/v1/sync/objects/missing", headers: [:])
+    let progress = try await server.json("POST", "/sync/objects/missing", headers: [:])
     #expect(progress.status == 400) // body must be a JSON array
 
     let report = try await SyncClient(destination: server.url, token: server.token).sync(a)
