@@ -66,7 +66,10 @@ func token() throws -> String {
     return token
 }
 
-func waitForTermination() {
+/// Starts handling SIGINT and SIGTERM and returns a function that waits for
+/// one. Install it before reporting readiness: once a signal is ignored, one
+/// sent before its dispatch source is registered would be lost.
+func terminationSignals() -> () -> Void {
     let stop = DispatchSemaphore(value: 0)
     let sources = [SIGINT, SIGTERM].map { number -> DispatchSourceSignal in
         signal(number, SIG_IGN)
@@ -75,8 +78,7 @@ func waitForTermination() {
         source.resume()
         return source
     }
-    stop.wait()
-    withExtendedLifetime(sources) {}
+    return { stop.wait(); withExtendedLifetime(sources) {} }
 }
 
 func report(_ line: String) { FileHandle.standardOutput.write(Data((line + "\n").utf8)) }
@@ -126,6 +128,7 @@ func main() async throws {
     switch command {
     case "watch":
         try expect(0...0)
+        let waitForTermination = terminationSignals()
         try session.startWatching(report: report)
         waitForTermination()
     case "serve":
