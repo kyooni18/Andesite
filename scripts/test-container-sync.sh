@@ -1,6 +1,6 @@
 #!/bin/sh
 # Two Mac Vaults, A and B, syncing through andesite-server running in an
-# Apple Container (deploy/Containerfile), published on 127.0.0.1 only.
+# Apple Container (Dockerfile), published on 127.0.0.1 only.
 # Covers first sync, edits, merges, conflicts, renames, deletes, a container
 # restart and authentication. Removes its container, volume and Vaults.
 # Usage: scripts/test-container-sync.sh   (build the image first)

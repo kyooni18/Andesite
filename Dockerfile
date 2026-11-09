@@ -5,9 +5,13 @@
 # loopback only (-p 127.0.0.1:8790:8790): the sync client accepts plain HTTP
 # only to loopback, and anything wider needs a TLS-terminating proxy.
 #
-#   container build -f deploy/Containerfile -t andesite-server .
-#   container run -d --name andesite -p 127.0.0.1:8790:8790 \
-#     -e ANDESITE_API_TOKEN=$(openssl rand -hex 32) -v andesite-vault:/data andesite-server
+# Notes live in /data/vaults/main (set ANDESITE_VAULT for another name);
+# mount a host folder on /data/vaults to see them. Server state stays in /data.
+#
+#   docker build -t andesite-server .          (or: container build -t andesite-server .)
+#   docker run -d --name andesite -p 127.0.0.1:8790:8790 \
+#     -e ANDESITE_API_TOKEN=$(openssl rand -hex 32) \
+#     -v andesite:/data -v "$PWD/vaults:/data/vaults" andesite-server
 
 FROM swift:6.2-noble AS build
 RUN apt-get update -qq && apt-get install -y -qq libsqlite3-dev >/dev/null
