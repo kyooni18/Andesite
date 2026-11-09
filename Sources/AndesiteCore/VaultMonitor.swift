@@ -24,6 +24,16 @@ public struct VaultMonitorSettings: Sendable {
     }
 }
 
+/// What a finished watcher scan means for the index. Delivered on the
+/// vault's thread, so handlers should only hand the event off.
+public enum VaultEvent: Sendable {
+    /// The first scan completed: the index now reflects the vault.
+    case indexReady(ReconciliationReport)
+    /// A later scan captured files created, edited, deleted or renamed
+    /// outside the vault API.
+    case indexChanged(ReconciliationReport)
+}
+
 public enum VaultMonitorError: Error, Equatable {
     case invalidSettings
     case cannotStartStream(Int32)
@@ -35,6 +45,7 @@ public enum VaultMonitorError: Error, Equatable {
 /// thread when no user request is waiting.
 final class VaultWatcher {
     private let report: (String) -> Void
+    private let onEvent: (VaultEvent) -> Void
     private var scheduler: VaultWorkScheduler
     private let events: FileEvents?
     private var lastGeneration: UInt64 = 0
@@ -43,13 +54,15 @@ final class VaultWatcher {
     private var interrupted = 0
     let polling: TimeInterval
 
-    init(vaultDirectory: String, settings: VaultMonitorSettings, report: @escaping (String) -> Void) throws {
+    init(vaultDirectory: String, settings: VaultMonitorSettings, report: @escaping (String) -> Void,
+         onEvent: @escaping (VaultEvent) -> Void = { _ in }) throws {
         guard [settings.latency, settings.debounce, settings.maximumCoalescing, settings.fallbackRescan,
                settings.snapshotTick, settings.polling, settings.retryDelay].allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 86_400 }),
               settings.maximumCoalescing >= settings.debounce else { throw VaultMonitorError.invalidSettings }
         // Subscribe before the initial scan so no change can fall in between.
         events = try FileEvents(directory: vaultDirectory, latency: settings.latency)
         self.report = report
+        self.onEvent = onEvent
         polling = settings.polling
         let now = ProcessInfo.processInfo.systemUptime
         scheduler = VaultWorkScheduler(now: now, debounce: settings.debounce,
@@ -90,9 +103,11 @@ final class VaultWatcher {
                 interrupted = 0
                 if ready {
                     report("watch-scan cause=\(cause == .periodic ? "periodic" : "event") discovered=\(r.discovered) revisions=\(r.revisionsCreated) deleted=\(r.deleted) renamed=\(r.renamed) snapshots=\(r.snapshotsCreated)")
+                    if r.discovered + r.revisionsCreated + r.deleted + r.renamed > 0 { onEvent(.indexChanged(r)) }
                 } else {
                     ready = true
                     report("watch-ready discovered=\(r.discovered) revisions=\(r.revisionsCreated) snapshots=\(r.snapshotsCreated)")
+                    onEvent(.indexReady(r))
                 }
             } catch {
                 let attempt = scheduler.scanFailed(at: ProcessInfo.processInfo.systemUptime)

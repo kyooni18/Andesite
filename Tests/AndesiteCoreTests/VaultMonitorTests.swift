@@ -57,6 +57,25 @@ final class Reports: @unchecked Sendable {
     try session.close()
 }
 
+@Test func watcherDeliversTypedReadyAndChangeEvents() throws {
+    let f = try RuntimeFixture(); defer { f.clean() }
+    try f.write("note.md", "# One\n")
+    let session = try Vault(at: f.vault.path, options: .init(stateDirectory: f.state.path, watch: false))
+    let events = Reports()
+    try session.startWatching(settings: fastMonitorSettings(), onEvent: { event in
+        switch event {
+        case .indexReady: events.add("ready")
+        case .indexChanged(let r): events.add("changed revisions=\(r.revisionsCreated)")
+        }
+    })
+    #expect(eventually { events.contains("ready") })
+    #expect(!events.contains("changed"))
+    try f.write("note.md", "# Two\n")
+    #expect(eventually { events.contains("changed revisions=1") }, "events=\(events.all)")
+    #expect(events.all.first == "ready")
+    try session.close()
+}
+
 @Test func watcherPromotesDueSnapshotsAndPeriodicallyRescans() throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("note.md", "# Initial\noldword\n")

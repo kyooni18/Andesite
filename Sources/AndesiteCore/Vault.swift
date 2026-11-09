@@ -52,14 +52,18 @@ public final class Vault: @unchecked Sendable {
         public var maximumFileBytes: Int
         /// Receives one line per background event: scans, failures, sync.
         public var report: @Sendable (String) -> Void
+        /// Receives typed index events from the watcher (see `VaultEvent`).
+        public var onEvent: @Sendable (VaultEvent) -> Void
 
         public init(stateDirectory: String? = nil, stateRoot: String? = nil, watch: Bool = true,
                     monitor: VaultMonitorSettings = VaultMonitorSettings(),
                     maximumNoteBytes: Int = 16 * 1024 * 1024, maximumFileBytes: Int = 4 * 1024 * 1024 * 1024,
-                    report: @escaping @Sendable (String) -> Void = { _ in }) {
+                    report: @escaping @Sendable (String) -> Void = { _ in },
+                    onEvent: @escaping @Sendable (VaultEvent) -> Void = { _ in }) {
             self.stateDirectory = stateDirectory; self.stateRoot = stateRoot; self.watch = watch
             self.monitor = monitor; self.maximumNoteBytes = maximumNoteBytes
             self.maximumFileBytes = maximumFileBytes; self.report = report
+            self.onEvent = onEvent
         }
     }
 
@@ -132,7 +136,7 @@ public final class Vault: @unchecked Sendable {
         self.directory = directory
         self.stateDirectory = state
         executor = VaultExecutor(runtime: runtime)
-        if options.watch { try startWatching(settings: options.monitor, report: options.report) }
+        if options.watch { try startWatching(settings: options.monitor, report: options.report, onEvent: options.onEvent) }
     }
 
     public convenience init(at url: URL, options: Options = Options()) throws {
@@ -325,8 +329,9 @@ public final class Vault: @unchecked Sendable {
     /// is false): an initial scan, then filesystem events, periodic
     /// rescans and snapshot promotion, all as background work.
     public func startWatching(settings: VaultMonitorSettings = VaultMonitorSettings(),
-                              report: @escaping @Sendable (String) -> Void = { _ in }) throws {
-        let watcher = try VaultWatcher(vaultDirectory: directory, settings: settings, report: report)
+                              report: @escaping @Sendable (String) -> Void = { _ in },
+                              onEvent: @escaping @Sendable (VaultEvent) -> Void = { _ in }) throws {
+        let watcher = try VaultWatcher(vaultDirectory: directory, settings: settings, report: report, onEvent: onEvent)
         try run { [executor] _ in executor.setWatcher(watcher) }
     }
 
