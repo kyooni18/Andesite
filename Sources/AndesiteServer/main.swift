@@ -21,6 +21,12 @@ Documents:
   delete <path> <revision>
   restore <path> <revision>
   mkdir <path> | mvdir <path> <new-path>
+Obsidian:
+  links <path> [incoming]               outgoing links, or backlinks
+  mentions <path>                       unlinked mentions
+  tag <path> add|remove <tag> <revision>
+  property <path> <name> <value>|- <revision>   (- removes; JSON values allowed)
+Storage:
   gc [<minimum-age-days>]               remove unreferenced stored content (default 7 days)
 Snapshots:
   snapshots [<path>] | snapshot <id> | snapshot-compare <id> <id>
@@ -213,6 +219,33 @@ func runDocumentCommand(_ vault: AndesiteBackend, _ command: String, _ rest: [St
         try expect(0...0)
         let s = try vault.snapshotStorage()
         print("snapshots=\(s.snapshots) expirationEligible=\(s.expirationEligible) logicalBytes=\(s.logicalBytes) uniqueSnapshotBytes=\(s.uniqueSnapshotBytes) registeredObjectBytes=\(s.registeredObjectBytes) physicalObjectAllocatedBytes=\(s.physicalObjectAllocatedBytes)")
+    case "links":
+        try expect(1...2)
+        let page = try vault.links(vault.document(rest[0]).id, direction: rest.count == 2 ? .incoming : .outgoing, limit: 500)
+        for m in page.mentions {
+            print("\(m.sourcePath)\t\(m.syntax)\t\(m.target)\(m.fragment.map { "#" + $0 } ?? "")\t\(m.status)\t\(m.documentPath ?? "-")\tfragment=\(m.fragmentStatus)")
+        }
+    case "mentions":
+        try expect(1...1)
+        for m in try vault.unlinkedMentions(vault.document(rest[0]).id, limit: 500) { print("\(m.sourcePath)\t\(m.term)") }
+    case "tag":
+        try expect(4...4)
+        guard ["add", "remove"].contains(rest[1]) else { throw UsageError() }
+        let revision = try identifier(rest[3])
+        print(describe(rest[1] == "add" ? try vault.addTag(rest[0], rest[2], revision: revision)
+                                        : try vault.removeTag(rest[0], rest[2], revision: revision)))
+    case "property":
+        try expect(4...4)
+        var value: PropertyValue?
+        if rest[2] != "-" {
+            switch try? JSONSerialization.jsonObject(with: Data(rest[2].utf8), options: [.fragmentsAllowed]) {
+            case let list as [String]: value = .list(list)
+            case let flag as Bool where rest[2] == "true" || rest[2] == "false": value = .bool(flag)
+            case let number as Double: value = .number(number)
+            default: value = .text(rest[2])
+            }
+        }
+        print(describe(try vault.setProperty(rest[0], rest[1], to: value, revision: identifier(rest[3]))))
     case "gc":
         try expect(0...1)
         let days = rest.first.flatMap(Double.init) ?? 7

@@ -124,11 +124,11 @@ enum Catalog {
             try record(db: db, vaultID: vaultID, r)
         }
         if r.deleted {
-            try db.executeValues("UPDATE entries SET state='deleted',path=NULL,path_key=NULL,head_revision=?,fs_hint=NULL WHERE vault_id=? AND id=?",
+            try db.executeValues("UPDATE entries SET state='deleted',path=NULL,path_key=NULL,name_key=NULL,head_revision=?,fs_hint=NULL WHERE vault_id=? AND id=?",
                                  bindings: [.blob(r.revision), .blob(vaultID), .blob(r.entry)])
         } else {
-            try db.executeValues("UPDATE entries SET state='live',path=?,path_key=?,head_revision=?,fs_hint=? WHERE vault_id=? AND id=?",
-                                 bindings: [.text(r.path), .text(VaultPath(r.path).portabilityKey), .blob(r.revision),
+            try db.executeValues("UPDATE entries SET state='live',path=?,path_key=?,name_key=?,head_revision=?,fs_hint=? WHERE vault_id=? AND id=?",
+                                 bindings: [.text(r.path), .text(VaultPath(r.path).portabilityKey), .text(LinkIndex.nameKey(r.path)), .blob(r.revision),
                                             try hint.map { .blob(try JSONEncoder().encode($0)) } ?? .null,
                                             .blob(vaultID), .blob(r.entry)])
         }

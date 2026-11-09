@@ -84,7 +84,8 @@ public enum AndesiteHTTPServer {
             let fields = try await form(request)
             return await respond(session) { vault in
                 try document(vault.move(required(fields["path"], "path"), to: required(fields["to"], "to"),
-                                        revision: required(fields["revision"].flatMap(Data.init(hex:)), "revision")))
+                                        revision: required(fields["revision"].flatMap(Data.init(hex:)), "revision"),
+                                        updateLinks: fields["updateLinks"] != "false"))
             }
         }
         router.post("/v1/restore") { request, _ in
@@ -108,7 +109,9 @@ public enum AndesiteHTTPServer {
             let fields = try await form(request)
             return await respond(session) { vault in
                 let path = try required(fields["path"], "path")
-                if let to = fields["to"] { try vault.moveDirectory(path, to: to) } else { try vault.createDirectory(path) }
+                if let to = fields["to"] {
+                    try vault.moveDirectory(path, to: to, updateLinks: fields["updateLinks"] != "false")
+                } else { try vault.createDirectory(path) }
                 return try json(["path": fields["to"] ?? path])
             }
         }
@@ -155,6 +158,42 @@ public enum AndesiteHTTPServer {
             let path = request.uri.queryParameters["path"].map(String.init)
             return await respond(session) { vault in
                 try json(vault.documentMetadata(vault.document(required(path, "path")).id))
+            }
+        }
+        router.get("/v1/mentions") { request, _ in
+            let path = request.uri.queryParameters["path"].map(String.init)
+            return await respond(session) { vault in
+                try json(["mentions": try vault.unlinkedMentions(vault.document(required(path, "path")).id).map {
+                    ["source": $0.sourcePath, "term": $0.term]
+                }])
+            }
+        }
+        // Frontmatter edits: {"path","revision","name","value"} (a null value removes the property).
+        router.post("/v1/properties") { request, _ in
+            let body = try await Data(buffer: request.body.collect(upTo: 256 * 1024))
+            return await respond(session) { vault in
+                guard let fields = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { throw APIError(.badRequest, "invalid_json") }
+                let value: PropertyValue?
+                switch fields["value"] {
+                case nil, is NSNull: value = nil
+                case let number as NSNumber where isBoolean(number): value = .bool(number.boolValue)
+                case let number as NSNumber: value = .number(number.doubleValue)
+                case let text as String: value = .text(text)
+                case let list as [String]: value = .list(list)
+                default: throw APIError(.badRequest, "unsupported_value")
+                }
+                return try document(vault.setProperty(required(fields["path"] as? String, "path"), required(fields["name"] as? String, "name"),
+                                                      to: value, revision: required((fields["revision"] as? String).flatMap(Data.init(hex:)), "revision")))
+            }
+        }
+        // {"path","revision","add"} or {"path","revision","remove"}.
+        router.post("/v1/tags") { request, _ in
+            let fields = try await form(request)
+            return await respond(session) { vault in
+                let path = try required(fields["path"], "path")
+                let revision = try required(fields["revision"].flatMap(Data.init(hex:)), "revision")
+                if let tag = fields["add"] { return try document(vault.addTag(path, tag, revision: revision)) }
+                return try document(vault.removeTag(path, required(fields["remove"], "add_or_remove"), revision: revision))
             }
         }
         router.get("/v1/links") { request, _ in
@@ -338,10 +377,10 @@ func failure(_ error: Error) -> Reply {
     case SyncError.invalidBatch(let reason): return code(400, "invalid_sync_batch", ["reason": reason])
     case SyncError.historyGap: return code(409, "history_gap")
     case SyncError.missingObject(let hash): return code(409, "missing_object", ["hash": hash])
-    case SearchIndexError.invalidQuery, ObsidianIndexError.invalidQuery, VaultLinkGraphError.invalidQuery,
+    case SearchIndexError.invalidQuery, ObsidianIndexError.invalidQuery,
          DocumentCatalogError.invalidPage, DocumentCatalogError.invalidIdentifier:
         return code(400, "invalid_query")
-    case VaultLinkGraphError.cacheNotReady, VaultRuntimeError.inconsistentCatalog, VaultSessionError.closed:
+    case VaultRuntimeError.inconsistentCatalog, VaultSessionError.closed:
         return code(503, "index_not_ready")
     default: return code(500, "internal_error")
     }
@@ -349,6 +388,15 @@ func failure(_ error: Error) -> Reply {
 
 func json(_ object: Any, status: Int = 200) throws -> Reply {
     Reply(status: status, body: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+}
+
+/// JSON `true`/`false`, as opposed to the numbers 1 and 0.
+func isBoolean(_ number: NSNumber) -> Bool {
+    #if canImport(Darwin)
+    return CFGetTypeID(number) == CFBooleanGetTypeID()
+    #else
+    return number === kCFBooleanTrue || number === kCFBooleanFalse || String(describing: type(of: number)).contains("Bool")
+    #endif
 }
 
 func encoded<T: Encodable>(_ value: T) throws -> Reply {

@@ -12,7 +12,7 @@ public enum CatalogMigrationError: Error, Equatable {
 /// safe to use as a sync service until general operations/recovery and the
 /// remaining protocol tables are implemented (the local restore journal is v6). Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 12
+    public static let currentVersion = 13
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -256,6 +256,38 @@ public enum CatalogSchema {
                     """)
                 try db.execute("CREATE INDEX IF NOT EXISTS revisions_entry ON revisions(vault_id,entry_id)")
                 try db.execute("PRAGMA user_version=12")
+            }
+            if version < 13 {
+                // Links are stored at index time with their positions and
+                // resolved against live entries by name when queried.
+                let columns = try db.queryValues("SELECT name FROM pragma_table_info('entries')")
+                if !columns.contains([.text("name_key")]) { try db.execute("ALTER TABLE entries ADD COLUMN name_key TEXT") }
+                for row in try db.queryValues("SELECT vault_id,id,path FROM entries WHERE state='live'") {
+                    guard case .text(let path) = row[2] else { continue }
+                    try db.executeValues("UPDATE entries SET name_key=? WHERE vault_id=? AND id=?",
+                                         bindings: [.text(LinkIndex.nameKey(path)), row[0], row[1]])
+                }
+                try db.execute("CREATE INDEX IF NOT EXISTS entries_name ON entries(vault_id,name_key) WHERE state='live'")
+                try db.execute("""
+                    CREATE TABLE IF NOT EXISTS document_links (
+                      vault_id BLOB NOT NULL, entry_id BLOB NOT NULL, revision_id BLOB NOT NULL, ordinal INTEGER NOT NULL,
+                      syntax TEXT NOT NULL, target TEXT NOT NULL, fragment TEXT, display TEXT, embed INTEGER NOT NULL,
+                      name_key TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL,
+                      PRIMARY KEY(vault_id,entry_id,ordinal)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("CREATE INDEX IF NOT EXISTS document_links_target ON document_links(vault_id,name_key)")
+                try db.execute("""
+                    CREATE TABLE IF NOT EXISTS document_anchors (
+                      vault_id BLOB NOT NULL, entry_id BLOB NOT NULL, revision_id BLOB NOT NULL, ordinal INTEGER NOT NULL,
+                      kind TEXT NOT NULL CHECK(kind IN ('heading','block')), key TEXT NOT NULL,
+                      PRIMARY KEY(vault_id,entry_id,ordinal)
+                    ) WITHOUT ROWID
+                    """)
+                // Reindex every note (from stored content) at the next scan.
+                try db.execute("DELETE FROM document_metadata")
+                try db.execute("UPDATE vaults SET state='scanRequired'")
+                try db.execute("PRAGMA user_version=13")
             }
         }
     }

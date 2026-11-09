@@ -90,19 +90,6 @@ final class VaultWatcher {
                 report("watch-snapshot-schedule-failed error=\(error)")
             }
             scheduler.snapshotsFinished(at: ProcessInfo.processInfo.systemUptime)
-        case .refreshLinks:
-            do {
-                if let result = try runtime.advanceLinkCache() {
-                    scheduler.refreshedLinks()
-                    report("watch-link-cache generation=\(result.generation) parsed=\(result.parsedDocuments) reused=\(result.reusedDocuments) changed=\(result.graphChanged)")
-                }
-            } catch VaultLinkGraphError.graphTooLarge {
-                scheduler.refreshFailed(at: ProcessInfo.processInfo.systemUptime, retry: false)
-                report("watch-link-cache-unavailable reason=graphTooLarge")
-            } catch {
-                scheduler.refreshFailed(at: ProcessInfo.processInfo.systemUptime, retry: true)
-                report("watch-link-cache-failed error=\(error)")
-            }
         }
     }
 }

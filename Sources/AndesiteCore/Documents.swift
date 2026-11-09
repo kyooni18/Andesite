@@ -69,14 +69,19 @@ extension VaultRuntime {
     }
 
     /// Renames or relocates a file. Missing destination folders are created.
+    /// With `updateLinks`, links elsewhere that pointed at the file (and
+    /// relative links inside it) are rewritten to keep resolving to the same
+    /// files, wherever that can be done unambiguously.
     @discardableResult
-    public func move(_ path: String, to newPath: String, revision: Data) throws -> IndexedDocument {
+    public func move(_ path: String, to newPath: String, revision: Data, updateLinks: Bool = true) throws -> IndexedDocument {
         let current = try head(path, revision: revision)
         let target = try vaultPath(newPath)
         guard kind(of: target) == current.kind else { throw VaultError.invalidPath(newPath) }
         if Array(target.utf8) == Array(current.path!.utf8) { return try document(target) }
         try requireFree(target, for: current)
+        let affected = updateLinks ? try linksAffected(byMoving: [current]) : []
         try run(plan(current, to: target, hash: current.hash, size: current.size))
+        try retarget(affected)
         return try document(target)
     }
 
@@ -138,8 +143,9 @@ extension VaultRuntime {
         _ = try VaultDirectory(root: requireOpen().reader.root, components: VaultPath(path).components, create: true)
     }
 
-    /// Renames a folder with everything in it as one atomic filesystem step.
-    public func moveDirectory(_ path: String, to newPath: String) throws {
+    /// Renames a folder with everything in it as one atomic filesystem step,
+    /// then updates links to the moved files (see `move`).
+    public func moveDirectory(_ path: String, to newPath: String, updateLinks: Bool = true) throws {
         let source = try vaultPath(path), target = try vaultPath(newPath)
         let sourceKey = try VaultPath(source).portabilityKey, targetKey = try VaultPath(target).portabilityKey
         guard sourceKey != targetKey, !targetKey.hasPrefix(sourceKey + "/") else { throw VaultError.invalidPath(newPath) }
@@ -152,8 +158,10 @@ extension VaultRuntime {
               try Catalog.liveEntries(db: requireOpen().db, vaultID: vaultID, under: target + "/").isEmpty else {
             throw VaultError.alreadyExists(target)
         }
+        let affected = updateLinks ? try linksAffected(byMoving: Catalog.liveEntries(db: requireOpen().db, vaultID: vaultID, under: source + "/")) : []
         try run(MutationPlan(entry: Data(count: 16), kind: "directory", base: nil, revision: Data(count: 16),
                              parents: [], from: source, to: target, origin: "local", directory: true))
+        try retarget(affected)
     }
 
     /// The live document at `path`, including attachments.

@@ -65,30 +65,6 @@ public final class VaultRuntime {
     let configuration: VaultConfiguration
     public let vaultID: Data
 
-    /// Derived, disposable in-memory data. Only the VaultRuntime owner
-    /// touches it, never an FSEvents callback, NIO task or separate SQLite
-    /// connection. Reconciliation invalidates the published generation.
-    private var linkSnapshot: VaultLinkGraph.Snapshot?
-    private var linkBuilder: VaultLinkGraph.Builder?
-    private var linkCacheReady = false
-    private var linkCacheError: VaultLinkGraphError?
-    private var linkCacheBuildCount = 0
-
-    public struct LinkCacheReport: Sendable {
-        public let parsedDocuments: Int
-        public let reusedDocuments: Int
-        public let graphChanged: Bool
-        public let generation: Int
-    }
-
-    public var linksIndexed: Bool { linkCacheReady }
-    public var linkCacheGeneration: Int { linkCacheBuildCount }
-    /// Progress applies only to a pending low-priority generation.
-    public var linkCacheProgress: (processedHeads: Int, totalHeads: Int, resolvedHeads: Int)? {
-        guard let builder = linkBuilder else { return nil }
-        return (builder.processedDocuments, builder.totalDocuments,
-                builder.resolvedDocuments)
-    }
     // Internal deterministic hook for tests; never supplied by vault contents.
     var mutationFault: ((String) throws -> Void)?
     func journal() throws -> Journal {
@@ -193,17 +169,13 @@ public final class VaultRuntime {
     public func shutdown(at date: Date = Date()) throws {
         guard resources != nil else { return }
         defer {
-            linkSnapshot = nil
-            linkBuilder = nil
-            linkCacheReady = false
-            linkCacheError = nil
             resources = nil
             processLock = nil
         }
         _ = try flushSnapshots(at: date)
     }
 
-    deinit { linkBuilder = nil; linkSnapshot = nil; resources = nil; processLock = nil }
+    deinit { resources = nil; processLock = nil }
 
     public func status() throws -> VaultStatus {
         guard let r = resources else { throw VaultRuntimeError.closed }
@@ -277,79 +249,8 @@ public final class VaultRuntime {
                                                      limit: limit, offset: offset)
     }
 
-    /// Cooperative background maintenance: advance one bounded parse/resolve
-    /// slice, then yield to FSEvents and private HTTP before the next slice.
-    /// The result is nil until the graph is fully rebuilt and atomically
-    /// published. Only call on the existing synchronous VaultRuntime owner.
-    @discardableResult
-    public func advanceLinkCache(maxDocuments: Int = 8,
-                                 maxBytes: Int = 256 * 1024) throws -> LinkCacheReport? {
-        guard let r = resources else { throw VaultRuntimeError.closed }
-        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-                do {
-            if linkBuilder == nil {
-                linkBuilder = try VaultLinkGraph.begin(
-                    db: r.db, vaultID: vaultID, previous: linkSnapshot)
-            }
-            guard let builder = linkBuilder else { throw VaultLinkGraphError.inconsistentCatalog }
-            guard let result = try builder.step(objects: r.objects,
-                                                maxDocuments: maxDocuments,
-                                                maxBytes: maxBytes) else {
-                return nil
-            }
-            // Never publish partial generations; the old snapshot is reused
-            // only internally until a complete fresh graph is available.
-            linkSnapshot = result.snapshot
-            linkBuilder = nil
-            linkCacheError = nil
-            linkCacheReady = true
-            if result.changed { linkCacheBuildCount += 1 }
-            return LinkCacheReport(parsedDocuments: result.parsed,
-                                   reusedDocuments: result.reused,
-                                   graphChanged: result.changed,
-                                   generation: linkCacheBuildCount)
-        } catch let graphError as VaultLinkGraphError {
-            linkBuilder = nil
-            linkCacheReady = false
-            linkCacheError = graphError
-            throw graphError
-        } catch {
-            linkBuilder = nil
-            linkCacheReady = false
-            linkCacheError = .inconsistentCatalog
-            throw error
-        }
-    }
-
-    /// Synchronous maintenance for explicit calls and legacy tests. The
-    /// always-on watcher uses advanceLinkCache, not this blocking wrapper.
-    @discardableResult
-    public func refreshLinkCache() throws -> LinkCacheReport {
-        while true {
-            if let report = try advanceLinkCache() { return report }
-        }
-    }
-
-    /// Cheap, page-only lookup of an already-published in-memory graph.
-    /// Never scans, parses or reads the object store on the request path.
-    public func links(_ documentID: Data, direction: VaultLinkDirection,
-                      limit: Int = 50, offset: Int = 0) throws -> VaultLinkPage {
-        guard resources != nil else { throw VaultRuntimeError.closed }
-        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-                guard linkCacheReady, let snapshot = linkSnapshot else {
-            throw linkCacheError ?? .cacheNotReady
-        }
-        return try snapshot.query(documentID: documentID, direction: direction,
-                                  limit: limit, offset: offset)
-    }
-
     public func reconcile(at date: Date = Date()) throws -> ReconciliationReport {
         guard let r = resources else { throw VaultRuntimeError.closed }
-        // The prior snapshot can be reused incrementally after this scan,
-        // but must not be served until its namespace has been reconciled.
-        linkCacheReady = false
-        linkBuilder = nil
-        linkCacheError = nil
         try journal().recover()
         try RecoverySnapshots.validateTime(date)
         try setState("scanning")
@@ -429,7 +330,7 @@ public final class VaultRuntime {
                 // Release all old names together so swaps and reuse cannot violate
                 // uniqueness or expose partially moved catalog identities.
                 for prior in plan.moved.sorted() {
-                    try r.db.executeValues("UPDATE entries SET state='reserved',path=NULL,path_key=NULL WHERE vault_id=? AND id=?", bindings: [.blob(vaultID), .blob(plan.old[prior].id)])
+                    try r.db.executeValues("UPDATE entries SET state='reserved',path=NULL,path_key=NULL,name_key=NULL WHERE vault_id=? AND id=?", bindings: [.blob(vaultID), .blob(plan.old[prior].id)])
                 }
                 var results: [(ExternalCaptureResult, String)] = []
                 for (indexInScan, prepared) in deferred {

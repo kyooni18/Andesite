@@ -166,6 +166,21 @@ import Testing
     #expect(try await get("/v1/documents?tag=1984").status == 400)
     #expect(try await get("/v1/documents?value=5").status == 400)
     #expect(try await get("/v1/tags?offset=-1").status == 400)
+
+    // Editing properties and tags, and links between notes.
+    let one = try session.run { try $0.document("one.md") }
+    let set = try await server.json("POST", "/v1/properties", ["path": "one.md", "name": "status", "value": "done", "revision": one.revisionID.hex])
+    #expect(set.status == 200)
+    let tagged = try await server.json("POST", "/v1/tags", ["path": "one.md", "add": "release", "revision": try #require(set.value["revision"] as? String)])
+    #expect(tagged.status == 200)
+    #expect(try await get("/v1/documents?tag=release&property=status&value=done").value["total"] as? Int == 1)
+    let stale = try await server.json("POST", "/v1/tags", ["path": "one.md", "add": "x", "revision": one.revisionID.hex])
+    #expect(stale.status == 412)
+    try session.run { _ = try $0.create("three.md", Data("[[one]] and one more mention of two\n".utf8)) }
+    let backlinks = try await get("/v1/links?path=one.md&direction=incoming")
+    #expect((backlinks.value["links"] as? [[String: Any]])?.first?["source"] as? String == "three.md")
+    let mentions = try await get("/v1/mentions?path=two.md")
+    #expect((mentions.value["mentions"] as? [[String: Any]])?.map { $0["source"] as? String } == ["three.md"])
     await server.stop()
     try session.close()
 }

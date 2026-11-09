@@ -69,31 +69,6 @@ import Testing
     try runtime.shutdown()
 }
 
-@Test func simpleWikilinkLexerHandlesObsidianSyntaxWithoutInventingResolution() throws {
-    let source = """
-    # Chapter
-    [[정리]] and [[Folder/Page#Details|이름]]
-    ![[image.png|200]] [[#Local Heading]]
-    `[[inside code]]`
-    ```md
-    [[in fence]]
-    ```
-    ~~~
-    [[in tilde fence]]
-    ~~~
-    Four spaces code:
-        [[indented]]
-    \\[[escaped]]
-    """
-    let results = ObsidianLinks.extract(source)
-    #expect(results == [
-        .init(target: "정리", fragment: nil, alias: nil, embed: false),
-        .init(target: "Folder/Page", fragment: "Details", alias: "이름", embed: false),
-        .init(target: "image.png", fragment: nil, alias: "200", embed: true),
-        .init(target: "", fragment: "Local Heading", alias: nil, embed: false)
-    ])
-}
-
 @Test func defaultObsidianConfigurationIsExcludedWithoutDeletingSettings() throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("note.md", "# Visible\n")

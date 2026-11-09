@@ -43,6 +43,8 @@ public enum SearchIndex {
                 """, bindings: [.blob(vaultID), .blob(entryID), .blob(revisionID),
                                  .text(parsed.state), .text(parsed.propertiesJSON),
                                  parsed.diagnostic.map(SQLiteValue.text) ?? .null])
+            try LinkIndex.store(db: db, vaultID: vaultID, entryID: entryID, revisionID: revisionID,
+                                bytes: bytes, body: parsed.body, headings: facts.headings.map(\.text))
             try db.executeValues("DELETE FROM document_tags WHERE vault_id=? AND entry_id=?",
                                  bindings: [.blob(vaultID), .blob(entryID)])
             for tag in parsed.tags {
