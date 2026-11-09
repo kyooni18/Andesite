@@ -110,6 +110,14 @@ public final class ObjectStore {
         return (immutable.values.reduce(0) { $0 + $1.0 }, immutable.values.reduce(0) { $0 + $1.1 }, temporary.filter { immutable[$0.key] == nil }.values.reduce(0, +))
     }
 
+    /// The byte length of a stored object, or nil if absent.
+    func size(_ hash: String) -> Int64? {
+        var info = stat()
+        guard Self.validHash(hash), fstatat(root, hash, &info, AT_SYMLINK_NOFOLLOW) == 0,
+              info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { return nil }
+        return Int64(info.st_size)
+    }
+
     public func contains(_ hash: String) -> Bool {
         var info = stat()
         return Self.validHash(hash) && fstatat(root, hash, &info, AT_SYMLINK_NOFOLLOW) == 0 &&

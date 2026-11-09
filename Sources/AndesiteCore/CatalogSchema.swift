@@ -12,7 +12,7 @@ public enum CatalogMigrationError: Error, Equatable {
 /// safe to use as a sync service until general operations/recovery and the
 /// remaining protocol tables are implemented (the local restore journal is v6). Call only with exclusive process ownership and a backup.
 public enum CatalogSchema {
-    public static let currentVersion = 11
+    public static let currentVersion = 12
 
     public static func migrate(_ db: SQLiteConnection) throws {
         try db.transaction {
@@ -240,6 +240,22 @@ public enum CatalogSchema {
                     """)
                 try db.execute("CREATE INDEX IF NOT EXISTS changes_revision ON changes(vault_id,revision_id)")
                 try db.execute("PRAGMA user_version=11")
+            }
+            if version < 12 {
+                // Sync applies peer revisions to the Vault. The archive-only
+                // inbox and snapshot replication are replaced by a set of
+                // documents whose peer revisions still need resolving.
+                for table in ["sync_inbox_changes", "sync_inbox_snapshots", "sync_outgoing_snapshots"] {
+                    try db.execute("DROP TABLE IF EXISTS \(table)")
+                }
+                try db.execute("""
+                    CREATE TABLE IF NOT EXISTS sync_pending (
+                      vault_id BLOB NOT NULL, entry_id BLOB NOT NULL CHECK(length(entry_id)=16),
+                      PRIMARY KEY(vault_id,entry_id)
+                    ) WITHOUT ROWID
+                    """)
+                try db.execute("CREATE INDEX IF NOT EXISTS revisions_entry ON revisions(vault_id,entry_id)")
+                try db.execute("PRAGMA user_version=12")
             }
         }
     }

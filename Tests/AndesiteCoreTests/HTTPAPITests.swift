@@ -100,3 +100,88 @@ final class TestServer: @unchecked Sendable {
     await server.stop()
     try session.close()
 }
+
+private func converged(_ a: VaultSession, _ ra: URL, _ b: VaultSession, _ rb: URL) throws -> Bool {
+    let left = try a.run { try snapshot($0, ra) }, right = try b.run { try snapshot($0, rb) }
+    return left == right && !left.isEmpty
+}
+
+@Test func twoVaultsSyncOverAuthenticatedHTTPAndResumeAfterOutage() async throws {
+    let fa = try RuntimeFixture(), fb = try RuntimeFixture(); defer { fa.clean(); fb.clean() }
+    let a = try VaultSession(vaultDirectory: fa.vault.path, stateDirectory: fa.state.path)
+    let b = try VaultSession(vaultDirectory: fb.vault.path, stateDirectory: fb.state.path)
+    try fa.write("from-a.md", "# A\nalpha\n")
+    try fb.write("from-b.md", "# B\nbeta\n")
+    try b.startWatching(settings: VaultMonitorSettings(latency: 0.05, debounce: 0.05, maximumCoalescing: 0.1, polling: 0.02))
+    #expect(try eventually { try b.run { try $0.status().revisions } == 1 })
+    var server = try await TestServer(b)
+
+    #expect(throws: SyncTransportError.insecureDestination) { try SyncClient(destination: URL(string: "http://example.com")!, token: server.token) }
+    let stranger = try SyncClient(destination: server.url, token: String(repeating: "0", count: 64))
+    await #expect(throws: SyncTransportError.self) { try await stranger.sync(a) }
+    #expect(try await server.request("POST", "/v1/sync/changes", body: Data("{}".utf8), token: "").status == 401)
+
+    let report = try await SyncClient(destination: server.url, token: server.token).sync(a)
+    #expect(report.received == 1 && report.sent == 1 && report.pending == 0)
+    #expect(try converged(a, fa.vault, b, fb.vault))
+    #expect(try String(contentsOf: fa.vault.appendingPathComponent("from-b.md"), encoding: .utf8) == "# B\nbeta\n")
+
+    // Offline: the peer is down while both sides keep editing.
+    await server.stop()
+    let offline = try SyncClient(destination: server.url, token: server.token)
+    await #expect(throws: (any Error).self) { try await offline.sync(a) }
+    let head = try a.run { try $0.document("from-b.md").revisionID }
+    try a.run { _ = try $0.update("from-b.md", Data("# B\nbeta\nedited on a\n".utf8), revision: head) }
+    try fb.write("from-b.md", "# B (renamed title)\nbeta\n")
+    try a.run { _ = try $0.create("Offline/new.md", Data("written offline\n".utf8)) }
+    #expect(try eventually { try b.run { try $0.status().revisions } == 3 }) // the watcher captured B's edit
+
+    server = try await TestServer(b)
+    let resumed = try await SyncClient(destination: server.url, token: server.token).sync(a)
+    #expect(resumed.pending == 0 && resumed.merged >= 1)
+    #expect(try converged(a, fa.vault, b, fb.vault))
+    #expect(try String(contentsOf: fb.vault.appendingPathComponent("from-b.md"), encoding: .utf8) == "# B (renamed title)\nbeta\nedited on a\n")
+    // Nothing new: a repeated sync is a no-op.
+    let again = try await SyncClient(destination: server.url, token: server.token).sync(a)
+    #expect(again.received == 0 && again.applied == 0)
+    await server.stop()
+    try a.close(); try b.close()
+}
+
+@Test func syncKilledWhileApplyingResumesConsistently() async throws {
+    let fa = try RuntimeFixture(), fb = try RuntimeFixture(); defer { fa.clean(); fb.clean() }
+    try fa.write("note.md", "one\ntwo\n")
+    let b = try VaultSession(vaultDirectory: fb.vault.path, stateDirectory: fb.state.path)
+    let server = try await TestServer(b)
+    let executable = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().appendingPathComponent(".build/debug/andesite-server")
+    func syncA(killAt point: String? = nil) throws -> Int32 {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["sync", fa.vault.path, server.url.absoluteString, "--state", fa.state.path]
+        var environment = ["ANDESITE_API_TOKEN": server.token]
+        if let point { environment["ANDESITE_TEST_FAULTS"] = "1"; environment["ANDESITE_TEST_KILL_POINT"] = point }
+        process.environment = environment
+        process.standardOutput = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+    #expect(try syncA() == 0)
+    let head = try b.run { try $0.document("note.md").revisionID }
+    try b.run { _ = try $0.update("note.md", Data("one\ntwo\nthree\n".utf8), revision: head) }
+    for point in ["staged", "verified", "before-commit", "committed"] {
+        #expect(try syncA(killAt: point) == 9, "\(point)") // SIGKILL while applying the remote edit
+        let current = try b.run { try $0.document("note.md").revisionID }
+        try b.run { _ = try $0.update("note.md", Data("one\ntwo\nthree \(point)\n".utf8), revision: current) }
+    }
+    #expect(try syncA() == 0)
+    let a = try VaultSession(vaultDirectory: fa.vault.path, stateDirectory: fa.state.path)
+    #expect(try a.run { try $0.status().unfinishedMutations } == 0)
+    #expect(try String(contentsOf: fa.vault.appendingPathComponent("note.md"), encoding: .utf8) == "one\ntwo\nthree committed\n")
+    #expect(try converged(a, fa.vault, b, fb.vault))
+    #expect(try a.run { try $0.reconcile().revisionsCreated } == 0)
+    try a.close()
+    await server.stop()
+    try b.close()
+}

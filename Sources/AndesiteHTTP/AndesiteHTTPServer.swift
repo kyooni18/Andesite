@@ -176,6 +176,44 @@ public enum AndesiteHTTPServer {
                 Reply(body: try vault.snapshotContents(required(id, "id")), contentType: "text/markdown; charset=utf-8")
             }
         }
+        // Sync: the feed, content objects and receiving a peer's feed.
+        router.get("/v1/sync/identity") { _, _ in
+            await respond(session) { try encoded($0.syncIdentity()) }
+        }
+        router.get("/v1/sync/changes") { request, _ in
+            let q = request.uri.queryParameters
+            let (after, limit) = (q["after"].flatMap { Int64($0) } ?? 0, int(q["limit"]) ?? VaultRuntime.syncPageLimit)
+            return await respond(session) { try encoded($0.syncFeed(after: after, limit: limit)) }
+        }
+        router.post("/v1/sync/changes") { request, _ in
+            let body = try await Data(buffer: request.body.collect(upTo: 8 * 1024 * 1024))
+            return await respond(session) { vault in
+                guard let batch = try? JSONDecoder().decode(SyncBatch.self, from: body) else { throw APIError(.badRequest, "invalid_json") }
+                let received = try vault.receive(batch)
+                var report = try vault.resolvePending()
+                report.received = received
+                return try encoded(report)
+            }
+        }
+        router.post("/v1/sync/objects/missing") { request, _ in
+            let body = try await Data(buffer: request.body.collect(upTo: 1024 * 1024))
+            return await respond(session) { vault in
+                guard let hashes = try? JSONDecoder().decode([String].self, from: body) else { throw APIError(.badRequest, "invalid_json") }
+                return try encoded(vault.missingObjects(hashes))
+            }
+        }
+        router.get("/v1/sync/objects/{hash}") { _, context in
+            let hash = context.parameters.get("hash") ?? ""
+            return await respond(session) { Reply(body: try $0.object(hash), contentType: "application/octet-stream") }
+        }
+        router.put("/v1/sync/objects/{hash}") { request, context in
+            let hash = context.parameters.get("hash") ?? ""
+            let body = try await Data(buffer: request.body.collect(upTo: maximumBody))
+            return await respond(session) { vault in
+                try vault.storeObject(body, hash: hash)
+                return try json(["stored": hash])
+            }
+        }
         return router
     }
 }
@@ -219,6 +257,9 @@ func failure(_ error: Error) -> Reply {
     case VaultError.invalidPath: return code(400, "invalid_path")
     case VaultError.tooLarge: return code(413, "too_large")
     case VaultError.unsupported: return code(422, "unsupported")
+    case SyncError.invalidBatch(let reason): return code(400, "invalid_sync_batch", ["reason": reason])
+    case SyncError.historyGap: return code(409, "history_gap")
+    case SyncError.missingObject(let hash): return code(409, "missing_object", ["hash": hash])
     case SearchIndexError.invalidQuery, ObsidianIndexError.invalidQuery, VaultLinkGraphError.invalidQuery,
          DocumentCatalogError.invalidPage, DocumentCatalogError.invalidIdentifier:
         return code(400, "invalid_query")
@@ -230,6 +271,12 @@ func failure(_ error: Error) -> Reply {
 
 func json(_ object: Any, status: Int = 200) throws -> Reply {
     Reply(status: status, body: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+}
+
+func encoded<T: Encodable>(_ value: T) throws -> Reply {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return Reply(body: try encoder.encode(value))
 }
 
 func documentJSON(_ d: IndexedDocument) -> [String: Any] {

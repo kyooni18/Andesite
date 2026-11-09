@@ -31,7 +31,7 @@ struct CatalogEntry {
 enum Catalog {
     private static let entryColumns = """
         SELECT e.id,e.kind,e.state,e.path,e.head_revision,
-               CASE WHEN r.deleted=0 THEN lower(hex(r.content_hash)) END,r.byte_length,e.fs_hint
+               CASE WHEN r.deleted=0 THEN CASE WHEN r.content_hash IS NOT NULL THEN lower(hex(r.content_hash)) END END,r.byte_length,e.fs_hint
         FROM entries e LEFT JOIN revisions r ON r.vault_id=e.vault_id AND r.revision_id=e.head_revision
         """
 
@@ -62,6 +62,23 @@ enum Catalog {
         if case .integer(let value) = row[6] { size = value }
         if case .blob(let value) = row[7] { hint = try? JSONDecoder().decode(FileFingerprint.self, from: value) }
         return CatalogEntry(id: id, kind: kind, state: state, path: path, head: head, hash: hash, size: size, hint: hint)
+    }
+
+    static func revision(db: SQLiteConnection, vaultID: Data, id: Data) throws -> RevisionRecord? {
+        guard let row = try db.queryValues("""
+            SELECT r.entry_id,r.parent1,r.parent2,r.path,r.deleted,CASE WHEN r.content_hash IS NOT NULL THEN lower(hex(r.content_hash)) END,r.byte_length,e.kind,r.origin
+            FROM revisions r JOIN entries e ON e.vault_id=r.vault_id AND e.id=r.entry_id
+            WHERE r.vault_id=? AND r.revision_id=?
+            """, bindings: [.blob(vaultID), .blob(id)]).first else { return nil }
+        guard case .blob(let entry) = row[0], case .text(let path) = row[3], case .integer(let deleted) = row[4],
+              case .text(let kind) = row[7], case .text(let origin) = row[8] else { throw VaultRuntimeError.inconsistentCatalog }
+        var parents: [Data] = [], hash: String?, size: Int64?
+        if case .blob(let p) = row[1] { parents.append(p) }
+        if case .blob(let p) = row[2] { parents.append(p) }
+        if case .text(let h) = row[5] { hash = h }
+        if case .integer(let n) = row[6] { size = n }
+        return RevisionRecord(entry: entry, revision: id, parents: parents, path: path, deleted: deleted != 0,
+                              hash: hash, size: size, kind: kind, origin: origin)
     }
 
     static func knows(db: SQLiteConnection, vaultID: Data, revision: Data) throws -> Bool {
@@ -150,7 +167,7 @@ enum Catalog {
 
     static func revisions(db: SQLiteConnection, vaultID: Data, entry: Data) throws -> [Revision] {
         try db.queryValues("""
-            SELECT r.revision_id,r.entry_id,r.parent1,r.parent2,r.path,r.deleted,lower(hex(r.content_hash)),r.byte_length,r.origin,r.created_at
+            SELECT r.revision_id,r.entry_id,r.parent1,r.parent2,r.path,r.deleted,CASE WHEN r.content_hash IS NOT NULL THEN lower(hex(r.content_hash)) END,r.byte_length,r.origin,r.created_at
             FROM revisions r LEFT JOIN changes c ON c.vault_id=r.vault_id AND c.revision_id=r.revision_id
             WHERE r.vault_id=? AND r.entry_id=? ORDER BY c.seq
             """, bindings: [.blob(vaultID), .blob(entry)]).map(Revision.init)

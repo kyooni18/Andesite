@@ -28,7 +28,8 @@ Snapshots:
 Services (stop with SIGINT or SIGTERM):
   watch                                 monitor the Vault
   serve [--port 8788]                   watch and serve the HTTP API on 127.0.0.1
-  sync <https://host[:port]>            two-way sync with a served Vault
+  sync <https://host[:port]> [--every <seconds>]
+                                        two-way sync with a served Vault
 serve and sync read the bearer token from ANDESITE_API_TOKEN (64 hex digits).
 """
 
@@ -129,7 +130,21 @@ func main() async throws {
             report("api-ready host=127.0.0.1 port=\(bound)")
         }
     case "sync":
-        throw UsageError() // SYNC-PLACEHOLDER
+        try expect(1...1)
+        guard let url = URL(string: rest[0]) else { throw UsageError() }
+        let client = try SyncClient(destination: url, token: token())
+        let interval = options["every"].flatMap(Double.init)
+        repeat {
+            do {
+                let r = try await client.sync(session)
+                report("sync received=\(r.received) sent=\(r.sent) applied=\(r.applied) merged=\(r.merged) conflicts=\(r.conflicts) pending=\(r.pending)")
+                for failure in r.failures { report("sync-pending \(failure)") }
+            } catch where interval != nil {
+                // Offline or interrupted: progress so far is kept; retry later.
+                report("sync-failed error=\(error)")
+            }
+            if let interval { try await Task.sleep(nanoseconds: UInt64(max(interval, 1) * 1_000_000_000)) }
+        } while interval != nil
     default:
         let input = command == "write" ? (try FileHandle.standardInput.read(upToCount: 16 * 1024 * 1024 + 1) ?? Data()) : Data()
         try session.run { vault in try runDocumentCommand(vault, command, rest, input: input) }

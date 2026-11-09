@@ -326,11 +326,10 @@ private extension RuntimeFixture {
         try runtime.shutdown()
     }
     let db = try f.database()
-    for table in ["sync_outgoing_snapshots", "sync_inbox_snapshots",
-                  "sync_inbox_changes", "sync_inbox_cursors",
-                  "sync_outgoing_peers"] {
+    for table in ["sync_pending", "sync_inbox_cursors", "sync_outgoing_peers"] {
         try db.execute("DROP TABLE " + table)
     }
+    try db.execute("DROP INDEX revisions_entry")
     // Rebuild the actual historical v4 layout; newly introduced derived
     // metadata tables did not exist in that catalog.
     for table in ["document_property_values", "document_property_keys",

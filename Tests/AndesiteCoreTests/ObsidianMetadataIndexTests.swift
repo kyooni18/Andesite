@@ -117,11 +117,10 @@ import Testing
     // Emulate a real v8 catalog whose FTS and revision data already exist
     // but which has no metadata tables at all.
     let db = try SQLiteConnection(path: f.state.appendingPathComponent("catalog.sqlite").path)
-    for name in ["sync_outgoing_snapshots", "sync_inbox_snapshots",
-                  "sync_inbox_changes", "sync_inbox_cursors",
-                  "sync_outgoing_peers"] {
+    for name in ["sync_pending", "sync_inbox_cursors", "sync_outgoing_peers"] {
         try db.execute("DROP TABLE " + name)
     }
+    try db.execute("DROP INDEX revisions_entry")
     for name in ["document_property_values", "document_property_keys",
                  "document_tags", "document_properties"] {
         try db.execute("DROP TABLE \(name)")
