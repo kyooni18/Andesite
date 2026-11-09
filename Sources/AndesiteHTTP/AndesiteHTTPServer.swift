@@ -371,6 +371,7 @@ func failure(_ error: Error) -> Reply {
     case SearchIndexError.invalidQuery, ObsidianIndexError.invalidQuery,
          DocumentCatalogError.invalidPage, DocumentCatalogError.invalidIdentifier:
         return code(400, "invalid_query")
+    case _ where VaultError.isStorageFull(error): return code(507, "storage_full")
     case VaultRuntimeError.inconsistentCatalog, VaultSessionError.closed:
         return code(503, "index_not_ready")
     default: return code(500, "internal_error")

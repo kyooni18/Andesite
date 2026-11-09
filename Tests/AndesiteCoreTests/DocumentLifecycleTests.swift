@@ -255,3 +255,54 @@ private extension RuntimeFixture {
     }
 }
 #endif
+
+/// Fills a real filesystem. Run with ANDESITE_TEST_SMALL_FS pointing at a
+/// small, disposable one (scripts/test-linux.sh mounts a 16 MiB tmpfs).
+@Test(.enabled(if: ProcessInfo.processInfo.environment["ANDESITE_TEST_SMALL_FS"] != nil))
+func fullDiskFailsCleanlyAndRecovers() throws {
+    let base = URL(fileURLWithPath: ProcessInfo.processInfo.environment["ANDESITE_TEST_SMALL_FS"]!).appendingPathComponent(UUID().uuidString)
+    let vaultURL = base.appendingPathComponent("vault"), state = base.appendingPathComponent("state")
+    try FileManager.default.createDirectory(at: vaultURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(at: base) }
+    let filler = base.appendingPathComponent("filler")
+    try Data(repeating: 0, count: 6 << 20).write(to: filler) // freed later; more than the WAL can grow
+    let configuration = VaultConfiguration(vaultDirectory: vaultURL.path, stateDirectory: state.path, debounce: 0)
+    var vault = try VaultRuntime(configuration: configuration)
+    _ = try vault.reconcile()
+
+    var acknowledged: [String: Data] = [:]
+    var failure: Error?, failed: (String, Data)?
+    for i in 0..<10_000 {
+        let content = Data((String(repeating: "note \(i) ", count: 2000) + "\n").utf8)
+        do { try vault.create("n\(i).md", content); acknowledged["n\(i).md"] = content } catch {
+            failure = error; failed = ("n\(i).md", content); break
+        }
+    }
+    #expect(failure.map(VaultError.isStorageFull) == true, "\(String(describing: failure))")
+    #expect(acknowledged.count > 3)
+    // Reads still work while the disk is full.
+    let sample = try #require(acknowledged.first)
+    #expect(try vault.read(sample.key).content == sample.value)
+
+    try FileManager.default.removeItem(at: filler)
+    // Every acknowledged write is intact, nothing unacknowledged is visible,
+    // and disk and catalog agree.
+    let check = try vault.reconcile()
+    #expect(check.revisionsCreated == 0 && check.deleted == 0 && check.invalidMarkdown == 0, "\(check)")
+    // A write whose catalog commit failed after its file was published is
+    // completed by recovery, as after a crash: then it is exactly that write.
+    if let (path, content) = failed, (try? vault.document(path)) != nil {
+        #expect(try vault.read(path).content == content)
+        acknowledged[path] = content
+    }
+    let status = try vault.status()
+    #expect(status.entries == acknowledged.count && status.unfinishedMutations == 0, "\(status) acknowledged=\(acknowledged.count)")
+    try vault.create("after.md", Data("space again\n".utf8))
+    try vault.shutdown()
+    vault = try VaultRuntime(configuration: configuration) // integrity check on open
+    for (path, content) in acknowledged { #expect(try vault.read(path).content == content) }
+    let reopened = try vault.reconcile()
+    #expect(reopened.revisionsCreated == 0 && reopened.deleted == 0)
+    try vault.shutdown()
+}

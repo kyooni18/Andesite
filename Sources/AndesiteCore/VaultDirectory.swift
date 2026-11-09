@@ -17,6 +17,8 @@ public enum VaultError: Error, Equatable, CustomStringConvertible {
     case invalidPath(String)
     case tooLarge
     case unsupported(String)
+    /// The disk, or the user's quota, is full. Nothing was changed.
+    case storageFull
 
     public var description: String {
         switch self {
@@ -26,6 +28,26 @@ public enum VaultError: Error, Equatable, CustomStringConvertible {
         case .invalidPath(let path): return "invalid vault path: \(path)"
         case .tooLarge: return "content exceeds the configured size limit"
         case .unsupported(let reason): return "unsupported: \(reason)"
+        case .storageFull: return "the disk is full"
+        }
+    }
+
+    /// A failed system call (read `errno` immediately after it).
+    static func system(_ what: String, _ code: Int32 = errno) -> VaultError {
+        code == ENOSPC || code == EDQUOT ? .storageFull : .unsupported("\(what) (errno \(code))")
+    }
+
+    /// Whether `error` means the disk or quota is full, whichever layer
+    /// (vault files, object store, catalog, staging) reported it.
+    public static func isStorageFull(_ error: Error) -> Bool {
+        switch error {
+        case VaultError.storageFull: return true
+        case ObjectStoreError.systemCall(_, let code): return code == ENOSPC || code == EDQUOT
+        case let failure as SQLiteFailure: return failure.code & 0xff == 13 // SQLITE_FULL
+        default:
+            let error = error as NSError
+            return (error.domain == NSPOSIXErrorDomain && (error.code == Int(ENOSPC) || error.code == Int(EDQUOT)))
+                || (error.domain == NSCocoaErrorDomain && error.code == NSFileWriteOutOfSpaceError)
         }
     }
 }
@@ -48,9 +70,9 @@ final class VaultDirectory {
                 var next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 if next < 0 && errno == ENOENT && create {
                     guard mkdirat(current, component, 0o755) == 0 || errno == EEXIST else {
-                        throw VaultError.unsupported("cannot create directory (errno \(errno))")
+                        throw VaultError.system("cannot create directory")
                     }
-                    guard fsync(current) == 0 else { throw VaultError.unsupported("directory sync failed") }
+                    guard fsync(current) == 0 else { throw VaultError.system("directory sync failed") }
                     next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 }
                 guard next >= 0 else {
@@ -126,7 +148,7 @@ final class VaultDirectory {
         while true {
             let n = read(file, buffer.baseAddress, buffer.count)
             if n < 0 && errno == EINTR { continue }
-            guard n >= 0 else { throw VaultError.unsupported("read failed") }
+            guard n >= 0 else { throw VaultError.system("read failed") }
             if n == 0 { break }
             size += Int64(n)
             guard size <= maximumBytes else { throw VaultError.tooLarge }
@@ -147,7 +169,7 @@ final class VaultDirectory {
         let temporary = name + ".tmp"
         _ = unlinkat(fd, temporary, 0) // only ever our own interrupted partial
         let file = openat(fd, temporary, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
-        guard file >= 0 else { throw VaultError.unsupported("cannot create staging file") }
+        guard file >= 0 else { throw VaultError.system("cannot create staging file") }
         defer { close(file) }
         do {
             try objects.export(hash, to: file)
@@ -160,7 +182,7 @@ final class VaultDirectory {
                 }
             }
             try objects.durabilityBarrier(file)
-            guard renameat(fd, temporary, fd, name) == 0 else { throw VaultError.unsupported("cannot publish staging file") }
+            guard renameat(fd, temporary, fd, name) == 0 else { throw VaultError.system("cannot publish staging file") }
             try sync()
         } catch {
             _ = unlinkat(fd, temporary, 0)
@@ -170,7 +192,7 @@ final class VaultDirectory {
 
     func exchange(_ a: String, _ b: String) throws {
         guard andesite_exchange(fd, a, fd, b) == 0 else {
-            throw errno == ENOENT ? VaultError.conflict(current: nil) : VaultError.unsupported("atomic exchange failed (errno \(errno))")
+            throw errno == ENOENT ? VaultError.conflict(current: nil) : VaultError.system("atomic exchange failed")
         }
         try sync()
     }
@@ -180,7 +202,7 @@ final class VaultDirectory {
     func move(_ name: String, to target: VaultDirectory, _ newName: String) throws {
         if andesite_rename_noreplace(fd, name, target.fd, newName) != 0 {
             guard errno == EEXIST else {
-                throw errno == ENOENT ? VaultError.conflict(current: nil) : VaultError.unsupported("rename failed (errno \(errno))")
+                throw errno == ENOENT ? VaultError.conflict(current: nil) : VaultError.system("rename failed")
             }
             var a = stat(), b = stat()
             guard fstatat(fd, name, &a, AT_SYMLINK_NOFOLLOW) == 0,
@@ -200,6 +222,6 @@ final class VaultDirectory {
     }
 
     func sync() throws {
-        guard fsync(fd) == 0 else { throw VaultError.unsupported("directory sync failed") }
+        guard fsync(fd) == 0 else { throw VaultError.system("directory sync failed") }
     }
 }

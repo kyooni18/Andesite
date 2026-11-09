@@ -193,8 +193,15 @@ final class Journal {
                 committed = true
             }
         }
-        try cleanup(plan, id: id)
-        try db.transaction { try db.executeValues("DELETE FROM mutations WHERE id=?", bindings: [.blob(id)]) }
+        do {
+            try cleanup(plan, id: id)
+            try db.transaction { try db.executeValues("DELETE FROM mutations WHERE id=?", bindings: [.blob(id)]) }
+        } catch where committed {
+            // The change is committed; leftover artifacts and the plan row are
+            // settled by the next recovery (for example once disk space is
+            // available again), so this operation has succeeded.
+            return true
+        }
         try fault("done")
         return committed
     }

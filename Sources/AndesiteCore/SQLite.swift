@@ -39,6 +39,9 @@ public final class SQLiteConnection {
                 throw SQLiteFailure(code: SQLITE_ERROR, message: "WAL unavailable")
             }
             try execute("PRAGMA synchronous=FULL")
+            // The WAL keeps its largest size until truncated; bound what a
+            // large scan leaves behind after each checkpoint.
+            _ = try scalarText("PRAGMA journal_size_limit=16777216")
             #if canImport(Darwin)
             try execute("PRAGMA fullfsync=ON")
             try execute("PRAGMA checkpoint_fullfsync=ON")
