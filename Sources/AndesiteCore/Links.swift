@@ -21,6 +21,12 @@ public struct VaultLinkMention: Sendable {
     public let documentPath: String?
     /// "none", "resolved", "missing", "ambiguous", "invalid", "unsupported" or "unresolved".
     public let fragmentStatus: String
+    /// The line of the source note the link is on (1-based), and that
+    /// line's text shortened around the link. Only when excerpts are asked for.
+    public var line: Int? = nil
+    public var excerpt: String? = nil
+    /// Byte range of the target in the source note.
+    var range: Range<Int>? = nil
 }
 
 public struct VaultLinkPage: Sendable {
@@ -81,6 +87,24 @@ enum LinkIndex {
     }
 
     /// Block identifiers (`text ^block-id` at the end of a line), outside code.
+    /// The 1-based line holding `range` (a byte range) and that line's text,
+    /// cut to about `width` characters around the range.
+    static func excerpt(_ bytes: [UInt8], around range: Range<Int>, width: Int = 160) -> (Int, String) {
+        let start = min(range.lowerBound, bytes.count), end = min(max(range.upperBound, start), bytes.count)
+        var lineStart = start, lineEnd = end
+        while lineStart > 0, bytes[lineStart - 1] != 0x0A { lineStart -= 1 }
+        while lineEnd < bytes.count, bytes[lineEnd] != 0x0A { lineEnd += 1 }
+        let line = bytes[..<lineStart].reduce(1) { $1 == 0x0A ? $0 + 1 : $0 }
+        let before = String(decoding: bytes[lineStart..<start], as: UTF8.self)
+        let link = String(decoding: bytes[start..<end], as: UTF8.self)
+        let after = String(decoding: bytes[end..<lineEnd], as: UTF8.self)
+        var head = before.trimmingCharacters(in: .whitespaces), tail = after.trimmingCharacters(in: .whitespacesAndNewlines)
+        let room = max(width - link.count, 20)
+        if head.count > room / 2 { head = "…" + head.suffix(room / 2) }
+        if tail.count > room - head.count { tail = tail.prefix(max(room - head.count, 0)) + "…" }
+        return (line, head + link + tail)
+    }
+
     static func blockIDs(_ text: String) -> [String] {
         var result: [String] = [], fence: Character?
         for line in text.lines() {
@@ -101,14 +125,14 @@ enum LinkIndex {
 }
 
 /// A live file a link can point at.
-struct LinkedFile: Equatable {
+struct LinkedFile: Equatable, Sendable {
     let id: Data
     let path: String
     let kind: String
 }
 
 /// A stored link of a current note revision.
-struct StoredLink {
+struct StoredLink: Sendable {
     let sourceID: Data
     let sourcePath: String
     let ordinal: Int
@@ -117,12 +141,51 @@ struct StoredLink {
     let fragment: String?
     let display: String?
     let embed: Bool
+    /// Byte range of the target in the source note.
+    let range: Range<Int>
+}
+
+/// Where link resolution finds files: the catalog, or an in-memory copy of
+/// it when many links are resolved at once (see `VaultGraph`). Both give
+/// the same answers, so there is one set of resolution rules.
+protocol LinkTargetLookup {
+    /// The kind of the live file `id`, if it is live.
+    func kind(of id: Data) throws -> String?
+    /// The live file at `path` (compared by portability key).
+    func live(path: String) throws -> LinkedFile?
+    /// Live files whose name key (see `LinkIndex.nameKey`) is `key`.
+    func named(_ key: String) throws -> [LinkedFile]
+}
+
+struct CatalogLinkLookup: LinkTargetLookup {
+    let db: SQLiteConnection
+    let vaultID: Data
+
+    func kind(of id: Data) throws -> String? {
+        try Catalog.entry(db: db, vaultID: vaultID, id: id)?.kind
+    }
+
+    func live(path: String) throws -> LinkedFile? {
+        guard let entry = try? Catalog.live(db: db, vaultID: vaultID, path: path), let path = entry.path else { return nil }
+        return LinkedFile(id: entry.id, path: path, kind: entry.kind)
+    }
+
+    func named(_ key: String) throws -> [LinkedFile] {
+        try db.queryValues("SELECT id,path,kind FROM entries WHERE vault_id=? AND state='live' AND name_key=? ORDER BY path",
+                           bindings: [.blob(vaultID), .text(key)]).compactMap { row -> LinkedFile? in
+            guard case .blob(let id) = row[0], case .text(let path) = row[1], case .text(let kind) = row[2] else { return nil }
+            return LinkedFile(id: id, path: path, kind: kind)
+        }
+    }
 }
 
 extension VaultRuntime {
     // MARK: Queries
 
-    public func links(_ documentID: Data, direction: VaultLinkDirection, limit: Int = 50, offset: Int = 0) throws -> VaultLinkPage {
+    /// A document's outgoing links, or with `.incoming` its backlinks. With
+    /// `excerpts`, each mention also gets its line and that line's text.
+    public func links(_ documentID: Data, direction: VaultLinkDirection, limit: Int = 50, offset: Int = 0,
+                      excerpts: Bool = false) throws -> VaultLinkPage {
         guard (1...500).contains(limit), offset >= 0 else { throw SearchIndexError.invalidQuery }
         guard let document = try Catalog.entry(db: requireOpen().db, vaultID: vaultID, id: documentID), document.state == "live" else {
             throw DocumentCatalogError.notFound
@@ -135,7 +198,25 @@ extension VaultRuntime {
             mentions = try storedLinks("l.name_key=?", [.text(LinkIndex.nameKey(document.path!))])
                 .map(mention).filter { $0.documentID == documentID && $0.target != "" }
         }
-        return VaultLinkPage(mentions: Array(mentions.dropFirst(offset).prefix(limit)), total: mentions.count, offset: offset)
+        var page = Array(mentions.dropFirst(offset).prefix(limit))
+        if excerpts { page = try withExcerpts(page) }
+        return VaultLinkPage(mentions: page, total: mentions.count, offset: offset)
+    }
+
+    /// Reads each source note once and adds the line around each link.
+    private func withExcerpts(_ mentions: [VaultLinkMention]) throws -> [VaultLinkMention] {
+        let r = try requireOpen()
+        var contents: [Data: [UInt8]] = [:]
+        return try mentions.map { mention in
+            guard let range = mention.range else { return mention }
+            if contents[mention.sourceID] == nil {
+                guard let entry = try Catalog.entry(db: r.db, vaultID: vaultID, id: mention.sourceID), let hash = entry.hash else { return mention }
+                contents[mention.sourceID] = [UInt8](try r.objects.get(hash, maximumBytes: configuration.maximumBytes))
+            }
+            var result = mention
+            (result.line, result.excerpt) = LinkIndex.excerpt(contents[mention.sourceID]!, around: range)
+            return result
+        }
     }
 
     /// Notes that mention the document's name or one of its aliases as text
@@ -165,21 +246,26 @@ extension VaultRuntime {
 
     private func storedLinks(_ condition: String, _ bindings: [SQLiteValue]) throws -> [StoredLink] {
         try requireOpen().db.queryValues("""
-            SELECT l.entry_id,e.path,l.ordinal,l.syntax,l.target,l.fragment,l.display,l.embed
+            SELECT \(Self.storedLinkColumns)
             FROM document_links l JOIN entries e ON e.vault_id=l.vault_id AND e.id=l.entry_id
               AND e.head_revision=l.revision_id AND e.state='live'
             WHERE l.vault_id=? AND \(condition) ORDER BY e.path,l.ordinal
-            """, bindings: [.blob(vaultID)] + bindings).map { row in
-            guard case .blob(let source) = row[0], case .text(let path) = row[1], case .integer(let ordinal) = row[2],
-                  case .text(let syntax) = row[3], case .text(let target) = row[4], case .integer(let embed) = row[7] else {
-                throw VaultRuntimeError.inconsistentCatalog
-            }
-            var fragment: String?, display: String?
-            if case .text(let value) = row[5] { fragment = value }
-            if case .text(let value) = row[6] { display = value }
-            return StoredLink(sourceID: source, sourcePath: path, ordinal: Int(ordinal), syntax: syntax, target: target,
-                              fragment: fragment, display: display, embed: embed != 0)
+            """, bindings: [.blob(vaultID)] + bindings).map(Self.storedLink)
+    }
+
+    static let storedLinkColumns = "l.entry_id,e.path,l.ordinal,l.syntax,l.target,l.fragment,l.display,l.embed,l.start,l.end"
+
+    static func storedLink(_ row: [SQLiteValue]) throws -> StoredLink {
+        guard case .blob(let source) = row[0], case .text(let path) = row[1], case .integer(let ordinal) = row[2],
+              case .text(let syntax) = row[3], case .text(let target) = row[4], case .integer(let embed) = row[7],
+              case .integer(let start) = row[8], case .integer(let end) = row[9], start <= end else {
+            throw VaultRuntimeError.inconsistentCatalog
         }
+        var fragment: String?, display: String?
+        if case .text(let value) = row[5] { fragment = value }
+        if case .text(let value) = row[6] { display = value }
+        return StoredLink(sourceID: source, sourcePath: path, ordinal: Int(ordinal), syntax: syntax, target: target,
+                          fragment: fragment, display: display, embed: embed != 0, range: Int(start)..<Int(end))
     }
 
     private func mention(_ link: StoredLink) throws -> VaultLinkMention {
@@ -187,13 +273,20 @@ extension VaultRuntime {
         return VaultLinkMention(sourceID: link.sourceID, sourcePath: link.sourcePath, syntax: link.syntax, target: link.target,
                                 fragment: link.fragment, display: link.display, embed: link.embed, status: status,
                                 documentID: file?.id, documentPath: file?.path,
-                                fragmentStatus: try file.map { try fragmentStatus(link, in: $0) } ?? "unresolved")
+                                fragmentStatus: try file.map { try fragmentStatus(link, in: $0) } ?? "unresolved",
+                                range: link.range)
     }
 
     /// Resolves a link target like Obsidian: by file name, by a path suffix
     /// ("folder/note"), or (Markdown links) relative to the source note.
     /// Several equally good matches are "ambiguous", never guessed.
     func resolve(syntax: String, target raw: String, from sourcePath: String, sourceID: Data) throws -> (String, LinkedFile?) {
+        try Self.resolve(syntax: syntax, target: raw, from: sourcePath, sourceID: sourceID,
+                         in: CatalogLinkLookup(db: requireOpen().db, vaultID: vaultID))
+    }
+
+    static func resolve(syntax: String, target raw: String, from sourcePath: String, sourceID: Data,
+                        in files: some LinkTargetLookup) throws -> (String, LinkedFile?) {
         if raw.range(of: "^[a-zA-Z][a-zA-Z0-9+.-]*:", options: .regularExpression) != nil || raw.hasPrefix("//") {
             return ("external", nil)
         }
@@ -202,10 +295,9 @@ extension VaultRuntime {
             guard let decoded = raw.removingPercentEncoding else { return ("unsupported", nil) }
             target = decoded
         }
-        let db = try requireOpen().db
         if target.isEmpty {
-            guard let source = try Catalog.entry(db: db, vaultID: vaultID, id: sourceID) else { return ("missing", nil) }
-            return ("resolved", LinkedFile(id: sourceID, path: sourcePath, kind: source.kind))
+            guard let kind = try files.kind(of: sourceID) else { return ("missing", nil) }
+            return ("resolved", LinkedFile(id: sourceID, path: sourcePath, kind: kind))
         }
         guard !target.contains("\\"), target.utf8.count <= 1024,
               !target.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return ("unsupported", nil) }
@@ -219,9 +311,7 @@ extension VaultRuntime {
             }
             let path = parts.joined(separator: "/")
             for candidate in [path, path + ".md"] {
-                if let entry = try? Catalog.live(db: db, vaultID: vaultID, path: candidate) {
-                    return ("resolved", LinkedFile(id: entry.id, path: entry.path!, kind: entry.kind))
-                }
+                if let file = try files.live(path: candidate) { return ("resolved", file) }
             }
             return ("missing", nil)
         }
@@ -230,11 +320,9 @@ extension VaultRuntime {
             return ("unsupported", nil)
         }
         let wanted = LinkIndex.fold(LinkIndex.withoutMarkdownExtension(target))
-        var matches = try db.queryValues("SELECT id,path,kind FROM entries WHERE vault_id=? AND state='live' AND name_key=? ORDER BY path",
-                                         bindings: [.blob(vaultID), .text(LinkIndex.nameKey(target))]).compactMap { row -> LinkedFile? in
-            guard case .blob(let id) = row[0], case .text(let path) = row[1], case .text(let kind) = row[2] else { return nil }
-            let key = LinkIndex.fold(LinkIndex.withoutMarkdownExtension(path))
-            return key == wanted || key.hasSuffix("/" + wanted) ? LinkedFile(id: id, path: path, kind: kind) : nil
+        var matches = try files.named(LinkIndex.nameKey(target)).filter { file in
+            let key = LinkIndex.fold(LinkIndex.withoutMarkdownExtension(file.path))
+            return key == wanted || key.hasSuffix("/" + wanted)
         }
         if matches.count > 1 {
             // Obsidian prefers the file next to the linking note.

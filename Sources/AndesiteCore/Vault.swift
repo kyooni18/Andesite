@@ -272,10 +272,13 @@ public final class Vault: @unchecked Sendable {
         try await perform(.read) { try $0.documentMetadata($0.document(path).id) }
     }
 
-    /// Outgoing links, or with `.incoming` the backlinks.
+    /// Outgoing links, or with `.incoming` the backlinks. With `excerpts`,
+    /// each mention also carries its line in the source and that line's text.
     public func links(_ path: String, direction: VaultLinkDirection = .outgoing,
-                      limit: Int = 50, offset: Int = 0) async throws -> VaultLinkPage {
-        try await perform(.read) { try $0.links($0.document(path).id, direction: direction, limit: limit, offset: offset) }
+                      limit: Int = 50, offset: Int = 0, excerpts: Bool = false) async throws -> VaultLinkPage {
+        try await perform(.read) {
+            try $0.links($0.document(path).id, direction: direction, limit: limit, offset: offset, excerpts: excerpts)
+        }
     }
 
     public func unlinkedMentions(_ path: String, limit: Int = 50) async throws -> [UnlinkedMention] {
