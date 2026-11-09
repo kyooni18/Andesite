@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// The document lifecycle. Paths are Vault-relative ("folder/note.md").
 /// `revision` arguments are optimistic-concurrency preconditions: the call
@@ -10,26 +15,56 @@ extension VaultRuntime {
     @discardableResult
     public func create(_ path: String, _ content: Data) throws -> IndexedDocument {
         let path = try vaultPath(path)
-        let hash = try store(content, kind: kind(of: path))
+        return try create(path, hash: try store(content, kind: kind(of: path)), size: Int64(content.count))
+    }
+
+    /// Creates a file from a local file's bytes, streamed (for large attachments).
+    @discardableResult
+    public func create(_ path: String, contentsOf file: URL) throws -> IndexedDocument {
+        let path = try vaultPath(path)
+        let (hash, size) = try store(contentsOf: file, kind: kind(of: path))
+        return try create(path, hash: hash, size: size)
+    }
+
+    private func create(_ path: String, hash: String, size: Int64) throws -> IndexedDocument {
         guard try Catalog.live(db: requireOpen().db, vaultID: vaultID, path: path) == nil else { throw VaultError.alreadyExists(path) }
-        let id = ExternalCapture.identifier()
-        try run(MutationPlan(entry: id, kind: kind(of: path), base: nil, revision: ExternalCapture.identifier(),
-                             parents: [], to: path, toHash: hash, toSize: Int64(content.count), origin: "local"))
+        try run(MutationPlan(entry: ExternalCapture.identifier(), kind: kind(of: path), base: nil, revision: ExternalCapture.identifier(),
+                             parents: [], to: path, toHash: hash, toSize: size, origin: "local"))
         return try document(path)
     }
 
-    /// The current document and its exact bytes.
+    /// The current document and its exact bytes (up to the Markdown size
+    /// limit; use `openContent` for larger attachments).
     public func read(_ path: String) throws -> (document: IndexedDocument, content: Data) {
         let document = try self.document(path)
+        guard document.byteLength <= configuration.maximumBytes else { throw VaultError.tooLarge }
         return (document, try requireOpen().objects.get(document.hash, maximumBytes: configuration.maximumBytes))
+    }
+
+    /// The current document and a read-only descriptor of its content, for
+    /// streaming. The caller closes the descriptor; it may be used from any
+    /// thread because stored content never changes.
+    public func openContent(_ path: String) throws -> (document: IndexedDocument, descriptor: Int32) {
+        let document = try self.document(path)
+        return (document, try requireOpen().objects.descriptor(document.hash))
     }
 
     @discardableResult
     public func update(_ path: String, _ content: Data, revision: Data) throws -> IndexedDocument {
         let current = try head(path, revision: revision)
-        let hash = try store(content, kind: current.kind)
+        return try update(current, hash: try store(content, kind: current.kind), size: Int64(content.count))
+    }
+
+    @discardableResult
+    public func update(_ path: String, contentsOf file: URL, revision: Data) throws -> IndexedDocument {
+        let current = try head(path, revision: revision)
+        let (hash, size) = try store(contentsOf: file, kind: current.kind)
+        return try update(current, hash: hash, size: size)
+    }
+
+    private func update(_ current: CatalogEntry, hash: String, size: Int64) throws -> IndexedDocument {
         if hash == current.hash { return try document(current.path!) }
-        try run(plan(current, to: current.path, hash: hash, size: Int64(content.count)))
+        try run(plan(current, to: current.path, hash: hash, size: size))
         return try document(current.path!)
     }
 
@@ -177,11 +212,28 @@ extension VaultRuntime {
     }
 
     func store(_ content: Data, kind: String) throws -> String {
-        guard content.count <= configuration.maximumBytes else { throw VaultError.tooLarge }
+        guard content.count <= configuration.limit(for: kind) else { throw VaultError.tooLarge }
         if kind == "markdown", String(data: content, encoding: .utf8) == nil {
             throw VaultError.unsupported("Markdown must be valid UTF-8")
         }
         return try requireOpen().objects.put(content)
+    }
+
+    func store(contentsOf file: URL, kind: String) throws -> (hash: String, size: Int64) {
+        #if canImport(Darwin)
+        let fd = Darwin.open(file.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        #else
+        let fd = Glibc.open(file.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        #endif
+        guard fd >= 0 else { throw VaultError.notFound(file.path) }
+        defer { close(fd) }
+        let objects = try requireOpen().objects
+        let stored: (hash: String, size: Int64)
+        do { stored = try objects.put(from: fd, maximumBytes: configuration.limit(for: kind)) } catch ObjectStoreError.tooLarge { throw VaultError.tooLarge }
+        if kind == "markdown", String(data: try objects.get(stored.hash, maximumBytes: configuration.maximumBytes), encoding: .utf8) == nil {
+            throw VaultError.unsupported("Markdown must be valid UTF-8")
+        }
+        return stored
     }
 
     func kind(of path: String) -> String {

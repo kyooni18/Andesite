@@ -185,3 +185,32 @@ private func converged(_ a: VaultSession, _ ra: URL, _ b: VaultSession, _ rb: UR
     await server.stop()
     try b.close()
 }
+
+@Test func largeAttachmentsStreamOverHTTPAndSyncInResumableChunks() async throws {
+    let fa = try RuntimeFixture(), fb = try RuntimeFixture(); defer { fa.clean(); fb.clean() }
+    let a = try VaultSession(vaultDirectory: fa.vault.path, stateDirectory: fa.state.path)
+    let b = try VaultSession(vaultDirectory: fb.vault.path, stateDirectory: fb.state.path)
+    let server = try await TestServer(b)
+    // Larger than the Markdown limit and spanning several sync chunks.
+    let large = Data((0..<(VaultRuntime.chunkLimit * 2 + 12345)).map { UInt8(truncatingIfNeeded: $0 &* 7) })
+    let put = try await server.request("PUT", "/v1/file?path=media/video.bin", body: large, headers: ["If-None-Match": "*"])
+    #expect(put.status == 201)
+    let get = try await server.request("GET", "/v1/file?path=media/video.bin")
+    #expect(get.status == 200 && get.body == large)
+
+    // A second attachment on A, whose upload to B is interrupted halfway.
+    let other = Data((0..<(VaultRuntime.chunkLimit + 99)).map { UInt8(truncatingIfNeeded: $0 &* 13) })
+    let created = try a.run { try $0.create("media/other.bin", other) }
+    let half = try await server.request("PUT", "/v1/sync/objects/\(created.hash)?size=\(other.count)&offset=0",
+                                        body: other.prefix(VaultRuntime.chunkLimit))
+    #expect(half.status == 200)
+    let progress = try await server.json("POST", "/v1/sync/objects/missing", headers: [:])
+    #expect(progress.status == 400) // body must be a JSON array
+
+    let report = try await SyncClient(destination: server.url, token: server.token).sync(a)
+    #expect(report.pending == 0 && report.received == 1 && report.sent == 1)
+    #expect(try Data(contentsOf: fa.vault.appendingPathComponent("media/video.bin")) == large)
+    #expect(try Data(contentsOf: fb.vault.appendingPathComponent("media/other.bin")) == other)
+    await server.stop()
+    try a.close(); try b.close()
+}

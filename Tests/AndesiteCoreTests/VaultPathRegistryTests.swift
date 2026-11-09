@@ -30,7 +30,7 @@ import Testing
     try "# Internal\ninternaluniquephrase\n".write(to: metadataDirectory.appendingPathComponent("internal.md"),
                                                        atomically: false, encoding: .utf8)
     let reader = try VaultReader(rootPath: f.vault.path)
-    #expect(try reader.markdownPaths().map { $0.components.joined(separator: "/") } == ["note.md"])
+    #expect(try reader.files().map { $0.path.components.joined(separator: "/") } == ["note.md"])
     let runtime = try VaultRuntime(configuration: f.configuration)
     #expect(try runtime.reconcile().discovered == 1)
     #expect(try runtime.search("useruniquephrase").count == 1)
@@ -80,13 +80,13 @@ import Testing
     try FileManager.default.createSymbolicLink(at: metadata, withDestinationURL: outside)
     #expect(throws: VaultPathRegistryError.unsafeRegistry) { try registry.register() }
     let unsafeReader = try VaultReader(rootPath: f.vault.path)
-    #expect(try unsafeReader.markdownFiles().isEmpty) // hidden entries are never followed
+    #expect(try unsafeReader.files().isEmpty) // hidden entries are never followed
     try FileManager.default.removeItem(at: metadata)
 
     try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: false,
                                              attributes: [.posixPermissions: 0o755])
     #expect(throws: VaultPathRegistryError.unsafeRegistry) { try registry.register() }
-    #expect(try unsafeReader.markdownFiles().isEmpty) // hidden entries are never followed
+    #expect(try unsafeReader.files().isEmpty) // hidden entries are never followed
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: metadata.path)
 
     let marker = metadata.appendingPathComponent("vault.json")
@@ -121,5 +121,5 @@ import Testing
                                              attributes: [.posixPermissions: 0o700])
     try Data("# hidden".utf8).write(to: nested.appendingPathComponent(".andesite/secret.md"))
     let reader = try VaultReader(rootPath: f.vault.path)
-    #expect(try reader.markdownFiles().isEmpty)
+    #expect(try reader.files().isEmpty)
 }

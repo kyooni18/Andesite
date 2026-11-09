@@ -27,6 +27,12 @@ public struct SyncBatch: Codable, Sendable {
     public var head: Int64
 }
 
+public struct ObjectProgress: Codable, Sendable, Equatable {
+    public var hash: String
+    public var received: Int64
+    public init(hash: String, received: Int64) { self.hash = hash; self.received = received }
+}
+
 public struct SyncIdentity: Codable, Sendable, Equatable {
     public var vault: String
     public var epoch: String
@@ -115,22 +121,33 @@ extension VaultRuntime {
 
     // MARK: Objects
 
-    public func missingObjects(_ hashes: [String]) throws -> [String] {
+    /// Largest chunk of an object sent in one request.
+    public static let chunkLimit = 4 * 1024 * 1024
+
+    /// Of `hashes`, the objects this Vault lacks, with how much of each an
+    /// interrupted transfer already delivered.
+    public func missingObjects(_ hashes: [String]) throws -> [ObjectProgress] {
         guard hashes.count <= 5000, hashes.allSatisfy(ObjectStore.validHash) else { throw SyncError.invalidBatch("hashes") }
         let objects = try requireOpen().objects
-        return Array(Set(hashes)).filter { !objects.contains($0) }.sorted()
+        return Set(hashes).filter { !objects.contains($0) }.sorted()
+            .map { ObjectProgress(hash: $0, received: objects.received($0)) }
     }
 
-    /// Stores peer content after verifying it hashes to `hash`.
-    public func storeObject(_ content: Data, hash: String) throws {
-        guard ObjectStore.validHash(hash), content.count <= configuration.maximumBytes else { throw SyncError.invalidBatch("object") }
-        guard ObjectStore.hash(content) == hash else { throw SyncError.invalidBatch("object hash mismatch") }
-        _ = try requireOpen().objects.put(content)
+    /// Stores one chunk of a peer's object; see `ObjectStore.receive`.
+    public func receiveChunk(_ hash: String, size: Int64, offset: Int64, _ data: Data) throws -> Int64 {
+        guard ObjectStore.validHash(hash), size >= 0, size <= Int64(configuration.maximumFileBytes), offset >= 0,
+              data.count <= Self.chunkLimit else { throw SyncError.invalidBatch("chunk") }
+        do {
+            return try requireOpen().objects.receive(hash, size: size, offset: offset, data)
+        } catch ObjectStoreError.corruptObject {
+            throw SyncError.invalidBatch("object \(hash) does not match its hash")
+        }
     }
 
-    public func object(_ hash: String) throws -> Data {
+    public func objectChunk(_ hash: String, offset: Int64, length: Int) throws -> Data {
         guard ObjectStore.validHash(hash), try requireOpen().objects.contains(hash) else { throw VaultError.notFound(hash) }
-        return try requireOpen().objects.get(hash, maximumBytes: configuration.maximumBytes)
+        guard offset >= 0, (0...Self.chunkLimit).contains(length) else { throw SyncError.invalidBatch("range") }
+        return try requireOpen().objects.chunk(hash, offset: offset, length: length)
     }
 
     // MARK: Progress
@@ -215,7 +232,7 @@ extension VaultRuntime {
               s.path.utf8.count <= 1024, let path = try? VaultPath(s.path),
               !path.components.contains(where: { $0.hasPrefix(".") }),
               s.deleted == (s.hash == nil), s.deleted == (s.size == nil),
-              s.hash.map(ObjectStore.validHash) ?? true, (s.size ?? 0) >= 0, (s.size ?? 0) <= Int64(configuration.maximumBytes),
+              s.hash.map(ObjectStore.validHash) ?? true, (s.size ?? 0) >= 0, (s.size ?? 0) <= Int64(configuration.limit(for: s.kind)),
               !s.origin.isEmpty, s.origin.utf8.count <= 32 else { throw SyncError.invalidBatch("record \(s.revision.prefix(40))") }
         return RevisionRecord(entry: try id(s.document), revision: try id(s.revision), parents: parents, path: s.path,
                               deleted: s.deleted, hash: s.hash, size: s.size, kind: s.kind, origin: s.origin)

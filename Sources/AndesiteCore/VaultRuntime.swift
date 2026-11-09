@@ -17,12 +17,18 @@ public enum VaultRuntimeError: Error, Equatable {
 public struct VaultConfiguration: Sendable {
     public let vaultDirectory: String
     public let stateDirectory: String
+    /// Largest Markdown note (notes are parsed in memory).
     public let maximumBytes: Int
+    /// Largest attachment (attachments are only ever streamed).
+    public let maximumFileBytes: Int
     public let debounce: TimeInterval
-    public init(vaultDirectory: String, stateDirectory: String, maximumBytes: Int = 16 * 1024 * 1024, debounce: TimeInterval = 0.25) {
+    public init(vaultDirectory: String, stateDirectory: String, maximumBytes: Int = 16 * 1024 * 1024,
+                maximumFileBytes: Int = 4 * 1024 * 1024 * 1024, debounce: TimeInterval = 0.25) {
         self.vaultDirectory = vaultDirectory; self.stateDirectory = stateDirectory
-        self.maximumBytes = maximumBytes; self.debounce = debounce
+        self.maximumBytes = maximumBytes; self.maximumFileBytes = maximumFileBytes; self.debounce = debounce
     }
+
+    func limit(for kind: String) -> Int { kind == "markdown" ? maximumBytes : maximumFileBytes }
 }
 
 public struct ReconciliationReport: Sendable {
@@ -33,6 +39,8 @@ public struct ReconciliationReport: Sendable {
     public var deleted = 0
     public var renamed = 0
     public var snapshotsCreated = 0
+    /// Files over the size limit, left untracked.
+    public var oversize = 0
 }
 
 public struct VaultStatus: Sendable {
@@ -98,7 +106,7 @@ public final class VaultRuntime {
 
     public init(configuration: VaultConfiguration) throws {
         let c = configuration
-        guard c.maximumBytes > 0, c.debounce.isFinite, c.debounce >= 0 else { throw VaultRuntimeError.invalidConfiguration }
+        guard c.maximumBytes > 0, c.maximumFileBytes >= c.maximumBytes, c.debounce.isFinite, c.debounce >= 0 else { throw VaultRuntimeError.invalidConfiguration }
         try Self.validateDirectory(c.vaultDirectory, privateDirectory: false)
         try Self.validateDirectory(c.stateDirectory, privateDirectory: true)
         let vault = c.vaultDirectory
@@ -347,21 +355,40 @@ public final class VaultRuntime {
         try setState("scanning")
         do {
             try verifyObjects()
-            let scan = try r.reader.markdownFiles()
+            let all = try r.reader.files()
+            // Files over their size limit are left alone: untracked, and not
+            // mistaken for the deletion of what was tracked at that path.
+            let oversize = Set(all.filter { $0.fingerprint.size > Int64(configuration.limit(for: $0.kind)) }.map(\.path.portabilityKey))
+            let scan = all.filter { !oversize.contains($0.path.portabilityKey) }
             let plan = try NamespacePlan(db: r.db, vaultID: vaultID, scan: scan)
+            let deleted = plan.deleted.filter { !oversize.contains(plan.old[$0].path.portabilityKey) }
             var report = ReconciliationReport()
             report.discovered = scan.count
+            report.oversize = all.count - scan.count
             var deferred: [(Int, ExternalCapture.Prepared)] = []
             var quarantinedMove = false
-            func index(_ captured: ExternalCaptureResult) throws {
-                let bytes = try r.objects.get(captured.contentHash, maximumBytes: configuration.maximumBytes)
-                try SearchIndex.index(db: r.db, vaultID: vaultID, entryID: captured.entryID, revisionID: captured.revisionID, bytes: bytes)
+            func index(_ captured: ExternalCaptureResult, _ kind: String) throws {
+                if kind == "markdown" {
+                    let bytes = try r.objects.get(captured.contentHash, maximumBytes: configuration.maximumBytes)
+                    try SearchIndex.index(db: r.db, vaultID: vaultID, entryID: captured.entryID, revisionID: captured.revisionID, bytes: bytes)
+                }
                 if captured.sequence == nil { report.unchanged += 1 } else { report.revisionsCreated += 1 }
             }
-            for (indexInScan, file) in scan.enumerated() {
-                let observation = try r.reader.observeStable(file.path, maximumBytes: configuration.maximumBytes, debounce: configuration.debounce)
-                guard observation.fingerprint == file.fingerprint else { throw VaultReadError.unstable }
-                let prepared = try ExternalCapture.prepare(path: file.path, observation: observation, objects: r.objects)
+            // Only files whose metadata differs from the catalog are read.
+            let changed = scan.indices.filter { index in
+                guard let prior = plan.assignment[index], !plan.moved.contains(prior) else { return true }
+                return plan.old[prior].fingerprint != scan[index].fingerprint
+            }
+            report.unchanged = scan.count - changed.count
+            // One quiet period for the whole batch: a file still being written
+            // changes its fingerprint, fails this scan and is retried later.
+            if !changed.isEmpty, configuration.debounce > 0 { Thread.sleep(forTimeInterval: configuration.debounce) }
+            for indexInScan in changed {
+                let file = scan[indexInScan]
+                let (hash, size) = try r.reader.capture(file.path, expected: file.fingerprint, into: r.objects,
+                                                        maximumBytes: configuration.limit(for: file.kind))
+                let prepared = try ExternalCapture.prepare(file, hash: hash, size: size, objects: r.objects,
+                                                           maximumMarkdownBytes: configuration.maximumBytes)
                 if plan.needsNamespaceCommit(index: indexInScan, file: file) {
                     if !prepared.valid {
                         let id = plan.assignment[indexInScan].map { plan.old[$0].id }
@@ -374,28 +401,28 @@ public final class VaultRuntime {
                 let captured = try r.db.transaction { try ExternalCapture.publish(db: r.db, vaultID: vaultID, prepared: prepared, at: date) }
                 if let captured {
                     if try r.db.transaction({ try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: captured.entryID, at: date) }) { report.snapshotsCreated += 1 }
-                    try index(captured)
+                    try index(captured, prepared.kind)
                 } else { report.invalidMarkdown += 1 }
             }
             // Only a fully enumerated, unchanged namespace and a later secure
             // absence check may authorize tombstones. A failure above or here
             // leaves earlier captures intact but publishes no disappearances.
-            try NamespacePlan.validateUnchanged(scan, r.reader.markdownFiles())
+            try NamespacePlan.validateUnchanged(all, r.reader.files())
             if quarantinedMove {
                 try setState("quarantined")
                 return report
             }
-            let results: [ExternalCaptureResult] = try r.db.transaction {
+            let results: [(ExternalCaptureResult, String)] = try r.db.transaction {
                 // Recheck after acquiring SQLite's writer lock, not before a
                 // potentially long lock wait. No metadata has changed yet.
-                for prior in plan.deleted {
+                for prior in deleted {
                     guard try r.reader.confirmAbsent(plan.old[prior].path) else { throw VaultReadError.unstable }
                 }
-                for prior in plan.moved.union(plan.deleted).sorted() {
-                    let reason = plan.deleted.contains(prior) ? "deletion" : "rename"
+                for prior in plan.moved.union(deleted).sorted() {
+                    let reason = deleted.contains(prior) ? "deletion" : "rename"
                     if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: plan.old[prior].id, at: date, reason: reason, force: true) { report.snapshotsCreated += 1 }
                 }
-                for prior in plan.deleted.sorted() {
+                for prior in deleted.sorted() {
                     try ExternalCapture.tombstone(db: r.db, vaultID: vaultID, entryID: plan.old[prior].id, at: date)
                     report.deleted += 1; report.revisionsCreated += 1
                 }
@@ -404,18 +431,18 @@ public final class VaultRuntime {
                 for prior in plan.moved.sorted() {
                     try r.db.executeValues("UPDATE entries SET state='reserved',path=NULL,path_key=NULL WHERE vault_id=? AND id=?", bindings: [.blob(vaultID), .blob(plan.old[prior].id)])
                 }
-                var results: [ExternalCaptureResult] = []
+                var results: [(ExternalCaptureResult, String)] = []
                 for (indexInScan, prepared) in deferred {
                     let id = plan.assignment[indexInScan].map { plan.old[$0].id }
                     guard let captured = try ExternalCapture.publish(db: r.db, vaultID: vaultID, prepared: prepared, entryID: id, at: date) else { throw VaultRuntimeError.inconsistentCatalog }
                     let moved = id != nil
                     if moved { report.renamed += 1 }
                     if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: captured.entryID, at: date, reason: moved ? "rename" : "interval", force: moved) { report.snapshotsCreated += 1 }
-                    results.append(captured)
+                    results.append((captured, prepared.kind))
                 }
                 return results
             }
-            for captured in results { try index(captured) }
+            for (captured, kind) in results { try index(captured, kind) }
             // v9 metadata migration: populate missing properties/tag rows
             // from already verified immutable revisions, never source files.
             // Do not declare the index ready with a partial backfill.
@@ -426,6 +453,9 @@ public final class VaultRuntime {
             // incident remains visible even when its original path disappears.
             let incidents = try status().openIncidents
             try setState(incidents == 0 ? "ready" : "quarantined")
+            // Unchanged files are not revisited, so promote snapshots that
+            // became due since their revision was captured.
+            report.snapshotsCreated += try scheduleDueSnapshots(at: date)
             return report
         } catch {
             try? setState("scanFailed")
@@ -450,10 +480,11 @@ public final class VaultRuntime {
                   OR r.content_hash!=s.content_hash OR r.byte_length!=s.byte_length OR r.path!=s.path
                   OR o.hash IS NULL OR o.length!=s.byte_length LIMIT 1
                 """).isEmpty else { throw VaultRuntimeError.inconsistentCatalog }
+        // Every registered object must exist with its recorded size. Content
+        // is verified by hash whenever it is read (exports, sync, restores).
         for row in try r.db.queryValues("SELECT lower(hex(hash)),length,durable_location FROM objects") {
-            guard case .text(let hash) = row[0], case .integer(let length) = row[1], row[2] == .text(hash), length >= 0, length <= Int.max else { throw VaultRuntimeError.inconsistentCatalog }
-            let bytes = try r.objects.get(hash, maximumBytes: Int(length))
-            guard bytes.count == Int(length) else { throw VaultRuntimeError.inconsistentCatalog }
+            guard case .text(let hash) = row[0], case .integer(let length) = row[1], row[2] == .text(hash),
+                  r.objects.size(hash) == length else { throw VaultRuntimeError.inconsistentCatalog }
         }
     }
 

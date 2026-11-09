@@ -21,6 +21,7 @@ Documents:
   delete <path> <revision>
   restore <path> <revision>
   mkdir <path> | mvdir <path> <new-path>
+  gc [<minimum-age-days>]               remove unreferenced stored content (default 7 days)
 Snapshots:
   snapshots [<path>] | snapshot <id> | snapshot-compare <id> <id>
   snapshot-export <id> <new-file> | snapshot-storage
@@ -146,7 +147,7 @@ func main() async throws {
             if let interval { try await Task.sleep(nanoseconds: UInt64(max(interval, 1) * 1_000_000_000)) }
         } while interval != nil
     default:
-        let input = command == "write" ? (try FileHandle.standardInput.read(upToCount: 16 * 1024 * 1024 + 1) ?? Data()) : Data()
+        let input = command == "write" ? (try FileHandle.standardInput.readToEnd() ?? Data()) : Data()
         try session.run { vault in try runDocumentCommand(vault, command, rest, input: input) }
     }
 }
@@ -171,7 +172,6 @@ func runDocumentCommand(_ vault: AndesiteBackend, _ command: String, _ rest: [St
         FileHandle.standardOutput.write(try vault.read(rest[0]).content)
     case "write":
         try expect(1...2)
-        guard input.count <= 16 * 1024 * 1024 else { throw VaultError.tooLarge }
         print(describe(rest.count == 2 ? try vault.update(rest[0], input, revision: identifier(rest[1]))
                                        : try vault.create(rest[0], input)))
     case "move":
@@ -213,6 +213,11 @@ func runDocumentCommand(_ vault: AndesiteBackend, _ command: String, _ rest: [St
         try expect(0...0)
         let s = try vault.snapshotStorage()
         print("snapshots=\(s.snapshots) expirationEligible=\(s.expirationEligible) logicalBytes=\(s.logicalBytes) uniqueSnapshotBytes=\(s.uniqueSnapshotBytes) registeredObjectBytes=\(s.registeredObjectBytes) physicalObjectAllocatedBytes=\(s.physicalObjectAllocatedBytes)")
+    case "gc":
+        try expect(0...1)
+        let days = rest.first.flatMap(Double.init) ?? 7
+        let g = try vault.collectGarbage(minimumAge: days * 86_400)
+        print("removedObjects=\(g.removedObjects) removedBytes=\(g.removedBytes) removedPartials=\(g.removedPartials)")
     case "snapshot-config":
         try expect(2...2)
         guard let interval = Double(rest[0]), let retention = Double(rest[1]) else { throw UsageError() }

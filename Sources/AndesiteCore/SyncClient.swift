@@ -59,11 +59,7 @@ public final class SyncClient: Sendable {
         while true {
             let batch: SyncBatch = try decode(await request("GET", "/v1/sync/changes?after=\(cursor)&limit=\(VaultRuntime.syncPageLimit)"))
             guard batch.vault == peer.vault, batch.epoch == peer.epoch, batch.through >= cursor else { throw SyncTransportError.invalidResponse }
-            let hashes = Array(Set(batch.records.compactMap(\.hash)))
-            for hash in try await session.perform({ try $0.missingObjects(hashes) }) {
-                let content = try await request("GET", "/v1/sync/objects/" + hash)
-                try await session.perform { try $0.storeObject(content, hash: hash) }
-            }
+            try await download(batch.records, into: session)
             report.received += try await session.perform { try $0.receive(batch) }
             cursor = batch.through
             if cursor >= batch.head { break }
@@ -75,12 +71,7 @@ public final class SyncClient: Sendable {
             let after = acknowledged
             let batch = try await session.perform { try $0.syncFeed(after: after) }
             if !batch.records.isEmpty {
-                let hashes = Array(Set(batch.records.compactMap(\.hash))).sorted()
-                let missing: [String] = try decode(await request("POST", "/v1/sync/objects/missing", body: try JSONEncoder().encode(hashes)))
-                for hash in missing where hashes.contains(hash) {
-                    let content = try await session.perform { try $0.object(hash) }
-                    _ = try await request("PUT", "/v1/sync/objects/" + hash, body: content)
-                }
+                try await upload(batch.records, from: session)
                 let remote: SyncReport = try decode(await request("POST", "/v1/sync/changes", body: try JSONEncoder().encode(batch)))
                 report.sent += remote.received
             }
@@ -91,11 +82,49 @@ public final class SyncClient: Sendable {
         return report
     }
 
-    private func request(_ method: String, _ path: String, body: Data? = nil) async throws -> Data {
+    /// Fetches the content the records need, resuming partial transfers.
+    private func download(_ records: [SyncRecord], into session: VaultSession) async throws {
+        let sizes = Dictionary(records.compactMap { r in r.hash.map { ($0, r.size ?? 0) } }, uniquingKeysWith: { a, _ in a })
+        let hashes = Array(sizes.keys)
+        for missing in try await session.perform({ try $0.missingObjects(hashes) }) {
+            let (hash, size) = (missing.hash, sizes[missing.hash] ?? 0)
+            var offset = missing.received
+            repeat {
+                let at = offset, length = Int(min(Int64(VaultRuntime.chunkLimit), size - at))
+                let data = try await request("GET", "/v1/sync/objects/\(hash)?offset=\(at)&length=\(length)")
+                guard data.count == length else { throw SyncTransportError.invalidResponse }
+                offset = try await session.perform { try $0.receiveChunk(hash, size: size, offset: at, data) }
+                guard offset > at || size == 0 else { throw SyncTransportError.invalidResponse }
+            } while offset < size
+        }
+    }
+
+    /// Sends the content the peer lacks, resuming partial transfers.
+    private func upload(_ records: [SyncRecord], from session: VaultSession) async throws {
+        let sizes = Dictionary(records.compactMap { r in r.hash.map { ($0, r.size ?? 0) } }, uniquingKeysWith: { a, _ in a })
+        let missing: [ObjectProgress] = try decode(await request("POST", "/v1/sync/objects/missing",
+                                                                 body: try JSONEncoder().encode(sizes.keys.sorted())))
+        for item in missing {
+            guard let size = sizes[item.hash] else { continue }
+            var offset = item.received
+            repeat {
+                let at = offset, length = Int(min(Int64(VaultRuntime.chunkLimit), size - at))
+                let data = try await session.perform { try $0.objectChunk(item.hash, offset: at, length: length) }
+                let reply: ObjectProgress = try decode(await request(
+                    "PUT", "/v1/sync/objects/\(item.hash)?size=\(size)&offset=\(at)", body: data,
+                    headers: ["X-Chunk-SHA256": ObjectStore.hash(data)]))
+                offset = reply.received
+                guard offset > at || size == 0 else { throw SyncTransportError.invalidResponse }
+            } while offset < size
+        }
+    }
+
+    private func request(_ method: String, _ path: String, body: Data? = nil, headers: [String: String] = [:]) async throws -> Data {
         var request = URLRequest(url: URL(string: endpoint.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path)!)
         request.httpMethod = method
         request.httpBody = body
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         let (data, response) = try await http.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw SyncTransportError.invalidResponse }
         guard response.statusCode == 200 else {

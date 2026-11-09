@@ -1,13 +1,19 @@
 import Foundation
 import AndesiteCore
 import Hummingbird
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// The authenticated HTTP API. Each route is one backend call executed on
 /// the session's owner queue; Hummingbird's event loops only parse and wait.
 /// The server binds 127.0.0.1. Reach it from other machines through TLS
 /// termination or a tunnel; the sync client refuses plain HTTP off-host.
 public enum AndesiteHTTPServer {
-    public static let maximumBody = 16 * 1024 * 1024
+    /// Largest file accepted by PUT /v1/file; the Vault's own limits also apply.
+    public static let maximumUpload = 4 * 1024 * 1024 * 1024
 
     public static func isValidToken(_ token: String) -> Bool {
         token.utf8.count == 64 && token.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) || (65...70).contains($0) }
@@ -39,22 +45,29 @@ public enum AndesiteHTTPServer {
         // Files, addressed by Vault-relative path.
         router.get("/v1/file") { request, _ in
             let path = request.uri.queryParameters["path"].map(String.init)
-            return await respond(session) { vault in
-                let (document, content) = try vault.read(try required(path, "path"))
-                return Reply(body: content, contentType: document.kind == "markdown" ? "text/markdown; charset=utf-8" : "application/octet-stream",
-                             etag: document.revisionID.hex)
-            }
+            let opened: OpenedContent
+            do {
+                opened = try await session.perform { vault in
+                    let (document, descriptor) = try vault.openContent(try required(path, "path"))
+                    return OpenedContent(document: document, descriptor: descriptor)
+                }
+            } catch { return response(failure(error)) }
+            return stream(opened)
         }
         router.put("/v1/file") { request, _ in
             let path = request.uri.queryParameters["path"].map(String.init)
             let create = request.headers[.init("If-None-Match")!] == "*"
             let match = revision(request.headers[.init("If-Match")!])
-            let body = try await Data(buffer: request.body.collect(upTo: maximumBody))
+            // Stage the body outside the owner queue; the backend then
+            // streams it into the object store.
+            let staged: URL
+            do { staged = try await stage(request.body, in: session.stateDirectory) } catch { return response(failure(error)) }
+            defer { try? FileManager.default.removeItem(at: staged) }
             return await respond(session) { vault in
                 let path = try required(path, "path")
-                if create { return try document(vault.create(path, body), status: 201) }
+                if create { return try document(vault.create(path, contentsOf: staged), status: 201) }
                 guard let match else { throw APIError(.preconditionRequired, "if_match_or_if_none_match_required") }
-                return try document(vault.update(path, body, revision: match))
+                return try document(vault.update(path, contentsOf: staged, revision: match))
             }
         }
         router.delete("/v1/file") { request, _ in
@@ -202,16 +215,24 @@ public enum AndesiteHTTPServer {
                 return try encoded(vault.missingObjects(hashes))
             }
         }
-        router.get("/v1/sync/objects/{hash}") { _, context in
+        router.get("/v1/sync/objects/{hash}") { request, context in
             let hash = context.parameters.get("hash") ?? ""
-            return await respond(session) { Reply(body: try $0.object(hash), contentType: "application/octet-stream") }
+            let q = request.uri.queryParameters
+            let (offset, length) = (q["offset"].flatMap { Int64($0) } ?? 0, int(q["length"]) ?? VaultRuntime.chunkLimit)
+            return await respond(session) {
+                Reply(body: try $0.objectChunk(hash, offset: offset, length: length), contentType: "application/octet-stream")
+            }
         }
         router.put("/v1/sync/objects/{hash}") { request, context in
             let hash = context.parameters.get("hash") ?? ""
-            let body = try await Data(buffer: request.body.collect(upTo: maximumBody))
+            let q = request.uri.queryParameters
+            let size = q["size"].flatMap { Int64($0) }, offset = q["offset"].flatMap { Int64($0) } ?? 0
+            let digest = request.headers[.init("X-Chunk-SHA256")!]
+            let body = try await Data(buffer: request.body.collect(upTo: VaultRuntime.chunkLimit))
             return await respond(session) { vault in
-                try vault.storeObject(body, hash: hash)
-                return try json(["stored": hash])
+                guard digest == nil || digest == ObjectStore.hash(body) else { throw APIError(.badRequest, "chunk_hash_mismatch") }
+                let received = try vault.receiveChunk(hash, size: required(size, "size"), offset: offset, body)
+                return try encoded(ObjectProgress(hash: hash, received: received))
             }
         }
         return router
@@ -235,12 +256,69 @@ struct Reply: Sendable {
 
 /// Runs `work` on the owner queue and converts the result or error.
 func respond(_ session: VaultSession, _ work: @escaping @Sendable (AndesiteBackend) throws -> Reply) async -> Response {
-    let reply: Reply
-    do { reply = try await session.perform(work) } catch { reply = failure(error) }
+    do { return response(try await session.perform(work)) } catch { return response(failure(error)) }
+}
+
+func response(_ reply: Reply) -> Response {
     var headers: HTTPFields = [.contentType: reply.contentType, .cacheControl: "no-store",
                                .init("X-Content-Type-Options")!: "nosniff"]
     if let etag = reply.etag { headers[.eTag] = "\"\(etag)\"" }
     return Response(status: .init(code: reply.status), headers: headers, body: .init(byteBuffer: ByteBuffer(bytes: reply.body)))
+}
+
+struct OpenedContent: Sendable {
+    let document: IndexedDocument
+    let descriptor: Int32
+}
+
+/// Streams stored content without loading it into memory.
+func stream(_ file: OpenedContent) -> Response {
+    let fd = file.descriptor
+    let body = ResponseBody(contentLength: file.document.byteLength) { writer in
+        defer { close(fd) }
+        var buffer = [UInt8](repeating: 0, count: 1 << 20)
+        while true {
+            let n = read(fd, &buffer, buffer.count)
+            if n < 0 && errno == EINTR { continue }
+            guard n >= 0 else { throw APIError(.internalServerError, "read_failed") }
+            if n == 0 { break }
+            try await writer.write(ByteBuffer(bytes: buffer[0..<n]))
+        }
+        try await writer.finish(nil)
+    }
+    let type = file.document.kind == "markdown" ? "text/markdown; charset=utf-8" : "application/octet-stream"
+    return Response(status: .ok, headers: [.contentType: type, .cacheControl: "no-store", .eTag: "\"\(file.document.revisionID.hex)\"",
+                                           .init("X-Content-Type-Options")!: "nosniff"], body: body)
+}
+
+/// Writes a request body to a private file under `<state>/uploads`.
+func stage(_ body: RequestBody, in stateDirectory: String) async throws -> URL {
+    let directory = URL(fileURLWithPath: stateDirectory).appendingPathComponent("uploads")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    let url = directory.appendingPathComponent(UUID().uuidString)
+    let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    guard fd >= 0 else { throw APIError(.internalServerError, "staging_failed") }
+    defer { close(fd) }
+    do {
+        var total = 0
+        for try await buffer in body {
+            total += buffer.readableBytes
+            guard total <= AndesiteHTTPServer.maximumUpload else { throw VaultError.tooLarge }
+            try buffer.withUnsafeReadableBytes { raw in
+                var written = 0
+                while written < raw.count {
+                    let n = write(fd, raw.baseAddress!.advanced(by: written), raw.count - written)
+                    if n < 0 && errno == EINTR { continue }
+                    guard n > 0 else { throw APIError(.init(code: 507), "staging_failed") }
+                    written += n
+                }
+            }
+        }
+    } catch {
+        try? FileManager.default.removeItem(at: url)
+        throw error
+    }
+    return url
 }
 
 func failure(_ error: Error) -> Reply {

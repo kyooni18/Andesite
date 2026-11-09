@@ -15,14 +15,22 @@ func pull(_ to: VaultRuntime, from: VaultRuntime, page: Int = 3) throws -> SyncR
     var cursor = try to.syncCursor(peer)
     while true {
         let batch = try from.syncFeed(after: cursor, limit: page)
-        for hash in try to.missingObjects(batch.records.compactMap(\.hash)) {
-            try to.storeObject(from.object(hash), hash: hash)
-        }
+        for record in batch.records { if let hash = record.hash { try transfer(hash, size: record.size!, from: from, to: to) } }
         try to.receive(batch)
         cursor = batch.through
         if cursor >= batch.head { break }
     }
     return try to.resolvePending()
+}
+
+/// Copies an object in small chunks, resuming any partial transfer.
+func transfer(_ hash: String, size: Int64, from: VaultRuntime, to: VaultRuntime, chunk: Int = 5) throws {
+    guard let missing = try to.missingObjects([hash]).first else { return }
+    var offset = missing.received
+    repeat {
+        let data = try from.objectChunk(hash, offset: offset, length: Int(min(Int64(chunk), size - offset)))
+        offset = try to.receiveChunk(hash, size: size, offset: offset, data)
+    } while offset < size
 }
 
 func sync(_ a: VaultRuntime, _ b: VaultRuntime) throws {
@@ -159,7 +167,7 @@ final class Pair {
     let all = try p.a.syncFeed(after: 0)
     let first = SyncBatch(vault: all.vault, epoch: all.epoch, records: [all.records[0]], through: all.records[0].sequence, head: all.head)
     let second = SyncBatch(vault: all.vault, epoch: all.epoch, records: [all.records[1]], through: all.head, head: all.head)
-    for hash in all.records.compactMap(\.hash) { try p.b.storeObject(p.a.object(hash), hash: hash) }
+    for record in all.records { try transfer(record.hash!, size: record.size!, from: p.a, to: p.b) }
 
     // Out of order: the child before its parent is refused atomically.
     #expect(throws: SyncError.historyGap(all.records[1].revision)) { try p.b.receive(second) }
@@ -173,7 +181,7 @@ final class Pair {
     try p.b.resolvePending()
     #expect(p.text(p.fb, "note.md") == "v2\n")
     // Content that does not match its hash, or is absent, is rejected.
-    #expect(throws: SyncError.self) { try p.b.storeObject(Data("forged".utf8), hash: String(repeating: "a", count: 64)) }
+    #expect(throws: SyncError.self) { try p.b.receiveChunk(String(repeating: "a", count: 64), size: 6, offset: 0, Data("forged".utf8)) }
     var forged = all
     forged.records[0].revision = String(repeating: "c", count: 32)
     forged.records[0].hash = String(repeating: "b", count: 64)

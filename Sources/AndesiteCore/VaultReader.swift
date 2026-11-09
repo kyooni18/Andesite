@@ -69,14 +69,10 @@ public struct FileFingerprint: Equatable, Sendable, Codable {
     }
 }
 
-public struct ScannedMarkdownFile: Sendable {
+public struct ScannedFile: Sendable {
     public let path: VaultPath
     public let fingerprint: FileFingerprint
-}
-
-public struct ObservedFile: Sendable {
-    public let fingerprint: FileFingerprint
-    public let bytes: Data
+    public var kind: String { path.components.last!.lowercased().hasSuffix(".md") ? "markdown" : "attachment" }
 }
 
 /// Synchronous descriptor-relative observation. Run on a bounded blocking
@@ -108,17 +104,15 @@ public final class VaultReader {
               UInt64(info.st_dev) == rootDevice, UInt64(info.st_ino) == rootInode else { throw VaultReadError.unstable }
     }
 
-    /// A failed enumeration never returns a partial listing.
-    public func markdownPaths() throws -> [VaultPath] {
-        try markdownFiles().map(\.path)
-    }
-
+    /// Every trackable file: Markdown notes and attachments. A failed
+    /// enumeration never returns a partial listing.
+    ///
     /// Hidden names (".obsidian", ".git", ".trash", ".andesite", journal
     /// artifacts, editor swap files) are skipped like Obsidian skips them:
     /// they are neither indexed nor followed.
-    public func markdownFiles() throws -> [ScannedMarkdownFile] {
+    public func files() throws -> [ScannedFile] {
         try verifyRoot()
-        var paths: [ScannedMarkdownFile] = []
+        var paths: [ScannedFile] = []
         var namespace = Set<String>()
         func visit(_ fd: Int32, _ prefix: String) throws {
             let copy = dup(fd)
@@ -150,7 +144,7 @@ public final class VaultReader {
                     guard fstat(child, &opened) == 0, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else { throw VaultReadError.unstable }
                     try visit(child, prefix + name + "/")
                 case mode_t(S_IFREG) where info.st_nlink == 1:
-                    if name.lowercased().hasSuffix(".md") { paths.append(ScannedMarkdownFile(path: path, fingerprint: FileFingerprint(info))) }
+                    paths.append(ScannedFile(path: path, fingerprint: FileFingerprint(info)))
                 default:
                     // Symlinks, hard-linked files and special files are never
                     // followed or indexed; Andesite cannot replace them safely.
@@ -189,77 +183,57 @@ public final class VaultReader {
         return true
     }
 
-    /// Requires two matching byte and metadata observations separated by the
-    /// caller-specified debounce. Even matching observations cannot rule out
-    /// unobserved writes or a writer paused between edits.
-    public func readStable(_ path: VaultPath, maximumBytes: Int, debounce: TimeInterval = 0.25) throws -> Data {
-        guard maximumBytes >= 0, debounce >= 0, debounce.isFinite else { throw VaultReadError.invalidPath }
-        return try observeStable(path, maximumBytes: maximumBytes, debounce: debounce).bytes
-    }
-
-    public func observeStable(_ path: VaultPath, maximumBytes: Int, debounce: TimeInterval = 0.25) throws -> ObservedFile {
-        guard maximumBytes >= 0, debounce >= 0, debounce.isFinite else { throw VaultReadError.invalidPath }
-        return try observeStable(path, maximumBytes: maximumBytes, betweenObservations: {
-            Thread.sleep(forTimeInterval: debounce)
-        })
-    }
-
-    // Internal seam for deterministic race tests. The caller must still run
-    // this synchronous function on a blocking executor.
-    func readStable(_ path: VaultPath, maximumBytes: Int, betweenObservations: () throws -> Void) throws -> Data {
-        try observeStable(path, maximumBytes: maximumBytes, betweenObservations: betweenObservations).bytes
-    }
-
-    private func observeStable(_ path: VaultPath, maximumBytes: Int, betweenObservations: () throws -> Void) throws -> ObservedFile {
-        let first = try observe(path, maximumBytes: maximumBytes)
-        try betweenObservations()
-        let second = try observe(path, maximumBytes: maximumBytes)
-        guard first.0 == second.0, first.1 == second.1 else { throw VaultReadError.unstable }
-        return ObservedFile(fingerprint: second.0, bytes: second.1)
-    }
-
-    private func observe(_ path: VaultPath, maximumBytes: Int) throws -> (FileFingerprint, Data) {
-        try verifyRoot()
-        var directory = dup(root)
-        guard directory >= 0 else { throw VaultReadError.systemCall("dup root", errno) }
+    /// Streams the file into `objects`, provided it is still exactly the
+    /// file that was scanned (`expected`) and does not change while read.
+    /// The caller waits a debounce between scanning and capturing, so a file
+    /// being written is seen as unstable rather than captured half-written.
+    func capture(_ path: VaultPath, expected: FileFingerprint, into objects: ObjectStore,
+                 maximumBytes: Int) throws -> (hash: String, size: Int64) {
+        let directory = try parent(path)
         defer { close(directory) }
-        for component in path.components.dropLast() {
-            let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            guard next >= 0 else { throw VaultReadError.systemCall("open directory", errno) }
-            var info = stat()
-            guard fstat(next, &info) == 0 else {
-                let error = errno; close(next); throw VaultReadError.systemCall("stat directory", error)
-            }
-            guard UInt64(info.st_dev) == rootDevice else { close(next); throw VaultReadError.unsafeFile }
-            close(directory); directory = next
-        }
         let name = path.components.last!
         let fd = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
-        guard fd >= 0 else { throw VaultReadError.systemCall("open file", errno) }
+        guard fd >= 0 else { throw VaultReadError.unstable }
         defer { close(fd) }
         var before = stat()
         guard fstat(fd, &before) == 0 else { throw VaultReadError.systemCall("stat file", errno) }
-        guard (before.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG), before.st_nlink == 1,
+        guard before.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), before.st_nlink == 1,
               UInt64(before.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
-        guard before.st_size >= 0, before.st_size <= maximumBytes else { throw VaultReadError.tooLarge }
-        var data = Data()
-        var buffer = [UInt8](repeating: 0, count: 65536)
-        while true {
-            let n = read(fd, &buffer, buffer.count)
-            if n < 0 {
-                if errno == EINTR { continue }
-                throw VaultReadError.systemCall("read file", errno)
-            }
-            if n == 0 { break }
-            guard n <= maximumBytes - data.count else { throw VaultReadError.tooLarge }
-            data.append(contentsOf: buffer[0..<n])
-        }
+        guard FileFingerprint(before) == expected else { throw VaultReadError.unstable }
+        guard before.st_size <= maximumBytes else { throw VaultReadError.tooLarge }
+        let stored: (hash: String, size: Int64)
+        do { stored = try objects.put(from: fd, maximumBytes: maximumBytes) } catch ObjectStoreError.tooLarge { throw VaultReadError.unstable }
         var after = stat(), atPath = stat()
-        guard fstat(fd, &after) == 0 else { throw VaultReadError.systemCall("restat file", errno) }
-        guard fstatat(directory, name, &atPath, AT_SYMLINK_NOFOLLOW) == 0 else { throw VaultReadError.unstable }
-        guard (atPath.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG), atPath.st_nlink == 1,
-              FileFingerprint(before) == FileFingerprint(after), FileFingerprint(after) == FileFingerprint(atPath),
-              data.count == after.st_size else { throw VaultReadError.unstable }
-        return (FileFingerprint(after), data)
+        guard fstat(fd, &after) == 0, fstatat(directory, name, &atPath, AT_SYMLINK_NOFOLLOW) == 0,
+              FileFingerprint(after) == expected, FileFingerprint(atPath) == expected,
+              stored.size == Int64(after.st_size) else { throw VaultReadError.unstable }
+        return stored
+    }
+
+    /// The current fingerprint of a regular file, without following links.
+    func fingerprint(_ path: VaultPath) throws -> FileFingerprint {
+        let directory = try parent(path)
+        defer { close(directory) }
+        var info = stat()
+        guard fstatat(directory, path.components.last!, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw VaultReadError.unstable }
+        guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), info.st_nlink == 1 else { throw VaultReadError.unsafeFile }
+        return FileFingerprint(info)
+    }
+
+    /// The containing directory, opened without following links.
+    private func parent(_ path: VaultPath) throws -> Int32 {
+        try verifyRoot()
+        var directory = dup(root)
+        guard directory >= 0 else { throw VaultReadError.systemCall("dup root", errno) }
+        for component in path.components.dropLast() {
+            let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard next >= 0 else { close(directory); throw VaultReadError.unstable }
+            var info = stat()
+            guard fstat(next, &info) == 0, UInt64(info.st_dev) == rootDevice else {
+                close(next); close(directory); throw VaultReadError.unsafeFile
+            }
+            close(directory); directory = next
+        }
+        return directory
     }
 }

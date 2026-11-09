@@ -45,6 +45,7 @@ public final class ObjectStore {
             guard fd >= 0 else { throw ObjectStoreError.systemCall("open object barrier", errno) }
             defer { close(fd) }
             try durabilityBarrier(fd)
+            touch(hash)
             return hash
         }
         guard errno == ENOENT else { throw ObjectStoreError.systemCall("check object", errno) }
@@ -147,6 +148,7 @@ public final class ObjectStore {
             guard fstatat(root, hash, &existing, AT_SYMLINK_NOFOLLOW) == 0, Int64(existing.st_size) == size else {
                 throw ObjectStoreError.corruptObject
             }
+            touch(hash)
         }
         guard fsync(root) == 0 else { throw ObjectStoreError.systemCall("sync object directory", errno) }
         return (hash, size)
@@ -218,5 +220,111 @@ public final class ObjectStore {
         guard Self.hash(bytes) == hash else { throw ObjectStoreError.corruptObject }
         return bytes
     }
-}
 
+    /// Marks an object as recently stored, so garbage collection's grace
+    /// period covers content that is about to be referenced again.
+    private func touch(_ name: String) { _ = utimensat(root, name, nil, AT_SYMLINK_NOFOLLOW) }
+
+    // MARK: Resumable transfer
+
+    private static func partial(_ hash: String) -> String { ".object-partial-" + hash }
+
+    /// Bytes received so far of an incomplete transfer of `hash`.
+    func received(_ hash: String) -> Int64 {
+        var info = stat()
+        guard Self.validHash(hash), fstatat(root, Self.partial(hash), &info, AT_SYMLINK_NOFOLLOW) == 0 else { return 0 }
+        return Int64(info.st_size)
+    }
+
+    /// Writes one chunk of the `size`-byte object `hash` at `offset` and
+    /// returns the bytes received so far. A chunk that does not continue the
+    /// transfer exactly is ignored; the sender resumes from the returned
+    /// offset. The complete object is published only if it hashes to `hash`.
+    func receive(_ hash: String, size: Int64, offset: Int64, _ data: Data) throws -> Int64 {
+        guard Self.validHash(hash), size >= 0 else { throw ObjectStoreError.invalidHash }
+        if self.size(hash) == size { return size }
+        let name = Self.partial(hash)
+        let fd = openat(root, name, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        guard fd >= 0 else { throw ObjectStoreError.systemCall("open partial object", errno) }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { throw ObjectStoreError.corruptObject }
+        var current = Int64(info.st_size)
+        if current > size { guard ftruncate(fd, 0) == 0 else { throw ObjectStoreError.systemCall("reset partial object", errno) }; current = 0 }
+        guard offset == current, offset + Int64(data.count) <= size else { return current }
+        try data.withUnsafeBytes { raw in
+            var written = 0
+            while written < raw.count {
+                let n = pwrite(fd, raw.baseAddress!.advanced(by: written), raw.count - written, off_t(offset) + off_t(written))
+                if n < 0 && errno == EINTR { continue }
+                guard n > 0 else { throw ObjectStoreError.systemCall("write partial object", errno) }
+                written += n
+            }
+        }
+        let received = offset + Int64(data.count)
+        guard received == size else { return received }
+        guard lseek(fd, 0, SEEK_SET) == 0 else { throw ObjectStoreError.systemCall("rewind partial object", errno) }
+        let stored = try put(from: fd, maximumBytes: Int(size))
+        _ = unlinkat(root, name, 0)
+        // A mismatch leaves only an unreferenced object for garbage collection.
+        guard stored.hash == hash else { throw ObjectStoreError.corruptObject }
+        return size
+    }
+
+    /// Up to `length` bytes of a stored object, starting at `offset`.
+    func chunk(_ hash: String, offset: Int64, length: Int) throws -> Data {
+        guard Self.validHash(hash), offset >= 0, length >= 0 else { throw ObjectStoreError.invalidHash }
+        let fd = openat(root, hash, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw ObjectStoreError.systemCall("open object", errno) }
+        defer { close(fd) }
+        var bytes = Data(count: length), total = 0
+        try bytes.withUnsafeMutableBytes { raw in
+            while total < length {
+                let n = pread(fd, raw.baseAddress!.advanced(by: total), length - total, off_t(offset) + off_t(total))
+                if n < 0 && errno == EINTR { continue }
+                guard n >= 0 else { throw ObjectStoreError.systemCall("read object", errno) }
+                if n == 0 { break }
+                total += n
+            }
+        }
+        return bytes.prefix(total)
+    }
+
+    /// Opens a stored object for streaming. Objects are immutable, so the
+    /// descriptor stays valid even if the object is later collected.
+    func descriptor(_ hash: String) throws -> Int32 {
+        guard Self.validHash(hash) else { throw ObjectStoreError.invalidHash }
+        let fd = openat(root, hash, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw ObjectStoreError.systemCall("open object", errno) }
+        return fd
+    }
+
+    // MARK: Garbage collection
+
+    /// Every name in the store with its size and last modification.
+    func listing() throws -> [(name: String, size: Int64, modified: TimeInterval)] {
+        let copy = dup(root)
+        guard copy >= 0, let stream = fdopendir(copy) else { throw ObjectStoreError.systemCall("list objects", errno) }
+        defer { closedir(stream) }
+        rewinddir(stream)
+        var result: [(String, Int64, TimeInterval)] = []
+        while let item = readdir(stream) {
+            let name = withUnsafePointer(to: &item.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) }
+            }
+            var info = stat()
+            guard name != ".", name != "..", fstatat(root, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
+            #if canImport(Darwin)
+            let modified = TimeInterval(info.st_mtimespec.tv_sec)
+            #else
+            let modified = TimeInterval(info.st_mtim.tv_sec)
+            #endif
+            result.append((name, Int64(info.st_size), modified))
+        }
+        return result
+    }
+
+    func remove(_ name: String) throws {
+        guard unlinkat(root, name, 0) == 0 || errno == ENOENT else { throw ObjectStoreError.systemCall("remove object", errno) }
+    }
+}

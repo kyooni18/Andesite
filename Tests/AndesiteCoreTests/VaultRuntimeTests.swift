@@ -163,7 +163,9 @@ struct RuntimeFixture {
     #expect(throws: SQLiteFailure.self) { try restarted.search("oldtoken") }
     try db.execute("DROP TRIGGER index_fault")
     let recovered = try restarted.reconcile()
-    #expect(recovered.revisionsCreated == 1 && recovered.unchanged == 2)
+    // The failed search above already captured b.md; only its index was
+    // missing, and the scan repairs indexes from stored content.
+    #expect(recovered.revisionsCreated == 0 && recovered.unchanged == 3, "\(recovered)")
     #expect(try restarted.search("newtoken").count == 1)
     #expect(try restarted.search("oldtoken").isEmpty)
     #expect(try restarted.search("newfiletoken").count == 1)

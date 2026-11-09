@@ -83,8 +83,9 @@ public enum SearchIndex {
         if withinTransaction { try publish() } else { try db.transaction(publish) }
     }
 
-    /// Upgrade old catalogs without trusting the mutable source filesystem.
-    /// Only absent/stale derived metadata for *current live heads* is rebuilt.
+    /// Indexes every live Markdown head whose index is missing or stale (an
+    /// interrupted index transaction, an upgraded catalog), from immutable
+    /// stored content, never the mutable source file.
     /// A successful scan calls this before reporting indexed readiness.
     @discardableResult
     public static func backfillMetadata(db: SQLiteConnection, objects: ObjectStore,
@@ -97,8 +98,11 @@ public enum SearchIndex {
             LEFT JOIN document_properties p
               ON p.vault_id=e.vault_id AND p.entry_id=e.id
               AND p.indexed_revision=e.head_revision
+            LEFT JOIN document_metadata m
+              ON m.vault_id=e.vault_id AND m.entry_id=e.id
+              AND m.indexed_revision=e.head_revision
             WHERE e.vault_id=? AND e.state='live' AND e.kind='markdown'
-              AND p.entry_id IS NULL
+              AND (p.entry_id IS NULL OR m.entry_id IS NULL)
             ORDER BY e.path
             """, bindings: [.blob(vaultID)])
         for row in rows {

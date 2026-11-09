@@ -17,8 +17,8 @@ struct NamespacePlan {
     let moved: Set<Int>
     let deleted: Set<Int>
 
-    init(db: SQLiteConnection, vaultID: Data, scan: [ScannedMarkdownFile]) throws {
-        let old = try db.queryValues("SELECT id,path,fs_hint FROM entries WHERE vault_id=? AND state='live' AND kind='markdown' ORDER BY id", bindings: [.blob(vaultID)]).map { row -> CatalogFile in
+    init(db: SQLiteConnection, vaultID: Data, scan: [ScannedFile]) throws {
+        let old = try db.queryValues("SELECT id,path,fs_hint FROM entries WHERE vault_id=? AND state='live' ORDER BY id", bindings: [.blob(vaultID)]).map { row -> CatalogFile in
             guard case .blob(let id) = row[0], case .text(let name) = row[1] else { throw VaultRuntimeError.inconsistentCatalog }
             let fingerprint: FileFingerprint?
             if case .blob(let hint) = row[2] { fingerprint = try JSONDecoder().decode(FileFingerprint.self, from: hint) }
@@ -54,12 +54,12 @@ struct NamespacePlan {
         self.deleted = Set(old.indices).subtracting(used)
     }
 
-    func needsNamespaceCommit(index: Int, file: ScannedMarkdownFile) -> Bool {
+    func needsNamespaceCommit(index: Int, file: ScannedFile) -> Bool {
         if let prior = assignment[index] { return moved.contains(prior) }
         return old.contains { $0.path.portabilityKey == file.path.portabilityKey }
     }
 
-    static func validateUnchanged(_ before: [ScannedMarkdownFile], _ after: [ScannedMarkdownFile]) throws {
+    static func validateUnchanged(_ before: [ScannedFile], _ after: [ScannedFile]) throws {
         guard before.count == after.count else { throw VaultReadError.unstable }
         for (a, b) in zip(before, after) {
             guard Array(a.path.components.joined(separator: "/").utf8) == Array(b.path.components.joined(separator: "/").utf8), a.fingerprint == b.fingerprint else { throw VaultReadError.unstable }

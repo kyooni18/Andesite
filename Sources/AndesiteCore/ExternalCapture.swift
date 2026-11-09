@@ -30,23 +30,26 @@ public enum ExternalCapture {
         var kind: String { name.lowercased().hasSuffix(".md") ? "markdown" : "attachment" }
     }
 
-    static func prepare(path: VaultPath, observation: ObservedFile, objects: ObjectStore) throws -> Prepared {
-        let hash = try objects.put(observation.bytes)
-        let hashBytes = Data(stride(from: 0, to: 64, by: 2).map { offset in
-            let start = hash.index(hash.startIndex, offsetBy: offset)
-            return UInt8(hash[start..<hash.index(start, offsetBy: 2)], radix: 16)!
-        })
-        return try Prepared(path: path, hash: hash, hashBytes: hashBytes, length: observation.bytes.count,
-                            hint: JSONEncoder().encode(observation.fingerprint),
-                            valid: !path.components.last!.lowercased().hasSuffix(".md") || String(data: observation.bytes, encoding: .utf8) != nil)
+    /// Describes a file already captured into `objects`. Markdown must be
+    /// UTF-8 (`maximumMarkdownBytes` bounds the validation read).
+    static func prepare(_ file: ScannedFile, hash: String, size: Int64, objects: ObjectStore,
+                        maximumMarkdownBytes: Int) throws -> Prepared {
+        var valid = true
+        if file.kind == "markdown" {
+            valid = String(data: try objects.get(hash, maximumBytes: maximumMarkdownBytes), encoding: .utf8) != nil
+        }
+        return try Prepared(path: file.path, hash: hash, hashBytes: Data(hex: hash)!, length: Int(size),
+                            hint: JSONEncoder().encode(file.fingerprint), valid: valid)
     }
 
     public static func capture(db: SQLiteConnection, reader: VaultReader, objects: ObjectStore,
                                vaultID: Data, path: VaultPath, maximumBytes: Int,
                                debounce: TimeInterval = 0.25) throws -> ExternalCaptureResult {
         guard vaultID.count == 16 else { throw ExternalCaptureError.unknownVault }
-        let observation = try reader.observeStable(path, maximumBytes: maximumBytes, debounce: debounce)
-        let prepared = try prepare(path: path, observation: observation, objects: objects)
+        let file = ScannedFile(path: path, fingerprint: try reader.fingerprint(path))
+        Thread.sleep(forTimeInterval: debounce)
+        let (hash, size) = try reader.capture(path, expected: file.fingerprint, into: objects, maximumBytes: maximumBytes)
+        let prepared = try prepare(file, hash: hash, size: size, objects: objects, maximumMarkdownBytes: maximumBytes)
         let result = try db.transaction { try publish(db: db, vaultID: vaultID, prepared: prepared, at: Date()) }
         guard let result else { throw ExternalCaptureError.invalidMarkdown }
         return result
