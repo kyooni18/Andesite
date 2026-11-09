@@ -107,3 +107,23 @@ import Testing
             Data("# Trashed\n".utf8))
     try runtime.shutdown()
 }
+
+@Test func filesListNotesAndAttachmentsWithFirstAndLastRecordedDates() throws {
+    let f = try RuntimeFixture(); defer { f.clean() }
+    try f.write("note.md", "# Note\n")
+    try f.write("data.json", "{}")
+    try f.write("gone.md", "bye")
+    let runtime = try VaultRuntime(configuration: f.configuration)
+    _ = try runtime.reconcile()
+    let created = try #require(try runtime.files().first { $0.path == "note.md" })
+    Thread.sleep(forTimeInterval: 1.1) // timestamps have one-second precision
+    try f.write("note.md", "# Note\nedited\n")
+    try FileManager.default.removeItem(at: f.vault.appendingPathComponent("gone.md"))
+    _ = try runtime.reconcile()
+    let files = try runtime.files()
+    #expect(files.map(\.path) == ["data.json", "note.md"])
+    #expect(files.map(\.kind) == ["attachment", "markdown"])
+    let note = try #require(files.last)
+    #expect(note.created == created.created && note.modified > note.created)
+    try runtime.shutdown()
+}
