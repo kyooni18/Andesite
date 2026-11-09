@@ -80,7 +80,7 @@ public final class Vault: @unchecked Sendable {
         return home + "/Library/Application Support/Andesite/States"
         #elseif canImport(Darwin)
         // iOS: the app's own container, never its user-visible Documents.
-        return NSHomeDirectory() + "/Library/Application Support/Andesite/States"
+        return appContainer + "/Library/Application Support/Andesite/States"
         #else
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return home + "/.local/share/Andesite/States"
@@ -416,7 +416,18 @@ func isAboveAppContainer(_ path: String) -> Bool {
     #if os(macOS) || !canImport(Darwin)
     return false
     #else
-    let home = NSHomeDirectory()
+    let home = appContainer
     return home == path || home.hasPrefix(path + "/")
     #endif
 }
+
+#if !os(macOS) && canImport(Darwin)
+/// The app's container without symlinks. On a device it is under /var, a
+/// symlink to /private/var, and paths through a symlink are refused.
+let appContainer: String = {
+    let home = NSHomeDirectory()
+    guard let resolved = realpath(home, nil) else { return home }
+    defer { free(resolved) }
+    return String(cString: resolved)
+}()
+#endif
