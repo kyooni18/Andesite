@@ -16,7 +16,8 @@ let package = Package(
         .package(url: "https://github.com/jpsim/Yams.git", exact: "6.2.2")
     ],
     targets: [
-        .systemLibrary(name: "CSQLite", pkgConfig: "sqlite3", providers: [.brew(["sqlite3"]), .apt(["libsqlite3-dev"])]),
+        // The SDK sqlite3 on Apple platforms (sandbox- and iOS-safe); libsqlite3-dev on Linux.
+        .systemLibrary(name: "CSQLite"),
         .target(name: "CAndesiteFS", linkerSettings: [.linkedFramework("CoreServices", .when(platforms: [.macOS]))]),
         .target(name: "AndesiteCore", dependencies: ["CSQLite", "CAndesiteFS", .product(name: "Markdown", package: "swift-markdown"), .product(name: "Crypto", package: "swift-crypto"), .product(name: "Yams", package: "Yams")]),
         // The authenticated HTTP API. Separate so embedded apps need not link a server.
