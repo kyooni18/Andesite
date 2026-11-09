@@ -12,6 +12,9 @@ public enum VaultRuntimeError: Error, Equatable {
     case inconsistentCatalog
     case portabilityCollision(String)
     case closed
+    /// The first scan has not finished (or the last one failed), so the
+    /// index does not yet reflect the vault.
+    case indexNotReady
 }
 
 public struct VaultConfiguration: Sendable {
@@ -62,6 +65,8 @@ public final class VaultRuntime {
     }
     private(set) var resources: Resources?
     private var objectsVerifiedAt: Date?
+    /// Set by `Vault` while background work runs; see `VaultExecutor`.
+    var cooperation = Cooperation()
     private var processLock: ProcessLock?
     let configuration: VaultConfiguration
     public let vaultID: Data
@@ -186,39 +191,39 @@ public final class VaultRuntime {
         return try VaultStatus(vaultID: vaultID, state: r.db.scalarText("SELECT state FROM vaults") ?? "unknown", entries: count("entries"), revisions: count("revisions"), openIncidents: count("incidents", "WHERE status='open'"), unfinishedMutations: count("mutations"))
     }
 
-    /// Search refreshes canonical files first; failed/partial scans never expose
-    /// the previous index as current. A result is an observation, not a live FS snapshot.
-    public func search(_ phrase: String, limit: Int = 50) throws -> [SearchIndexHit] {
-        _ = try reconcile()
-        guard let r = resources else { throw VaultRuntimeError.closed }
-        return try SearchIndex.search(db: r.db, vaultID: vaultID, phrase: phrase, limit: limit)
+    /// Runs `body` with catalog writes rejected (SQLite `query_only`).
+    func readingOnly<T>(_ body: () throws -> T) rethrows -> T {
+        guard let r = resources else { return try body() }
+        try? r.db.execute("PRAGMA query_only=1")
+        defer { try? r.db.execute("PRAGMA query_only=0") }
+        return try body()
     }
 
-    /// Catalog-only query for the in-process read-only local API. Unlike the
-    /// interactive CLI search, never starts a nested scan or opens another
-    /// SQLite owner while the watcher holds its exclusive state lock.
-    public func searchIndexed(_ phrase: String, limit: Int = 50,
-                              filter: ObsidianFilter? = nil) throws -> [SearchIndexHit] {
-        guard let r = resources else { throw VaultRuntimeError.closed }
-        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-                return try SearchIndex.search(db: r.db, vaultID: vaultID,
-                                      phrase: phrase, limit: limit, filter: filter)
+    func requireReady() throws -> Resources {
+        let r = try requireOpen()
+        guard try status().state == "ready" else { throw VaultRuntimeError.indexNotReady }
+        return r
+    }
+
+    /// Full-text search of the index as of the last scan.
+    public func search(_ phrase: String, limit: Int = 50,
+                       filter: ObsidianFilter? = nil) throws -> [SearchIndexHit] {
+        let r = try requireReady()
+        return try SearchIndex.search(db: r.db, vaultID: vaultID, phrase: phrase, limit: limit, filter: filter)
     }
 
     /// Current live Markdown heads, read from the same owner SQLite connection
     /// and never from source notes. No nested reconciliation takes place.
     public func documents(limit: Int = 50, offset: Int = 0,
                           filter: ObsidianFilter? = nil) throws -> DocumentPage {
-        guard let r = resources else { throw VaultRuntimeError.closed }
-        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-                return try DocumentCatalog.list(db: r.db, vaultID: vaultID,
+        let r = try requireReady()
+        return try DocumentCatalog.list(db: r.db, vaultID: vaultID,
                                         limit: limit, offset: offset, filter: filter)
     }
 
     public func inspectDocument(_ id: Data) throws -> IndexedDocument {
-        guard let r = resources else { throw VaultRuntimeError.closed }
-        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-                return try DocumentCatalog.inspect(db: r.db, vaultID: vaultID, documentID: id)
+        let r = try requireReady()
+        return try DocumentCatalog.inspect(db: r.db, vaultID: vaultID, documentID: id)
     }
 
     public func documentContents(_ id: Data, maximumBytes: Int = 1024 * 1024) throws -> Data {
@@ -229,32 +234,61 @@ public final class VaultRuntime {
 
     /// The immutable, revision-aligned YAML/tags projection. No source reads,
     /// parser invocation or reconciliation happens on the HTTP request path.
-    public func documentMetadata(_ id: Data) throws -> [String: Any] {
+    public func documentMetadata(_ id: Data) throws -> NoteMetadata {
         guard let r = resources else { throw VaultRuntimeError.closed }
         let note = try inspectDocument(id)
         return try ObsidianMetadataIndex.document(db: r.db, vaultID: vaultID,
                                                    id: id, revision: note.revisionID)
     }
 
-    public func tags(limit: Int = 50, offset: Int = 0) throws -> [String: Any] {
-        guard let r = resources else { throw VaultRuntimeError.closed }
-        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-                return try ObsidianMetadataIndex.tags(db: r.db, vaultID: vaultID,
+    public func tags(limit: Int = 50, offset: Int = 0) throws -> TagPage {
+        let r = try requireReady()
+        return try ObsidianMetadataIndex.tags(db: r.db, vaultID: vaultID,
                                                limit: limit, offset: offset)
     }
 
-    public func properties(limit: Int = 50, offset: Int = 0) throws -> [String: Any] {
-        guard let r = resources else { throw VaultRuntimeError.closed }
-        guard try status().state == "ready" else { throw VaultRuntimeError.inconsistentCatalog }
-                return try ObsidianMetadataIndex.properties(db: r.db, vaultID: vaultID,
+    public func properties(limit: Int = 50, offset: Int = 0) throws -> PropertyPage {
+        let r = try requireReady()
+        return try ObsidianMetadataIndex.properties(db: r.db, vaultID: vaultID,
                                                      limit: limit, offset: offset)
     }
 
+    /// Captures outside changes: new, edited, moved and deleted files.
+    /// Repeats `scan` until a pass completes. After three incomplete
+    /// passes, writes wait; if that pass is incomplete too, files kept
+    /// changing during it and `VaultReadError.unstable` is thrown.
     public func reconcile(at date: Date = Date()) throws -> ReconciliationReport {
+        var earlier = ReconciliationReport()
+        for attempt in 0... {
+            let (report, complete) = try scan(at: date, writesMayEnter: attempt < 3)
+            if !complete && attempt >= 3 { throw VaultReadError.unstable }
+            guard complete else {
+                earlier.revisionsCreated += report.revisionsCreated
+                earlier.snapshotsCreated += report.snapshotsCreated
+                earlier.invalidMarkdown += report.invalidMarkdown
+                continue
+            }
+            var total = report
+            total.revisionsCreated += earlier.revisionsCreated
+            total.snapshotsCreated += earlier.snapshotsCreated
+            total.invalidMarkdown += earlier.invalidMarkdown
+            return total
+        }
+        fatalError("unreachable")
+    }
+
+    /// One scan pass. Run by `Vault` as background work, it lets waiting
+    /// user requests in: reads at any safe point, and, if `writesMayEnter`,
+    /// writes between its batches.
+    ///
+    /// When a write entered, or a file changed while the pass ran, what the
+    /// pass saw may be out of date: it commits the captures it could make,
+    /// leaves moves and deletions to the next pass, and returns
+    /// `complete: false`. The index stays usable meanwhile.
+    func scan(at date: Date = Date(), writesMayEnter: Bool) throws -> (report: ReconciliationReport, complete: Bool) {
         guard let r = resources else { throw VaultRuntimeError.closed }
         try journal().recover()
         try RecoverySnapshots.validateTime(date)
-        try setState("scanning")
         do {
             // The full catalog/object cross-check is O(vault): on the first
             // scan, then at most every five minutes. Content is verified by
@@ -263,7 +297,11 @@ public final class VaultRuntime {
                 try verifyObjects()
                 objectsVerifiedAt = Date()
             }
-            let all = try r.reader.files()
+            // Only reads may enter while the folder is enumerated: a write
+            // could make the listing inconsistent.
+            let all = try r.reader.files(visiting: { _ = cooperation.yield(false) })
+            var interrupted = false // a user write ran, or a file changed
+            func letUsersIn() { if cooperation.yield(writesMayEnter) { interrupted = true } }
             // Files over their size limit are left alone: untracked, and not
             // mistaken for the deletion of what was tracked at that path.
             let oversize = Set(all.filter { $0.fingerprint.size > Int64(configuration.limit(for: $0.kind)) }.map(\.path.portabilityKey))
@@ -277,15 +315,17 @@ public final class VaultRuntime {
             var quarantinedMove = false
             /// Indexes captured notes in one transaction. Their revisions are
             /// already committed; a failed index is repaired by a later scan.
-            func index(_ captured: [(ExternalCaptureResult, String)]) throws {
+            typealias Captured = (result: ExternalCaptureResult, kind: String, analysis: SearchIndex.Analysis?)
+            func index(_ captured: [Captured]) throws {
                 try r.db.transaction {
-                    for (result, kind) in captured where kind == "markdown" {
-                        let bytes = try r.objects.get(result.contentHash, maximumBytes: configuration.maximumBytes)
+                    for (result, kind, analysis) in captured where kind == "markdown" {
+                        let analysis = try analysis ?? SearchIndex.analyze(
+                            r.objects.get(result.contentHash, maximumBytes: configuration.maximumBytes))
                         try SearchIndex.index(db: r.db, vaultID: vaultID, entryID: result.entryID, revisionID: result.revisionID,
-                                              bytes: bytes, withinTransaction: true)
+                                              analysis: analysis, withinTransaction: true)
                     }
                 }
-                for (result, _) in captured {
+                for (result, _, _) in captured {
                     if result.sequence == nil { report.unchanged += 1 } else { report.revisionsCreated += 1 }
                 }
             }
@@ -297,21 +337,41 @@ public final class VaultRuntime {
             report.unchanged = scan.count - changed.count
             // One quiet period for the whole batch, counted from the latest
             // change (watcher scans start after one, so they rarely wait). A
-            // file still being written changes its fingerprint, fails this
-            // scan and is retried later.
+            // file still being written changes its fingerprint; it is left
+            // to the next pass.
             let latest = changed.map { scan[$0].fingerprint.changedAt }.max() ?? 0
             let wait = min(configuration.debounce, latest + configuration.debounce - Date().timeIntervalSince1970)
-            if wait > 0 { Thread.sleep(forTimeInterval: wait) }
+            if wait > 0, cooperation.pause(wait, writesMayEnter) { interrupted = true }
             // Captures are committed in batches: one transaction (and one
-            // device flush) for many files instead of several per file.
-            for batch in stride(from: 0, to: changed.count, by: 256).map({ Array(changed[$0..<min($0 + 256, changed.count)]) }) {
-                var ready: [ExternalCapture.Prepared] = []
-                for indexInScan in batch {
+            // device flush) for many files instead of several per file. A
+            // batch ends early when a user write is waiting, which then runs
+            // between batches.
+            var position = 0
+            while position < changed.count {
+                // Notes are parsed here, before the commit, so a write that
+                // waits for the batch waits only for its SQL.
+                var ready: [(ExternalCapture.Prepared, SearchIndex.Analysis?)] = []
+                let start = position
+                while position < changed.count, position - start < 256,
+                      position == start || !(writesMayEnter && cooperation.writeWaiting()) {
+                    // Reads may enter mid-batch: nothing is published yet.
+                    _ = cooperation.yield(false)
+                    let indexInScan = changed[position]
+                    position += 1
                     let file = scan[indexInScan]
-                    let (hash, size) = try r.reader.capture(file.path, expected: file.fingerprint, into: r.objects,
-                                                            maximumBytes: configuration.limit(for: file.kind))
-                    let prepared = try ExternalCapture.prepare(file, hash: hash, size: size, objects: r.objects,
+                    let prepared: ExternalCapture.Prepared, analysis: SearchIndex.Analysis?
+                    do {
+                        let (hash, size) = try r.reader.capture(file.path, expected: file.fingerprint, into: r.objects,
+                                                                maximumBytes: configuration.limit(for: file.kind))
+                        prepared = try ExternalCapture.prepare(file, hash: hash, size: size, objects: r.objects,
                                                                maximumMarkdownBytes: configuration.maximumBytes)
+                        analysis = prepared.kind == "markdown" && prepared.valid
+                            ? try SearchIndex.analyze(r.objects.get(hash, maximumBytes: configuration.maximumBytes)) : nil
+                    } catch let error where interrupted || error as? VaultReadError == .unstable {
+                        // Being written, or changed by a user write: the next pass looks again.
+                        interrupted = true
+                        continue
+                    }
                     if plan.needsNamespaceCommit(index: indexInScan, file: file) {
                         if !prepared.valid {
                             let id = plan.assignment[indexInScan].map { plan.old[$0].id }
@@ -320,32 +380,38 @@ public final class VaultRuntime {
                             quarantinedMove = true
                         } else { deferred.append((indexInScan, prepared)) }
                     } else {
-                        ready.append(prepared)
+                        ready.append((prepared, analysis))
                     }
                 }
-                let captured: [(ExternalCaptureResult, String)] = try r.db.transaction {
-                    var captured: [(ExternalCaptureResult, String)] = []
-                    for prepared in ready {
+                let captured: [Captured]
+                do { captured = try r.db.transaction {
+                    var captured: [Captured] = []
+                    for (prepared, analysis) in ready {
                         guard let result = try ExternalCapture.publish(db: r.db, vaultID: vaultID, prepared: prepared, at: date) else {
                             report.invalidMarkdown += 1
                             continue
                         }
                         if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: result.entryID, at: date) { report.snapshotsCreated += 1 }
-                        captured.append((result, prepared.kind))
+                        captured.append((result, prepared.kind, analysis))
                     }
                     return captured
+                } } catch where interrupted {
+                    return (report, false)
                 }
                 try index(captured)
+                letUsersIn()
             }
+            if interrupted { return (report, false) }
             // Only a fully enumerated, unchanged namespace and a later secure
             // absence check may authorize tombstones. A failure above or here
             // leaves earlier captures intact but publishes no disappearances.
-            try NamespacePlan.validateUnchanged(all, r.reader.files())
+            let after = try r.reader.files(visiting: { _ = cooperation.yield(false) })
+            guard (try? NamespacePlan.validateUnchanged(all, after)) != nil else { return (report, false) }
             if quarantinedMove {
                 try setState("quarantined")
-                return report
+                return (report, true)
             }
-            let results: [(ExternalCaptureResult, String)] = try r.db.transaction {
+            let results: [Captured] = try r.db.transaction {
                 // Recheck after acquiring SQLite's writer lock, not before a
                 // potentially long lock wait. No metadata has changed yet.
                 for prior in deleted {
@@ -364,14 +430,14 @@ public final class VaultRuntime {
                 for prior in plan.moved.sorted() {
                     try r.db.executeValues("UPDATE entries SET state='reserved',path=NULL,path_key=NULL,name_key=NULL WHERE vault_id=? AND id=?", bindings: [.blob(vaultID), .blob(plan.old[prior].id)])
                 }
-                var results: [(ExternalCaptureResult, String)] = []
+                var results: [Captured] = []
                 for (indexInScan, prepared) in deferred {
                     let id = plan.assignment[indexInScan].map { plan.old[$0].id }
                     guard let captured = try ExternalCapture.publish(db: r.db, vaultID: vaultID, prepared: prepared, entryID: id, at: date) else { throw VaultRuntimeError.inconsistentCatalog }
                     let moved = id != nil
                     if moved { report.renamed += 1 }
                     if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: captured.entryID, at: date, reason: moved ? "rename" : "interval", force: moved) { report.snapshotsCreated += 1 }
-                    results.append((captured, prepared.kind))
+                    results.append((captured, prepared.kind, nil))
                 }
                 return results
             }
@@ -389,7 +455,7 @@ public final class VaultRuntime {
             // Unchanged files are not revisited, so promote snapshots that
             // became due since their revision was captured.
             report.snapshotsCreated += try scheduleDueSnapshots(at: date)
-            return report
+            return (report, true)
         } catch {
             try? setState("scanFailed")
             throw error
@@ -415,7 +481,8 @@ public final class VaultRuntime {
                 """).isEmpty else { throw VaultRuntimeError.inconsistentCatalog }
         // Every registered object must exist with its recorded size. Content
         // is verified by hash whenever it is read (exports, sync, restores).
-        for row in try r.db.queryValues("SELECT lower(hex(hash)),length,durable_location FROM objects") {
+        for (index, row) in try r.db.queryValues("SELECT lower(hex(hash)),length,durable_location FROM objects").enumerated() {
+            if index % 1024 == 1023 { _ = cooperation.yield(false) }
             guard case .text(let hash) = row[0], case .integer(let length) = row[1], row[2] == .text(hash),
                   r.objects.size(hash) == length else { throw VaultRuntimeError.inconsistentCatalog }
         }

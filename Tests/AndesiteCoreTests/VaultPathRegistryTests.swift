@@ -33,8 +33,8 @@ import Testing
     #expect(try reader.files().map { $0.path.components.joined(separator: "/") } == ["note.md"])
     let runtime = try VaultRuntime(configuration: f.configuration)
     #expect(try runtime.reconcile().discovered == 1)
-    #expect(try runtime.search("useruniquephrase").count == 1)
-    #expect(try runtime.search("internaluniquephrase").isEmpty)
+    #expect(try runtime.scanAndSearch("useruniquephrase").count == 1)
+    #expect(try runtime.scanAndSearch("internaluniquephrase").isEmpty)
     try runtime.shutdown()
 
     // Unregister only deletes the path marker, not .andesite's unrelated

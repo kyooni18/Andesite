@@ -124,11 +124,14 @@ public final class VaultReader {
     /// Hidden names (".obsidian", ".git", ".trash", ".andesite", journal
     /// artifacts, editor swap files) are skipped like Obsidian skips them:
     /// they are neither indexed nor followed.
-    public func files() throws -> [ScannedFile] {
+    /// Every regular file in the vault. `visiting` runs before each folder
+    /// is read (a scan uses it to give way to user requests).
+    public func files(visiting: () throws -> Void = {}) throws -> [ScannedFile] {
         try verifyRoot()
         var paths: [ScannedFile] = []
         var namespace = Set<String>()
         func visit(_ fd: Int32, _ prefix: String) throws {
+            try visiting()
             let copy = dup(fd)
             guard copy >= 0 else { throw VaultReadError.systemCall("dup scan", errno) }
             guard let stream = fdopendir(copy) else { close(copy); throw VaultReadError.systemCall("open scan", errno) }

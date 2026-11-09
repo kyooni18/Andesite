@@ -7,8 +7,8 @@ import Darwin
 import Glibc
 #endif
 
-/// The authenticated HTTP API. Each route is one backend call executed on
-/// the session's owner queue; Hummingbird's event loops only parse and wait.
+/// The authenticated HTTP API over one `Vault`. Hummingbird's event loops
+/// only parse and wait; the vault runs each call on its own thread.
 /// The server binds 127.0.0.1. Reach it from other machines through TLS
 /// termination or a tunnel; the sync client refuses plain HTTP off-host.
 public enum AndesiteHTTPServer {
@@ -21,22 +21,25 @@ public enum AndesiteHTTPServer {
 
     /// Serves until cancelled or sent SIGINT/SIGTERM. `onReady` receives the
     /// bound port (useful with port 0).
-    public static func run(session: VaultSession, token: String, port: Int,
+    public static func run(vault: Vault, token: String, port: Int,
                            onReady: @escaping @Sendable (Int) -> Void = { _ in }) async throws {
         guard isValidToken(token) else { throw APIError(.badRequest, "invalid_token") }
-        let app = Application(router: router(session: session, token: token),
+        let app = Application(router: router(vault: vault, token: token),
                               configuration: .init(address: .hostname("127.0.0.1", port: port), serverName: "Andesite"),
                               onServerRunning: { onReady($0.localAddress?.port ?? port) })
         try await app.runService()
     }
 
-    static func router(session: VaultSession, token: String) -> Router<BasicRequestContext> {
+    /// Routes map onto `Vault` methods, which set each call's priority:
+    /// document and index routes are user requests; sync routes, which
+    /// serve a peer's background sync, are background work.
+    static func router(vault: Vault, token: String) -> Router<BasicRequestContext> {
         let router = Router()
         router.middlewares.add(BearerAuthentication(token: Array(token.utf8)))
 
         router.get("/v1/status") { _, _ in
-            await respond(session) { vault in
-                let s = try vault.status()
+            await respond {
+                let s = try await vault.status()
                 return try json(["vault": s.vaultID.hex, "state": s.state, "entries": s.entries, "revisions": s.revisions,
                                  "openIncidents": s.openIncidents, "unfinishedMutations": s.unfinishedMutations])
             }
@@ -47,8 +50,9 @@ public enum AndesiteHTTPServer {
             let path = request.uri.queryParameters["path"].map(String.init)
             let opened: OpenedContent
             do {
-                opened = try await session.perform { vault in
-                    let (document, descriptor) = try vault.openContent(try required(path, "path"))
+                let path = try required(path, "path")
+                opened = try await vault.perform(.read) { runtime in
+                    let (document, descriptor) = try runtime.openContent(path)
                     return OpenedContent(document: document, descriptor: descriptor)
                 }
             } catch { return response(failure(error)) }
@@ -58,47 +62,47 @@ public enum AndesiteHTTPServer {
             let path = request.uri.queryParameters["path"].map(String.init)
             let create = request.headers[.init("If-None-Match")!] == "*"
             let match = revision(request.headers[.init("If-Match")!])
-            // Stage the body outside the owner queue; the backend then
+            // Stage the body off the vault's thread; the backend then
             // streams it into the object store.
             let staged: URL
-            do { staged = try await stage(request.body, in: session.stateDirectory) } catch { return response(failure(error)) }
+            do { staged = try await stage(request.body, in: vault.stateDirectory) } catch { return response(failure(error)) }
             defer { try? FileManager.default.removeItem(at: staged) }
-            return await respond(session) { vault in
+            return await respond {
                 let path = try required(path, "path")
-                if create { return try document(vault.create(path, contentsOf: staged), status: 201) }
+                if create { return try document(await vault.create(path, contentsOf: staged), status: 201) }
                 guard let match else { throw APIError(.preconditionRequired, "if_match_or_if_none_match_required") }
-                return try document(vault.update(path, contentsOf: staged, revision: match))
+                return try document(await vault.update(path, contentsOf: staged, revision: match))
             }
         }
         router.delete("/v1/file") { request, _ in
             let path = request.uri.queryParameters["path"].map(String.init)
             let match = revision(request.headers[.init("If-Match")!])
-            return await respond(session) { vault in
+            return await respond {
                 guard let match else { throw APIError(.preconditionRequired, "if_match_required") }
                 let path = try required(path, "path")
-                try vault.delete(path, revision: match)
+                try await vault.delete(path, revision: match)
                 return try json(["deleted": path])
             }
         }
         router.post("/v1/move") { request, _ in
             let fields = try await form(request)
-            return await respond(session) { vault in
-                try document(vault.move(required(fields["path"], "path"), to: required(fields["to"], "to"),
-                                        revision: required(fields["revision"].flatMap(Data.init(hex:)), "revision"),
-                                        updateLinks: fields["updateLinks"] != "false"))
+            return await respond {
+                try document(await vault.move(required(fields["path"], "path"), to: required(fields["to"], "to"),
+                                              revision: required(fields["revision"].flatMap(Data.init(hex:)), "revision"),
+                                              updateLinks: fields["updateLinks"] != "false"))
             }
         }
         router.post("/v1/restore") { request, _ in
             let fields = try await form(request)
-            return await respond(session) { vault in
-                try document(vault.restore(required(fields["path"], "path"),
-                                           revision: required(fields["revision"].flatMap(Data.init(hex:)), "revision")))
+            return await respond {
+                try document(await vault.restore(required(fields["path"], "path"),
+                                                 revision: required(fields["revision"].flatMap(Data.init(hex:)), "revision")))
             }
         }
         router.get("/v1/history") { request, _ in
             let path = request.uri.queryParameters["path"].map(String.init)
-            return await respond(session) { vault in
-                try json(["revisions": try vault.history(required(path, "path")).map { r -> [String: Any] in
+            return await respond {
+                try json(["revisions": try await vault.history(required(path, "path")).map { r -> [String: Any] in
                     ["revision": r.id.hex, "document": r.document.hex, "parents": r.parents.map(\.hex), "path": r.path,
                      "deleted": r.deleted, "hash": r.hash ?? NSNull(), "bytes": r.size ?? NSNull(),
                      "origin": r.origin, "created": r.created]
@@ -107,11 +111,11 @@ public enum AndesiteHTTPServer {
         }
         router.post("/v1/directories") { request, _ in
             let fields = try await form(request)
-            return await respond(session) { vault in
+            return await respond {
                 let path = try required(fields["path"], "path")
                 if let to = fields["to"] {
-                    try vault.moveDirectory(path, to: to, updateLinks: fields["updateLinks"] != "false")
-                } else { try vault.createDirectory(path) }
+                    try await vault.moveDirectory(path, to: to, updateLinks: fields["updateLinks"] != "false")
+                } else { try await vault.createDirectory(path) }
                 return try json(["path": fields["to"] ?? path])
             }
         }
@@ -121,49 +125,47 @@ public enum AndesiteHTTPServer {
             let q = request.uri.queryParameters
             let (limit, offset) = (int(q["limit"]) ?? 50, int(q["offset"]) ?? 0)
             let (tag, property, value) = (q["tag"].map(String.init), q["property"].map(String.init), q["value"].map(String.init))
-            return await respond(session) { vault in
+            return await respond {
                 let filter = tag == nil && property == nil && value == nil ? nil :
                     try ObsidianFilter(tag: tag, property: property, value: value)
-                let page = try vault.documents(limit: limit, offset: offset, filter: filter)
+                let page = try await vault.documents(limit: limit, offset: offset, filter: filter)
                 return try json(["documents": page.documents.map(documentJSON), "total": page.total,
-                                 "nextOffset": page.nextOffset ?? NSNull()])
+                                 "nextOffset": page.nextOffset.map { $0 as Any } ?? NSNull()])
             }
         }
         router.get("/v1/search") { request, _ in
             let q = request.uri.queryParameters
             let (text, limit) = (q["q"].map(String.init) ?? "", int(q["limit"]) ?? 50)
             let (tag, property, value) = (q["tag"].map(String.init), q["property"].map(String.init), q["value"].map(String.init))
-            return await respond(session) { vault in
+            return await respond {
                 let search = try ObsidianSearchQuery.parse(text, explicitTag: tag, explicitProperty: property, explicitValue: value)
                 let hits: [[String: Any]]
                 if let phrase = search.phrase {
-                    hits = try vault.searchIndexed(phrase, limit: limit, filter: search.filter).map {
+                    hits = try await vault.search(phrase, limit: limit, filter: search.filter).map {
                         ["document": $0.entryID.hex, "revision": $0.revisionID.hex, "title": $0.title, "path": $0.path]
                     }
                 } else {
-                    hits = try vault.documents(limit: min(limit, 100), filter: search.filter).documents.map(documentJSON)
+                    hits = try await vault.documents(limit: min(limit, 100), filter: search.filter).documents.map(documentJSON)
                 }
                 return try json(["hits": hits])
             }
         }
         router.get("/v1/tags") { request, _ in
             let (limit, offset) = (int(request.uri.queryParameters["limit"]) ?? 50, int(request.uri.queryParameters["offset"]) ?? 0)
-            return await respond(session) { try json($0.tags(limit: limit, offset: offset)) }
+            return await respond { try encoded(await vault.tags(limit: limit, offset: offset)) }
         }
         router.get("/v1/properties") { request, _ in
             let (limit, offset) = (int(request.uri.queryParameters["limit"]) ?? 50, int(request.uri.queryParameters["offset"]) ?? 0)
-            return await respond(session) { try json($0.properties(limit: limit, offset: offset)) }
+            return await respond { try encoded(await vault.properties(limit: limit, offset: offset)) }
         }
         router.get("/v1/metadata") { request, _ in
             let path = request.uri.queryParameters["path"].map(String.init)
-            return await respond(session) { vault in
-                try json(vault.documentMetadata(vault.document(required(path, "path")).id))
-            }
+            return await respond { try encoded(await vault.metadata(required(path, "path"))) }
         }
         router.get("/v1/mentions") { request, _ in
             let path = request.uri.queryParameters["path"].map(String.init)
-            return await respond(session) { vault in
-                try json(["mentions": try vault.unlinkedMentions(vault.document(required(path, "path")).id).map {
+            return await respond {
+                try json(["mentions": try await vault.unlinkedMentions(required(path, "path")).map {
                     ["source": $0.sourcePath, "term": $0.term]
                 }])
             }
@@ -171,42 +173,42 @@ public enum AndesiteHTTPServer {
         // Frontmatter edits: {"path","revision","name","value"} (a null value removes the property).
         router.post("/v1/properties") { request, _ in
             let body = try await Data(buffer: request.body.collect(upTo: 256 * 1024))
-            return await respond(session) { vault in
+            return await respond {
                 guard let edit = try? JSONDecoder().decode(PropertyEdit.self, from: body),
                       let revision = Data(hex: edit.revision) else { throw APIError(.badRequest, "invalid_json") }
-                return try document(vault.setProperty(edit.path, edit.name, to: edit.value, revision: revision))
+                return try document(await vault.setProperty(edit.path, edit.name, to: edit.value, revision: revision))
             }
         }
         // {"path","revision","add"} or {"path","revision","remove"}.
         router.post("/v1/tags") { request, _ in
             let fields = try await form(request)
-            return await respond(session) { vault in
+            return await respond {
                 let path = try required(fields["path"], "path")
                 let revision = try required(fields["revision"].flatMap(Data.init(hex:)), "revision")
-                if let tag = fields["add"] { return try document(vault.addTag(path, tag, revision: revision)) }
-                return try document(vault.removeTag(path, required(fields["remove"], "add_or_remove"), revision: revision))
+                if let tag = fields["add"] { return try document(await vault.addTag(path, tag, revision: revision)) }
+                return try document(await vault.removeTag(path, required(fields["remove"], "add_or_remove"), revision: revision))
             }
         }
         router.get("/v1/links") { request, _ in
             let q = request.uri.queryParameters
             let path = q["path"].map(String.init), incoming = q["direction"] == "incoming"
             let (limit, offset) = (int(q["limit"]) ?? 50, int(q["offset"]) ?? 0)
-            return await respond(session) { vault in
-                let page = try vault.links(vault.document(required(path, "path")).id,
-                                           direction: incoming ? .incoming : .outgoing, limit: limit, offset: offset)
+            return await respond {
+                let page = try await vault.links(required(path, "path"), direction: incoming ? .incoming : .outgoing,
+                                                 limit: limit, offset: offset)
                 return try json(["links": page.mentions.map { m -> [String: Any] in
                     ["source": m.sourcePath, "target": m.target, "fragment": m.fragment ?? NSNull(),
                      "display": m.display ?? NSNull(), "embed": m.embed, "status": m.status,
                      "path": m.documentPath ?? NSNull(), "fragmentStatus": m.fragmentStatus]
-                }, "total": page.total, "nextOffset": page.nextOffset ?? NSNull()])
+                }, "total": page.total, "nextOffset": page.nextOffset.map { $0 as Any } ?? NSNull()])
             }
         }
 
         // Recovery snapshots.
         router.get("/v1/snapshots") { request, _ in
             let path = request.uri.queryParameters["path"].map(String.init)
-            return await respond(session) { vault in
-                try json(["snapshots": try vault.snapshots(path: path).reversed().prefix(100).map { s -> [String: Any] in
+            return await respond {
+                try json(["snapshots": try await vault.snapshots(path: path).reversed().prefix(100).map { s -> [String: Any] in
                     ["snapshot": s.id.hex, "document": s.entryID.hex, "revision": s.revisionID.hex, "path": s.originalPath,
                      "hash": s.contentHash, "bytes": s.byteLength, "reason": s.reason,
                      "created": ISO8601DateFormatter().string(from: s.createdAt)]
@@ -215,42 +217,45 @@ public enum AndesiteHTTPServer {
         }
         router.get("/v1/snapshots/{id}/content") { _, context in
             let id = context.parameters.get("id").flatMap(Data.init(hex:))
-            return await respond(session) { vault in
-                Reply(body: try vault.snapshotContents(required(id, "id")), contentType: "text/markdown; charset=utf-8")
+            return await respond {
+                Reply(body: try await vault.snapshotContents(required(id, "id")), contentType: "text/markdown; charset=utf-8")
             }
         }
         // Sync: the feed, content objects and receiving a peer's feed.
         router.get("/v1/sync/identity") { _, _ in
-            await respond(session) { try encoded($0.syncIdentity()) }
+            await respond { try encoded(await vault.perform(.background) { try $0.syncIdentity() }) }
         }
         router.get("/v1/sync/changes") { request, _ in
             let q = request.uri.queryParameters
             let (after, limit) = (q["after"].flatMap { Int64($0) } ?? 0, int(q["limit"]) ?? VaultRuntime.syncPageLimit)
-            return await respond(session) { try encoded($0.syncFeed(after: after, limit: limit)) }
+            return await respond { try encoded(await vault.perform(.background) { try $0.syncFeed(after: after, limit: limit) }) }
         }
         router.post("/v1/sync/changes") { request, _ in
             let body = try await Data(buffer: request.body.collect(upTo: 8 * 1024 * 1024))
-            return await respond(session) { vault in
+            return await respond {
                 guard let batch = try? JSONDecoder().decode(SyncBatch.self, from: body) else { throw APIError(.badRequest, "invalid_json") }
-                let received = try vault.receive(batch)
-                var report = try vault.resolvePending()
-                report.received = received
-                return try encoded(report)
+                return try encoded(await vault.perform(.background) { runtime in
+                    let received = try runtime.receive(batch)
+                    var report = try runtime.resolvePending()
+                    report.received = received
+                    return report
+                })
             }
         }
         router.post("/v1/sync/objects/missing") { request, _ in
             let body = try await Data(buffer: request.body.collect(upTo: 1024 * 1024))
-            return await respond(session) { vault in
+            return await respond {
                 guard let hashes = try? JSONDecoder().decode([String].self, from: body) else { throw APIError(.badRequest, "invalid_json") }
-                return try encoded(vault.missingObjects(hashes))
+                return try encoded(await vault.perform(.background) { try $0.missingObjects(hashes) })
             }
         }
         router.get("/v1/sync/objects/{hash}") { request, context in
             let hash = context.parameters.get("hash") ?? ""
             let q = request.uri.queryParameters
             let (offset, length) = (q["offset"].flatMap { Int64($0) } ?? 0, int(q["length"]) ?? VaultRuntime.chunkLimit)
-            return await respond(session) {
-                Reply(body: try $0.objectChunk(hash, offset: offset, length: length), contentType: "application/octet-stream")
+            return await respond {
+                Reply(body: try await vault.perform(.background) { try $0.objectChunk(hash, offset: offset, length: length) },
+                      contentType: "application/octet-stream")
             }
         }
         router.put("/v1/sync/objects/{hash}") { request, context in
@@ -259,9 +264,10 @@ public enum AndesiteHTTPServer {
             let size = q["size"].flatMap { Int64($0) }, offset = q["offset"].flatMap { Int64($0) } ?? 0
             let digest = request.headers[.init("X-Chunk-SHA256")!]
             let body = try await Data(buffer: request.body.collect(upTo: VaultRuntime.chunkLimit))
-            return await respond(session) { vault in
+            return await respond {
                 guard digest == nil || digest == ObjectStore.hash(body) else { throw APIError(.badRequest, "chunk_hash_mismatch") }
-                let received = try vault.receiveChunk(hash, size: required(size, "size"), offset: offset, body)
+                let size = try required(size, "size")
+                let received = try await vault.perform(.background) { try $0.receiveChunk(hash, size: size, offset: offset, body) }
                 return try encoded(ObjectProgress(hash: hash, received: received))
             }
         }
@@ -284,9 +290,9 @@ struct Reply: Sendable {
     var etag: String?
 }
 
-/// Runs `work` on the owner queue and converts the result or error.
-func respond(_ session: VaultSession, _ work: @escaping @Sendable (AndesiteBackend) throws -> Reply) async -> Response {
-    do { return response(try await session.perform(work)) } catch { return response(failure(error)) }
+/// Runs a route's work and converts its result or error.
+func respond(_ work: () async throws -> Reply) async -> Response {
+    do { return response(try await work()) } catch { return response(failure(error)) }
 }
 
 func response(_ reply: Reply) -> Response {
@@ -372,7 +378,7 @@ func failure(_ error: Error) -> Reply {
          DocumentCatalogError.invalidPage, DocumentCatalogError.invalidIdentifier:
         return code(400, "invalid_query")
     case _ where VaultError.isStorageFull(error): return code(507, "storage_full")
-    case VaultRuntimeError.inconsistentCatalog, VaultSessionError.closed:
+    case VaultRuntimeError.indexNotReady, VaultRuntimeError.inconsistentCatalog, VaultRuntimeError.closed:
         return code(503, "index_not_ready")
     default: return code(500, "internal_error")
     }

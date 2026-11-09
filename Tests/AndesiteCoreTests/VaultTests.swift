@@ -8,11 +8,11 @@ import Testing
     let root = f.root.appendingPathComponent("managed-states").path
     let marker = try VaultPathRegistry(vaultDirectory: f.vault.path)
     #expect(try marker.register())
-    let planned = try VaultSession.plannedStateDirectory(
+    let planned = try Vault.plannedStateDirectory(
         vaultDirectory: f.vault.path, stateRoot: root)
     #expect(!FileManager.default.fileExists(atPath: planned))
 
-    let session = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
+    let session = try Vault(at: f.vault.path, options: .init(stateRoot: root, watch: false))
     #expect(session.stateDirectory == planned)
     #expect(FileManager.default.fileExists(atPath: planned + "/catalog.sqlite"))
     let first = try session.reconcile()
@@ -20,14 +20,14 @@ import Testing
     let id = try session.run { $0.vaultID }
     #expect(try session.run { try $0.search("firstunique").count } == 1)
     #expect(throws: ProcessLockError.unavailable) {
-        try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
+        try Vault(at: f.vault.path, options: .init(stateRoot: root, watch: false))
     }
 
     try session.close()
     try session.close()
-    #expect(throws: VaultSessionError.closed) { try session.reconcile() }
+    #expect(throws: VaultRuntimeError.closed) { try session.reconcile() }
 
-    let reopened = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
+    let reopened = try Vault(at: f.vault.path, options: .init(stateRoot: root, watch: false))
     #expect(try reopened.run { $0.vaultID } == id)
     #expect(try reopened.reconcile().revisionsCreated == 0)
     #expect(try reopened.run { try $0.status().revisions } == 1)
@@ -41,7 +41,7 @@ import Testing
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("note.md", "# History\nfirstrevision\n")
     let root = f.root.appendingPathComponent("automatic-state").path
-    let session = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
+    let session = try Vault(at: f.vault.path, options: .init(stateRoot: root, watch: false))
     let id = try session.run { $0.vaultID }
     let sourceState = session.stateDirectory
     #expect(try session.reconcile().revisionsCreated == 1)
@@ -50,11 +50,11 @@ import Testing
 
     let moved = f.root.appendingPathComponent("moved-vault")
     try FileManager.default.moveItem(at: f.vault, to: moved)
-    #expect(try VaultSession.plannedStateDirectory(vaultDirectory: moved.path, stateRoot: root) == sourceState)
+    #expect(try Vault.plannedStateDirectory(vaultDirectory: moved.path, stateRoot: root) == sourceState)
     let selected = try VaultPathRegistry(vaultDirectory: moved.path)
     #expect(try selected.storedPath() == f.vault.path)
 
-    let restored = try VaultSession(vaultDirectory: moved.path, stateRoot: root)
+    let restored = try Vault(at: moved.path, options: .init(stateRoot: root, watch: false))
     #expect(restored.stateDirectory == sourceState)
     #expect(try restored.run { $0.vaultID } == id)
     #expect(try restored.reconcile().revisionsCreated == 0)
@@ -65,7 +65,7 @@ import Testing
     #expect(try restored.run { try $0.status().revisions } == 2)
     try restored.close()
 
-    let again = try VaultSession(vaultDirectory: moved.path, stateRoot: root)
+    let again = try Vault(at: moved.path, options: .init(stateRoot: root, watch: false))
     #expect(try again.run { $0.vaultID } == id)
     #expect(try again.run { try $0.status().revisions } == 2)
     try again.close()
@@ -75,7 +75,7 @@ import Testing
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("note.md", "important-before-copy")
     let root = f.root.appendingPathComponent("managed").path
-    let original = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
+    let original = try Vault(at: f.vault.path, options: .init(stateRoot: root, watch: false))
     let originalState = original.stateDirectory
     _ = try original.reconcile()
     try original.close()
@@ -84,10 +84,10 @@ import Testing
     try FileManager.default.copyItem(at: f.vault, to: clone)
     let copied = try VaultPathRegistry(vaultDirectory: clone.path)
     #expect(try copied.storedPath() == f.vault.path)
-    let newState = try VaultSession.plannedStateDirectory(vaultDirectory: clone.path, stateRoot: root)
+    let newState = try Vault.plannedStateDirectory(vaultDirectory: clone.path, stateRoot: root)
     #expect(newState != originalState)
-    #expect(throws: VaultSessionError.stateHistoryRequiresMigration) {
-        try VaultSession(vaultDirectory: clone.path, stateRoot: root)
+    #expect(throws: VaultOpenError.stateHistoryRequiresMigration) {
+        try Vault(at: clone.path, options: .init(stateRoot: root, watch: false))
     }
     #expect(try copied.storedPath() == f.vault.path)
     #expect(!FileManager.default.fileExists(atPath: newState))
@@ -108,7 +108,7 @@ import Testing
 
     let moved = f.root.appendingPathComponent("renamed")
     try FileManager.default.moveItem(at: f.vault, to: moved)
-    let session = try VaultSession(vaultDirectory: moved.path, stateDirectory: f.state.path)
+    let session = try Vault(at: moved.path, options: .init(stateDirectory: f.state.path, watch: false))
     #expect(try session.run { $0.vaultID } == previousID)
     #expect(try session.reconcile().revisionsCreated == 0)
     #expect(try session.run { try $0.search("keepthese").count } == 1)
@@ -120,14 +120,61 @@ import Testing
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("note.md", "# Watched\nwatchuniquetoken\n")
     let root = f.root.appendingPathComponent("states").path
-    let session = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
+    let session = try Vault(at: f.vault.path, options: .init(stateRoot: root, watch: false))
     let reports = Reports()
     try session.startWatching(report: reports.add)
     #expect(eventually { reports.contains("watch-ready") })
     #expect(try session.run { try $0.status().revisions } == 1)
     try session.close()
-    #expect(throws: VaultSessionError.closed) { try session.run { _ in } }
-    let again = try VaultSession(vaultDirectory: f.vault.path, stateRoot: root)
+    #expect(throws: VaultRuntimeError.closed) { try session.run { _ in } }
+    let again = try Vault(at: f.vault.path, options: .init(stateRoot: root, watch: false))
     #expect(try again.run { try $0.status().revisions } == 1)
     try again.close()
+}
+
+private func writeNotes(_ f: RuntimeFixture, _ count: Int) throws {
+    for i in 0..<count { try f.write("n\(i).md", "# Note \(i)\nbody \(i) [[n\((i + 1) % count)]]\n") }
+}
+
+/// Polls until a scan has committed some but not all of `total` files,
+/// which proves these reads ran in the middle of it.
+private func waitUntilScanIsHalfway(_ vault: Vault, total: Int) async throws -> Bool {
+    for _ in 0..<2000 {
+        let entries = try await vault.status().entries
+        if entries > 0 && entries < total { return true }
+        if entries >= total { return false }
+        try await Task.sleep(nanoseconds: 2_000_000)
+    }
+    return false
+}
+
+@Test func readsAreServedInsideALongBackgroundScan() async throws {
+    let f = try RuntimeFixture(); defer { f.clean() }
+    try writeNotes(f, 1000)
+    let vault = try f.open()
+    let scan = Task { try await vault.refresh() }
+    #expect(try await waitUntilScanIsHalfway(vault, total: 1000))
+    // Catalog writes are refused inside a read.
+    await #expect(throws: SQLiteFailure.self) { try await vault.perform(.read) { try $0.create("x.md", Data()) } }
+    #expect(try await scan.value.revisionsCreated == 1000)
+    #expect(try await vault.search("body").count == 50)
+    try vault.close()
+}
+
+@Test func aUserWriteInterruptsTheWatcherScanWhichThenCompletes() async throws {
+    let f = try RuntimeFixture(); defer { f.clean() }
+    try writeNotes(f, 1000)
+    let reports = Reports()
+    let vault = try Vault(at: f.vault.path, options: .init(stateDirectory: f.state.path, report: reports.add))
+    #expect(try await waitUntilScanIsHalfway(vault, total: 1000))
+    let created = try await vault.create("new.md", "# New\n[[n1]]\n")
+    // Had the write waited for the scan, every note would be indexed by now.
+    #expect(try await vault.status().entries < 1001)
+    #expect(try eventually { reports.contains("watch-ready") }, "reports=\(reports.all)")
+    let status = try await vault.status()
+    #expect(status.state == "ready" && status.entries == 1001 && status.revisions == 1001)
+    #expect(try await vault.links("n1.md", direction: .incoming).mentions.map(\.sourcePath).sorted() == ["n0.md", "new.md"])
+    try await vault.update("new.md", "# New\n[[n2]]\n", revision: created.revisionID)
+    #expect(try await vault.read("new.md").content == Data("# New\n[[n2]]\n".utf8))
+    try vault.close()
 }

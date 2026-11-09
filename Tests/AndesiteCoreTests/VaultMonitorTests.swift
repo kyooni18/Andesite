@@ -34,7 +34,7 @@ final class Reports: @unchecked Sendable {
 @Test func watcherAutomaticallyObservesEditRenameCreationAndDeletion() throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("note.md", "# One\noldword\n")
-    let session = try VaultSession(vaultDirectory: f.vault.path, stateDirectory: f.state.path)
+    let session = try Vault(at: f.vault.path, options: .init(stateDirectory: f.state.path, watch: false))
     let reports = Reports()
     try session.startWatching(settings: fastMonitorSettings(), report: reports.add)
     func revisions() throws -> Int { try session.run { try $0.status().revisions } }
@@ -52,7 +52,7 @@ final class Reports: @unchecked Sendable {
         let moved = try #require(vault.snapshots(path: "renamed.md").first)
         #expect(first.entryID == moved.entryID)
         #expect(try vault.snapshots(path: "temporary.md").contains { $0.documentState == "deleted" })
-        #expect(try vault.searchIndexed("newword").count == 1)
+        #expect(try vault.search("newword").count == 1)
     }
     try session.close()
 }
@@ -60,7 +60,7 @@ final class Reports: @unchecked Sendable {
 @Test func watcherPromotesDueSnapshotsAndPeriodicallyRescans() throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("note.md", "# Initial\noldword\n")
-    let session = try VaultSession(vaultDirectory: f.vault.path, stateDirectory: f.state.path)
+    let session = try Vault(at: f.vault.path, options: .init(stateDirectory: f.state.path, watch: false))
     try session.run { try $0.configureSnapshots(SnapshotPolicy(minimumInterval: 1, retentionSeconds: 60)) }
     let reports = Reports()
     try session.startWatching(settings: fastMonitorSettings(fallback: 0.5), report: reports.add)
@@ -120,10 +120,11 @@ final class Reports: @unchecked Sendable {
     }
     #expect(kill(restarted.processIdentifier, SIGTERM) == 0)
     restarted.waitUntilExit()
-    #expect(restarted.terminationStatus == 0)
+    #expect(restarted.terminationStatus == 0,
+            "reason=\(restarted.terminationReason.rawValue) log=\((try? String(contentsOf: log, encoding: .utf8)) ?? "")")
     let runtime = try VaultRuntime(configuration: f.configuration)
     #expect(try runtime.status().revisions == 2)
     #expect(try runtime.snapshots(path: "note.md").count == 2)
-    #expect(try runtime.search("secondtoken").count == 1)
+    #expect(try runtime.scanAndSearch("secondtoken").count == 1)
     try runtime.shutdown()
 }

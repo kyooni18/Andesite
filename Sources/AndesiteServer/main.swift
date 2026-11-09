@@ -116,52 +116,55 @@ func main() async throws {
         return
     case "state":
         try expect(0...0)
-        print(try VaultSession.plannedStateDirectory(vaultDirectory: vaultPath))
+        print(try Vault.plannedStateDirectory(vaultDirectory: vaultPath))
         return
     default: break
     }
 
-    let session = try VaultSession(vaultDirectory: vaultPath, stateDirectory: options["state"])
+    let vault = try Vault(at: vaultPath, options: .init(stateDirectory: options["state"], watch: false))
     defer {
-        do { try session.close() } catch { FileHandle.standardError.write(Data("closing failed: \(error)\n".utf8)) }
+        do { try vault.close() } catch { FileHandle.standardError.write(Data("closing failed: \(error)\n".utf8)) }
     }
     switch command {
     case "watch":
         try expect(0...0)
         let waitForTermination = terminationSignals()
-        try session.startWatching(report: report)
+        try vault.startWatching(report: report)
         waitForTermination()
     case "serve":
         try expect(0...0)
         let secret = try token()
         guard let port = Int(options["port"] ?? "8788"), (0...65535).contains(port) else { throw UsageError() }
-        try session.startWatching(report: report)
-        try await AndesiteHTTPServer.run(session: session, token: secret, port: port) { bound in
+        try vault.startWatching(report: report)
+        try await AndesiteHTTPServer.run(vault: vault, token: secret, port: port) { bound in
             report("api-ready host=127.0.0.1 port=\(bound)")
         }
     case "sync":
         try expect(1...1)
         guard let url = URL(string: rest[0]) else { throw UsageError() }
-        let client = try SyncClient(destination: url, token: token())
-        let interval = options["every"].flatMap(Double.init)
-        repeat {
-            do {
-                let r = try await client.sync(session)
-                report("sync received=\(r.received) sent=\(r.sent) applied=\(r.applied) merged=\(r.merged) conflicts=\(r.conflicts) pending=\(r.pending)")
-                for failure in r.failures { report("sync-pending \(failure)") }
-            } catch where interval != nil {
-                // Offline or interrupted: progress so far is kept; retry later.
-                report("sync-failed error=\(error)")
+        @Sendable func describe(_ r: SyncReport) {
+            report("sync received=\(r.received) sent=\(r.sent) applied=\(r.applied) merged=\(r.merged) conflicts=\(r.conflicts) pending=\(r.pending)")
+            for failure in r.failures { report("sync-pending \(failure)") }
+        }
+        guard let interval = options["every"].flatMap(Double.init) else {
+            return describe(try await vault.sync(with: url, token: token()))
+        }
+        // Offline or interrupted: progress so far is kept; retried later.
+        let waitForTermination = terminationSignals()
+        try vault.startSyncing(with: url, token: token(), every: interval) { result in
+            switch result {
+            case .success(let r): describe(r)
+            case .failure(let error): report("sync-failed error=\(error)")
             }
-            if let interval { try await Task.sleep(nanoseconds: UInt64(max(interval, 1) * 1_000_000_000)) }
-        } while interval != nil
+        }
+        waitForTermination()
     default:
         let input = command == "write" ? (try FileHandle.standardInput.readToEnd() ?? Data()) : Data()
-        try session.run { vault in try runDocumentCommand(vault, command, rest, input: input) }
+        try vault.run { runtime in try runDocumentCommand(runtime, command, rest, input: input) }
     }
 }
 
-func runDocumentCommand(_ vault: AndesiteBackend, _ command: String, _ rest: [String], input: Data) throws {
+func runDocumentCommand(_ vault: VaultRuntime, _ command: String, _ rest: [String], input: Data) throws {
     func expect(_ count: ClosedRange<Int>) throws { guard count.contains(rest.count) else { throw UsageError() } }
     switch command {
     case "open":
@@ -175,7 +178,7 @@ func runDocumentCommand(_ vault: AndesiteBackend, _ command: String, _ rest: [St
     case "search":
         try expect(1...1)
         _ = try vault.reconcile()
-        for hit in try vault.searchIndexed(rest[0]) { print("\(hit.path)\t\(hit.title)") }
+        for hit in try vault.search(rest[0]) { print("\(hit.path)\t\(hit.title)") }
     case "read":
         try expect(1...1)
         FileHandle.standardOutput.write(try vault.read(rest[0]).content)

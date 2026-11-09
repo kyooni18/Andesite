@@ -253,6 +253,7 @@ extension VaultRuntime {
         try journal().recover()
         var waiting = Set<Data>(), failed: [Data: String] = [:], forced = false
         while true {
+            _ = cooperation.yield(false)
             guard let entry = try pendingEntries().first(where: { !waiting.contains($0) && failed[$0] == nil }) else {
                 // Only documents waiting on each other remain (for example
                 // two that swapped names): resolve them without waiting.

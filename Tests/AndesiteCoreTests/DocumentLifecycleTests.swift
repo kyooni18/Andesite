@@ -30,7 +30,7 @@ private extension RuntimeFixture {
     #expect(try f.text("노트/첫 노트.md") == "# First\nalpha\n")
     #expect(try vault.read("노트/첫 노트.md").content == Data("# First\nalpha\n".utf8))
     #expect(throws: VaultError.alreadyExists("노트/첫 노트.md")) { try vault.create("노트/첫 노트.md", Data()) }
-    #expect(try vault.searchIndexed("alpha").map(\.path) == ["노트/첫 노트.md"])
+    #expect(try vault.search("alpha").map(\.path) == ["노트/첫 노트.md"])
 
     let updated = try vault.update("노트/첫 노트.md", Data("# First\nbeta\n".utf8), revision: created.revisionID)
     #expect(updated.id == created.id && updated.revisionID != created.revisionID)
@@ -57,7 +57,7 @@ private extension RuntimeFixture {
     #expect(restored.id == created.id && restored.hash == created.hash)
     #expect(try f.text("노트/첫 노트.md") == "# First\nalpha\n")
     #expect(try vault.history("노트/첫 노트.md").last?.origin == "restore")
-    #expect(try vault.searchIndexed("alpha").count == 1 && vault.searchIndexed("beta").isEmpty)
+    #expect(try vault.search("alpha").count == 1 && vault.search("beta").isEmpty)
 
     // Restoring a live document to an older revision is an ordinary child.
     let edited = try vault.update("노트/첫 노트.md", Data("gamma".utf8), revision: restored.revisionID)

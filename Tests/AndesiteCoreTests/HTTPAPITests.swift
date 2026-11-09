@@ -8,17 +8,17 @@ import FoundationNetworking
 
 /// A real Hummingbird server on an ephemeral loopback port.
 final class TestServer: @unchecked Sendable {
-    let session: VaultSession
+    let session: Vault
     let token: String
     private(set) var port = 0
     private var task: Task<Void, Error>?
     private let lock = NSLock()
 
-    init(_ session: VaultSession, token: String = String(repeating: "5a", count: 32)) async throws {
+    init(_ session: Vault, token: String = String(repeating: "5a", count: 32)) async throws {
         self.session = session
         self.token = token
         task = Task { [session, token] in
-            try await AndesiteHTTPServer.run(session: session, token: token, port: 0) { bound in
+            try await AndesiteHTTPServer.run(vault: session, token: token, port: 0) { bound in
                 self.lock.withLock { self.port = bound }
             }
         }
@@ -56,7 +56,7 @@ final class TestServer: @unchecked Sendable {
 
 @Test func httpAPIServesDocumentLifecycleWithAuthenticationAndPreconditions() async throws {
     let f = try RuntimeFixture(); defer { f.clean() }
-    let session = try VaultSession(vaultDirectory: f.vault.path, stateDirectory: f.state.path)
+    let session = try Vault(at: f.vault.path, options: .init(stateDirectory: f.state.path, watch: false))
     try session.reconcile()
     let server = try await TestServer(session)
 
@@ -101,15 +101,15 @@ final class TestServer: @unchecked Sendable {
     try session.close()
 }
 
-private func converged(_ a: VaultSession, _ ra: URL, _ b: VaultSession, _ rb: URL) throws -> Bool {
+private func converged(_ a: Vault, _ ra: URL, _ b: Vault, _ rb: URL) throws -> Bool {
     let left = try a.run { try snapshot($0, ra) }, right = try b.run { try snapshot($0, rb) }
     return left == right && !left.isEmpty
 }
 
 @Test func twoVaultsSyncOverAuthenticatedHTTPAndResumeAfterOutage() async throws {
     let fa = try RuntimeFixture(), fb = try RuntimeFixture(); defer { fa.clean(); fb.clean() }
-    let a = try VaultSession(vaultDirectory: fa.vault.path, stateDirectory: fa.state.path)
-    let b = try VaultSession(vaultDirectory: fb.vault.path, stateDirectory: fb.state.path)
+    let a = try Vault(at: fa.vault.path, options: .init(stateDirectory: fa.state.path, watch: false))
+    let b = try Vault(at: fb.vault.path, options: .init(stateDirectory: fb.state.path, watch: false))
     try fa.write("from-a.md", "# A\nalpha\n")
     try fb.write("from-b.md", "# B\nbeta\n")
     try b.startWatching(settings: VaultMonitorSettings(latency: 0.05, debounce: 0.05, maximumCoalescing: 0.1, polling: 0.02))
@@ -151,7 +151,7 @@ private func converged(_ a: VaultSession, _ ra: URL, _ b: VaultSession, _ rb: UR
 @Test func syncKilledWhileApplyingResumesConsistently() async throws {
     let fa = try RuntimeFixture(), fb = try RuntimeFixture(); defer { fa.clean(); fb.clean() }
     try fa.write("note.md", "one\ntwo\n")
-    let b = try VaultSession(vaultDirectory: fb.vault.path, stateDirectory: fb.state.path)
+    let b = try Vault(at: fb.vault.path, options: .init(stateDirectory: fb.state.path, watch: false))
     let server = try await TestServer(b)
     let executable = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         .deletingLastPathComponent().appendingPathComponent(".build/debug/andesite-server")
@@ -176,7 +176,7 @@ private func converged(_ a: VaultSession, _ ra: URL, _ b: VaultSession, _ rb: UR
         try b.run { _ = try $0.update("note.md", Data("one\ntwo\nthree \(point)\n".utf8), revision: current) }
     }
     #expect(try syncA() == 0)
-    let a = try VaultSession(vaultDirectory: fa.vault.path, stateDirectory: fa.state.path)
+    let a = try Vault(at: fa.vault.path, options: .init(stateDirectory: fa.state.path, watch: false))
     #expect(try a.run { try $0.status().unfinishedMutations } == 0)
     #expect(try String(contentsOf: fa.vault.appendingPathComponent("note.md"), encoding: .utf8) == "one\ntwo\nthree committed\n")
     #expect(try converged(a, fa.vault, b, fb.vault))
@@ -188,8 +188,8 @@ private func converged(_ a: VaultSession, _ ra: URL, _ b: VaultSession, _ rb: UR
 
 @Test func largeAttachmentsStreamOverHTTPAndSyncInResumableChunks() async throws {
     let fa = try RuntimeFixture(), fb = try RuntimeFixture(); defer { fa.clean(); fb.clean() }
-    let a = try VaultSession(vaultDirectory: fa.vault.path, stateDirectory: fa.state.path)
-    let b = try VaultSession(vaultDirectory: fb.vault.path, stateDirectory: fb.state.path)
+    let a = try Vault(at: fa.vault.path, options: .init(stateDirectory: fa.state.path, watch: false))
+    let b = try Vault(at: fb.vault.path, options: .init(stateDirectory: fb.state.path, watch: false))
     let server = try await TestServer(b)
     // Larger than the Markdown limit and spanning several sync chunks.
     let large = Data((0..<(VaultRuntime.chunkLimit * 2 + 12345)).map { UInt8(truncatingIfNeeded: $0 &* 7) })

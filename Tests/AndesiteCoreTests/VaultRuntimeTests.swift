@@ -21,6 +21,24 @@ struct RuntimeFixture {
     }
     func clean() { try? FileManager.default.removeItem(at: root) }
     func write(_ name: String, _ text: String) throws { try Data(text.utf8).write(to: vault.appendingPathComponent(name)) }
+    /// A `Vault` on this fixture's state, without the watcher unless asked.
+    func open(watch: Bool = false) throws -> Vault {
+        try Vault(at: vault.path, options: .init(stateDirectory: state.path, watch: watch))
+    }
+}
+
+extension Vault {
+    /// A blocking scan, for tests.
+    @discardableResult
+    func reconcile() throws -> ReconciliationReport { try run(.background) { try $0.reconcile() } }
+}
+
+extension VaultRuntime {
+    /// Scans, then searches the index whatever its state.
+    func scanAndSearch(_ phrase: String) throws -> [SearchIndexHit] {
+        _ = try reconcile()
+        return try SearchIndex.search(db: requireOpen().db, vaultID: vaultID, phrase: phrase, limit: 50)
+    }
 }
 
 @Test func integratedLifecycleAndUnicode() throws {
@@ -31,19 +49,19 @@ struct RuntimeFixture {
     let id = runtime.vaultID
     #expect(throws: ProcessLockError.unavailable) { try VaultRuntime(configuration: f.configuration) }
     #expect(try runtime.reconcile().revisionsCreated == 1)
-    let first = try #require(runtime.search("oldword").first)
+    let first = try #require(runtime.scanAndSearch("oldword").first)
     #expect(try runtime.reconcile().unchanged == 1)
     try f.write("new.MD", "# Another\ndiscovery")
     #expect(try runtime.reconcile().revisionsCreated == 1)
     try f.write("노트.md", "# Second\nnewword")
-    #expect(try runtime.search("oldword").isEmpty)
-    let second = try #require(runtime.search("newword").first)
+    #expect(try runtime.scanAndSearch("oldword").isEmpty)
+    let second = try #require(runtime.scanAndSearch("newword").first)
     #expect(first.entryID == second.entryID && first.revisionID != second.revisionID)
     #expect(try runtime.status().revisions == 3)
     try runtime.shutdown()
     let reopened = try VaultRuntime(configuration: f.configuration)
     #expect(reopened.vaultID == id)
-    #expect(try reopened.search("newword").first == second)
+    #expect(try reopened.scanAndSearch("newword").first == second)
     #expect(try reopened.status().revisions == 3)
     let store = try ObjectStore(directory: f.state.appendingPathComponent("objects").path)
     #expect(try store.get(ObjectStore.hash(Data(original.utf8)), maximumBytes: 1024) == Data(original.utf8))
@@ -64,7 +82,7 @@ struct RuntimeFixture {
     #expect(throws: SQLiteFailure.self) { try runtime.reconcile() }
     #expect(try runtime.status().revisions == 1)
     #expect(try runtime.status().state == "scanFailed")
-    #expect(throws: SQLiteFailure.self) { try runtime.search("hello") }
+    #expect(throws: SQLiteFailure.self) { try runtime.scanAndSearch("hello") }
     let orphanHash = ObjectStore.hash(Data("# Updated\nchanged".utf8))
     let orphanStore = try ObjectStore(directory: f.state.appendingPathComponent("objects").path)
     #expect(try orphanStore.get(orphanHash, maximumBytes: 1024) == Data("# Updated\nchanged".utf8))
@@ -74,18 +92,18 @@ struct RuntimeFixture {
     let retry = try VaultRuntime(configuration: f.configuration)
     #expect(try retry.reconcile().revisionsCreated == 1)
     #expect(try retry.status().revisions == 2)
-    #expect(try retry.search("changed").count == 1)
+    #expect(try retry.scanAndSearch("changed").count == 1)
     try Data([0xff]).write(to: f.vault.appendingPathComponent("a.md"))
     #expect(try retry.reconcile().invalidMarkdown == 1)
-    #expect(try retry.search("changed").isEmpty)
+    #expect(try retry.scanAndSearch("changed").isEmpty)
     #expect(try retry.status().openIncidents == 1)
     #expect(try retry.status().revisions == 2)
     try retry.shutdown()
     let quarantineRestart = try VaultRuntime(configuration: f.configuration)
-    #expect(try quarantineRestart.search("changed").isEmpty)
+    #expect(try quarantineRestart.scanAndSearch("changed").isEmpty)
     #expect(try quarantineRestart.status().openIncidents == 1)
     try f.write("a.md", "# Updated\nchanged")
-    #expect(try quarantineRestart.search("changed").count == 1)
+    #expect(try quarantineRestart.scanAndSearch("changed").count == 1)
     #expect(try quarantineRestart.status().openIncidents == 0)
     try quarantineRestart.shutdown()
     let hash = ObjectStore.hash(Data("# Initial\nhello".utf8))
@@ -111,7 +129,7 @@ struct RuntimeFixture {
     try FileManager.default.moveItem(at: f.vault.appendingPathComponent("moved.md"), to: f.vault.appendingPathComponent("a.md"))
     // Symlinks are never followed or indexed; the scan itself proceeds.
     try FileManager.default.createSymbolicLink(atPath: f.vault.appendingPathComponent("link.md").path, withDestinationPath: f.vault.appendingPathComponent("a.md").path)
-    #expect(try runtime.search("history").map(\.path) == ["a.md"])
+    #expect(try runtime.scanAndSearch("history").map(\.path) == ["a.md"])
     try FileManager.default.removeItem(at: f.vault.appendingPathComponent("link.md"))
     try FileManager.default.createDirectory(at: f.vault.appendingPathComponent("Upper"), withIntermediateDirectories: false)
     try f.write("Upper/one.md", "one")
@@ -127,7 +145,7 @@ struct RuntimeFixture {
     let displaced = f.root.appendingPathComponent("displaced")
     try FileManager.default.moveItem(at: f.vault, to: displaced)
     try FileManager.default.createDirectory(at: f.vault, withIntermediateDirectories: false)
-    #expect(throws: VaultReadError.unstable) { try runtime.search("history") }
+    #expect(throws: VaultReadError.unstable) { try runtime.scanAndSearch("history") }
     try runtime.shutdown()
     #expect(throws: VaultRuntimeError.identityMismatch) { try VaultRuntime(configuration: f.configuration) }
     let unsafe = VaultConfiguration(vaultDirectory: f.vault.path, stateDirectory: f.vault.path)
@@ -152,11 +170,11 @@ struct RuntimeFixture {
     // The old FTS row survives the rollback but cannot pass the current-head join.
     #expect(try SearchIndex.search(db: db, vaultID: runtime.vaultID, phrase: "oldtoken", limit: 10).isEmpty)
     #expect(try SearchIndex.search(db: db, vaultID: Data(repeating: 0x55, count: 16), phrase: "lasttoken", limit: 10).isEmpty)
-    #expect(throws: SQLiteFailure.self) { try runtime.search("lasttoken") }
+    #expect(throws: SQLiteFailure.self) { try runtime.scanAndSearch("lasttoken") }
     try runtime.shutdown()
     let restarted = try VaultRuntime(configuration: f.configuration)
     #expect(try restarted.status().state == "scanRequired")
-    #expect(throws: SQLiteFailure.self) { try restarted.search("oldtoken") }
+    #expect(throws: SQLiteFailure.self) { try restarted.scanAndSearch("oldtoken") }
     try db.execute("DROP TRIGGER index_fault")
     let recovered = try restarted.reconcile()
     // Nothing is left to capture; the scan repairs the missing indexes

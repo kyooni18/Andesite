@@ -11,7 +11,6 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.28.0"),
-        .package(url: "https://github.com/apple/swift-collections.git", exact: "1.3.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", exact: "5.0.3"),
         .package(url: "https://github.com/swiftlang/swift-markdown.git", exact: "0.9.0"),
         .package(url: "https://github.com/jpsim/Yams.git", exact: "6.2.2")

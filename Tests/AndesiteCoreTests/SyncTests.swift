@@ -90,7 +90,7 @@ final class Pair {
     #expect(p.text(p.fa, "Archive/renamed.md") == nil)
     #expect(try p.a.history("Archive/renamed.md").count == 4)
     #expect(try p.converged())
-    #expect(try p.a.search("second").isEmpty)
+    #expect(try p.a.scanAndSearch("second").isEmpty)
 }
 
 @Test func concurrentEditsMergeCleanlyOrKeepBothVersions() throws {

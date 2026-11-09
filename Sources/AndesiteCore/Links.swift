@@ -59,11 +59,11 @@ enum LinkIndex {
 
     /// Replaces a note's links and anchors. Caller owns the transaction.
     static func store(db: SQLiteConnection, vaultID: Data, entryID: Data, revisionID: Data,
-                      bytes: Data, body: String, headings: [String]) throws {
+                      links: [ObsidianLink], anchors: [(kind: String, key: String)]) throws {
         for table in ["document_links", "document_anchors"] {
             try db.executeValues("DELETE FROM \(table) WHERE vault_id=? AND entry_id=?", bindings: [.blob(vaultID), .blob(entryID)])
         }
-        for (ordinal, link) in ObsidianLinks.extract(bytes).enumerated() {
+        for (ordinal, link) in links.enumerated() {
             let decoded = link.syntax == "markdown" ? (link.target.removingPercentEncoding ?? link.target) : link.target
             try db.executeValues("""
                 INSERT INTO document_links(vault_id,entry_id,revision_id,ordinal,syntax,target,fragment,display,embed,name_key,start,end)
@@ -74,7 +74,6 @@ enum LinkIndex {
                                 .text(decoded.isEmpty ? "" : nameKey(decoded)),
                                 .integer(Int64(link.targetRange.lowerBound)), .integer(Int64(link.targetRange.upperBound))])
         }
-        let anchors = headings.map { ("heading", fold($0)) } + blockIDs(body).map { ("block", $0) }
         for (ordinal, (kind, key)) in anchors.enumerated() {
             try db.executeValues("INSERT INTO document_anchors(vault_id,entry_id,revision_id,ordinal,kind,key) VALUES(?,?,?,?,?,?)",
                                  bindings: [.blob(vaultID), .blob(entryID), .blob(revisionID), .integer(Int64(ordinal)), .text(kind), .text(key)])

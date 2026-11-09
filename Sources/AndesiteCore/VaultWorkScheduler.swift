@@ -1,15 +1,10 @@
 import Foundation
 
-/// A bounded, coalescing queue on the Vault's single owner thread.
-///
-/// Priority:
-///   1. Source-file writes are performed by the editor/OS immediately; this
-///      queue never intercepts or blocks file saves, creations or deletions.
-///   2. FSEvents-triggered and safety fallback reconciliation (durable catalog).
-///   3. Due recovery-snapshot registration.
-///
-/// At most one of each job kind is pending, regardless of event volume.
-/// No callback or queued job ever opens a second SQLite writer.
+/// The watcher's timing: when a scan or snapshot pass is due. Bursts of
+/// events coalesce into one scan (after `debounce` of quiet, at most
+/// `maximumCoalescing` after the first event); failures back off; a
+/// fallback rescan runs periodically. The watcher's work is background
+/// work: `VaultExecutor` runs it only when no user request is waiting.
 public enum VaultScheduledWork: Equatable, Sendable {
     case reconcile(VaultScanCause)
     case snapshots
@@ -53,6 +48,12 @@ public struct VaultWorkScheduler: Sendable {
     public mutating func observedChange(at now: TimeInterval) {
         if dirtySince == nil { dirtySince = now }
         lastChange = now
+    }
+
+    /// Makes a scan due now (at startup).
+    public mutating func requestScan(at now: TimeInterval) {
+        if dirtySince == nil { dirtySince = now }
+        lastChange = now - debounce
     }
 
     public mutating func reconciled(at now: TimeInterval) {

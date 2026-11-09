@@ -29,42 +29,39 @@ public enum VaultMonitorError: Error, Equatable {
     case cannotStartStream(Int32)
 }
 
-/// One tick of Vault monitoring, run on the session's owner queue. Native
-/// filesystem events are only hints that something changed; the scanner
-/// decides what. Without native events, periodic rescans still run.
+/// Watches the vault: native filesystem events are only hints that
+/// something changed; the scanner decides what. Without native events,
+/// periodic rescans still run. `VaultExecutor` calls `tick` on the vault's
+/// thread when no user request is waiting.
 final class VaultWatcher {
-    private let runtime: VaultRuntime
     private let report: (String) -> Void
     private var scheduler: VaultWorkScheduler
     private let events: FileEvents?
     private var lastGeneration: UInt64 = 0
+    private var ready = false
+    /// Incomplete scans in a row (see `VaultRuntime.scan`).
+    private var interrupted = 0
+    let polling: TimeInterval
 
-    init(runtime: VaultRuntime, vaultDirectory: String, settings: VaultMonitorSettings,
-         report: @escaping (String) -> Void) throws {
+    init(vaultDirectory: String, settings: VaultMonitorSettings, report: @escaping (String) -> Void) throws {
         guard [settings.latency, settings.debounce, settings.maximumCoalescing, settings.fallbackRescan,
                settings.snapshotTick, settings.polling, settings.retryDelay].allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 86_400 }),
               settings.maximumCoalescing >= settings.debounce else { throw VaultMonitorError.invalidSettings }
         // Subscribe before the initial scan so no change can fall in between.
         events = try FileEvents(directory: vaultDirectory, latency: settings.latency)
-        self.runtime = runtime
         self.report = report
+        polling = settings.polling
         let now = ProcessInfo.processInfo.systemUptime
         scheduler = VaultWorkScheduler(now: now, debounce: settings.debounce,
                                        maximumCoalescing: settings.maximumCoalescing,
                                        fallbackRescan: events == nil ? min(settings.fallbackRescan, 2) : settings.fallbackRescan,
                                        snapshotTick: settings.snapshotTick, retryDelay: settings.retryDelay)
-        do {
-            let initial = try runtime.reconcile()
-            scheduler.reconciled(at: ProcessInfo.processInfo.systemUptime)
-            report("watch-ready discovered=\(initial.discovered) revisions=\(initial.revisionsCreated) snapshots=\(initial.snapshotsCreated)")
-        } catch {
-            _ = scheduler.scanFailed(at: now)
-            report("watch-scan-failed attempt=1 error=\(error)")
-        }
+        // The initial scan runs as soon as the vault's thread is free.
+        scheduler.requestScan(at: now)
     }
 
-    /// Runs at most one scheduled job.
-    func tick() {
+    /// Runs at most one due job.
+    func tick(_ runtime: VaultRuntime) {
         let now = ProcessInfo.processInfo.systemUptime
         if let events, let (generation, rescan) = events.drain(), generation != lastGeneration || rescan {
             lastGeneration = generation
@@ -75,9 +72,28 @@ final class VaultWatcher {
         switch job {
         case .reconcile(let cause):
             do {
-                let result = try runtime.reconcile()
-                scheduler.reconciled(at: ProcessInfo.processInfo.systemUptime)
-                report("watch-scan cause=\(cause == .periodic ? "periodic" : "event") discovered=\(result.discovered) revisions=\(result.revisionsCreated) deleted=\(result.deleted) renamed=\(result.renamed) snapshots=\(result.snapshotsCreated)")
+                // After three interrupted scans, writes wait for this one.
+                let (r, complete) = try runtime.scan(writesMayEnter: interrupted < 3)
+                let now = ProcessInfo.processInfo.systemUptime
+                scheduler.reconciled(at: now)
+                guard complete else {
+                    interrupted += 1
+                    if interrupted > 3 {
+                        // Even with writes held back, files kept changing: back off.
+                        let attempt = scheduler.scanFailed(at: now)
+                        report("watch-scan-incomplete attempt=\(attempt)")
+                    } else {
+                        scheduler.observedChange(at: now)
+                    }
+                    return
+                }
+                interrupted = 0
+                if ready {
+                    report("watch-scan cause=\(cause == .periodic ? "periodic" : "event") discovered=\(r.discovered) revisions=\(r.revisionsCreated) deleted=\(r.deleted) renamed=\(r.renamed) snapshots=\(r.snapshotsCreated)")
+                } else {
+                    ready = true
+                    report("watch-ready discovered=\(r.discovered) revisions=\(r.revisionsCreated) snapshots=\(r.snapshotsCreated)")
+                }
             } catch {
                 let attempt = scheduler.scanFailed(at: ProcessInfo.processInfo.systemUptime)
                 report("watch-scan-failed attempt=\(attempt) error=\(error)")

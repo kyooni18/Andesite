@@ -17,13 +17,35 @@ public struct SearchIndexHit: Equatable, Sendable {
 /// All database access must be serialized with catalog writes. Callers must
 /// parse immutable revision bytes off the network event loop.
 public enum SearchIndex {
-    public static func index(db: SQLiteConnection, vaultID: Data, entryID: Data, revisionID: Data, bytes: Data, withinTransaction: Bool = false) throws {
-        guard vaultID.count == 16, entryID.count == 16, revisionID.count == 16 else { throw SearchIndexError.invalidIdentifier }
+    /// A note parsed for the index: everything except the catalog writes,
+    /// so a scan can do this work before it commits.
+    struct Analysis {
+        let parsed: ObsidianMetadata
+        let title: String
+        /// The searchable text (the whole file when frontmatter is invalid).
+        let body: String
+        let links: [ObsidianLink]
+        let anchors: [(kind: String, key: String)]
+    }
+
+    static func analyze(_ bytes: Data) throws -> Analysis {
         let parsed = try ObsidianMetadataParser.parse(bytes)
-        let facts = try MarkdownAnalyzer.analyze(Data(parsed.body.utf8))
-        let body = parsed.state == "invalid" ?
-            (String(data: bytes, encoding: .utf8) ?? "") : parsed.body
-        let title = facts.headings.first?.text ?? ""
+        let headings = try MarkdownAnalyzer.analyze(Data(parsed.body.utf8)).headings.map(\.text)
+        return Analysis(parsed: parsed, title: headings.first ?? "",
+                        body: parsed.state == "invalid" ? (String(data: bytes, encoding: .utf8) ?? "") : parsed.body,
+                        links: ObsidianLinks.extract(bytes),
+                        anchors: headings.map { ("heading", LinkIndex.fold($0)) } + LinkIndex.blockIDs(parsed.body).map { ("block", $0) })
+    }
+
+    public static func index(db: SQLiteConnection, vaultID: Data, entryID: Data, revisionID: Data, bytes: Data, withinTransaction: Bool = false) throws {
+        try index(db: db, vaultID: vaultID, entryID: entryID, revisionID: revisionID, analysis: analyze(bytes),
+                  withinTransaction: withinTransaction)
+    }
+
+    static func index(db: SQLiteConnection, vaultID: Data, entryID: Data, revisionID: Data, analysis: Analysis,
+                      withinTransaction: Bool = false) throws {
+        guard vaultID.count == 16, entryID.count == 16, revisionID.count == 16 else { throw SearchIndexError.invalidIdentifier }
+        let parsed = analysis.parsed, title = analysis.title, body = analysis.body
         let vaultKey = vaultID.map { String(format: "%02x", $0) }.joined()
         let entryKey = entryID.map { String(format: "%02x", $0) }.joined()
         let publish = {
@@ -48,7 +70,7 @@ public enum SearchIndex {
                                  .text(parsed.state), .text(parsed.propertiesJSON),
                                  parsed.diagnostic.map(SQLiteValue.text) ?? .null])
             try LinkIndex.store(db: db, vaultID: vaultID, entryID: entryID, revisionID: revisionID,
-                                bytes: bytes, body: parsed.body, headings: facts.headings.map(\.text))
+                                links: analysis.links, anchors: analysis.anchors)
             try db.executeValues("DELETE FROM document_tags WHERE vault_id=? AND entry_id=?",
                                  bindings: [.blob(vaultID), .blob(entryID)])
             for tag in parsed.tags {

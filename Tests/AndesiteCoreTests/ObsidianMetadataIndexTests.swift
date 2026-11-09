@@ -37,17 +37,11 @@ import Testing
     #expect(try runtime.documents().total == 4)
     let alpha = try #require(try runtime.documents().documents.first(where: { $0.path == "alpha.md" }))
     let metadata = try runtime.documentMetadata(alpha.id)
-    #expect(metadata["state"] as? String == "valid")
-    let props = try #require(metadata["properties"] as? [[String: Any]])
-    #expect(props.contains(where: {
-        $0["name"] as? String == "priority" && $0["type"] as? String == "number"
-    }))
-    #expect(props.contains(where: {
-        $0["name"] as? String == "created" && $0["type"] as? String == "date"
-    }))
-    let tags = try #require(metadata["tags"] as? [[String: String]])
-    #expect(tags.contains { $0["canonical"] == "project/work" && $0["origin"] == "frontmatter" })
-    #expect(tags.contains { $0["canonical"] == "project/work" && $0["origin"] == "inline" })
+    #expect(metadata.state == "valid")
+    #expect(metadata.properties.contains { $0.name == "priority" && $0.type == "number" && $0.value == .number(42) })
+    #expect(metadata.properties.contains { $0.name == "created" && $0.type == "date" })
+    #expect(metadata.tags.contains { $0.canonical == "project/work" && $0.origin == "frontmatter" })
+    #expect(metadata.tags.contains { $0.canonical == "project/work" && $0.origin == "inline" })
 
     let parent = try ObsidianFilter(tag: "PROJECT")
     let nested = try runtime.documents(filter: parent)
@@ -64,20 +58,14 @@ import Testing
     #expect(try runtime.documents(filter: ObsidianFilter(property: "category", value: "ROCKET")).total == 2)
     #expect(try runtime.documents(filter: ObsidianFilter(tag: "project",
                   property: "category", value: "rocket")).total == 1)
-    #expect(try runtime.searchIndexed("special-index-marker",
+    #expect(try runtime.search("special-index-marker",
                                       filter: ObsidianFilter(tag: "#project")).count == 2)
 
-    let tagSummary = try runtime.tags(limit: 30)
-    let labels = try #require(tagSummary["tags"] as? [[String: Any]])
-    #expect(labels.contains(where: {
-        $0["canonical"] as? String == "project/work" && $0["documents"] as? Int64 == 1
-    }))
-    let propSummary = try runtime.properties(limit: 50)
-    let keys = try #require(propSummary["properties"] as? [[String: Any]])
-    #expect(keys.contains { $0["canonical"] as? String == "priority" })
-    #expect(keys.contains { $0["canonical"] as? String == "tags" })
+    #expect(try runtime.tags(limit: 30).tags.contains { $0.canonical == "project/work" && $0.documents == 1 })
+    let keys = try runtime.properties(limit: 50).properties.map(\.canonical)
+    #expect(keys.contains("priority") && keys.contains("tags"))
     let broken = try #require(try runtime.documents().documents.first(where: { $0.path == "broken.md" }))
-    #expect(try runtime.documentMetadata(broken.id)["state"] as? String == "invalid")
+    #expect(try runtime.documentMetadata(broken.id).state == "invalid")
     #expect(try runtime.documents(filter: ObsidianFilter(tag: "bad-inline")).total == 1)
 
     // A changed head atomically replaces its old tag/property projections.
@@ -130,7 +118,7 @@ import Testing
     #expect(try reopened.reconcile().revisionsCreated == 0)
     #expect(try reopened.inspectDocument(initial.id).revisionID == initial.revisionID)
     #expect(try reopened.documents(filter: ObsidianFilter(tag: "#legacy")).total == 1)
-    #expect(try reopened.documentMetadata(initial.id)["state"] as? String == "valid")
+    #expect(try reopened.documentMetadata(initial.id).state == "valid")
     #expect(try Data(contentsOf: f.vault.appendingPathComponent("note.md")) == Data(source.utf8))
     try reopened.shutdown()
 }
@@ -146,7 +134,7 @@ import Testing
     search-for-property-uniquely
     """)
     try f.write("two.md", "# Two\n#program/Swift\n")
-    let session = try VaultSession(vaultDirectory: f.vault.path, stateDirectory: f.state.path)
+    let session = try Vault(at: f.vault.path, options: .init(stateDirectory: f.state.path, watch: false))
     try session.reconcile()
     let server = try await TestServer(session)
     func get(_ path: String) async throws -> (status: Int, value: [String: Any]) { try await server.json("GET", path) }

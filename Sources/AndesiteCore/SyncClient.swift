@@ -20,8 +20,8 @@ private final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Se
 
 /// Syncs a local Vault with one served by `andesite-server serve`.
 ///
-/// Network I/O runs off the session's owner queue; every backend step is a
-/// short `perform` job. Progress is durable after each step (pull cursor,
+/// Network I/O runs off the vault's thread; every backend step is a
+/// short background job. Progress is durable after each step (pull cursor,
 /// push acknowledgement, recorded revisions), so an interrupted sync simply
 /// resumes on the next call. Plain HTTP is accepted only for loopback.
 public final class SyncClient: Sendable {
@@ -50,32 +50,32 @@ public final class SyncClient: Sendable {
 
     /// One complete exchange: pull the peer's new revisions and resolve
     /// them locally, then push local revisions for the peer to resolve.
-    public func sync(_ session: VaultSession) async throws -> SyncReport {
-        try await session.perform { _ = try $0.reconcile() }
+    public func sync(_ vault: Vault) async throws -> SyncReport {
+        try await vault.refresh()
         let peer: SyncIdentity = try decode(await request("GET", "/v1/sync/identity"))
 
         var report = SyncReport()
-        var cursor = try await session.perform { try $0.syncCursor(peer) }
+        var cursor = try await vault.perform(.background) { try $0.syncCursor(peer) }
         while true {
             let batch: SyncBatch = try decode(await request("GET", "/v1/sync/changes?after=\(cursor)&limit=\(VaultRuntime.syncPageLimit)"))
             guard batch.vault == peer.vault, batch.epoch == peer.epoch, batch.through >= cursor else { throw SyncTransportError.invalidResponse }
-            try await download(batch.records, into: session)
-            report.received += try await session.perform { try $0.receive(batch) }
+            try await download(batch.records, into: vault)
+            report.received += try await vault.perform(.background) { try $0.receive(batch) }
             cursor = batch.through
             if cursor >= batch.head { break }
         }
-        report.add(try await session.perform { try $0.resolvePending() })
+        report.add(try await vault.perform(.background) { try $0.resolvePending() })
 
-        var acknowledged = try await session.perform { try $0.acknowledgedSequence(peer) }
+        var acknowledged = try await vault.perform(.background) { try $0.acknowledgedSequence(peer) }
         while true {
             let after = acknowledged
-            let batch = try await session.perform { try $0.syncFeed(after: after) }
+            let batch = try await vault.perform(.background) { try $0.syncFeed(after: after) }
             if !batch.records.isEmpty {
-                try await upload(batch.records, from: session)
+                try await upload(batch.records, from: vault)
                 let remote: SyncReport = try decode(await request("POST", "/v1/sync/changes", body: try JSONEncoder().encode(batch)))
                 report.sent += remote.received
             }
-            try await session.perform { try $0.acknowledge(peer, through: batch.through) }
+            try await vault.perform(.background) { try $0.acknowledge(peer, through: batch.through) }
             acknowledged = batch.through
             if acknowledged >= batch.head { break }
         }
@@ -83,24 +83,24 @@ public final class SyncClient: Sendable {
     }
 
     /// Fetches the content the records need, resuming partial transfers.
-    private func download(_ records: [SyncRecord], into session: VaultSession) async throws {
+    private func download(_ records: [SyncRecord], into vault: Vault) async throws {
         let sizes = Dictionary(records.compactMap { r in r.hash.map { ($0, r.size ?? 0) } }, uniquingKeysWith: { a, _ in a })
         let hashes = Array(sizes.keys)
-        for missing in try await session.perform({ try $0.missingObjects(hashes) }) {
+        for missing in try await vault.perform(.background, { try $0.missingObjects(hashes) }) {
             let (hash, size) = (missing.hash, sizes[missing.hash] ?? 0)
             var offset = missing.received
             repeat {
                 let at = offset, length = Int(min(Int64(VaultRuntime.chunkLimit), size - at))
                 let data = try await request("GET", "/v1/sync/objects/\(hash)?offset=\(at)&length=\(length)")
                 guard data.count == length else { throw SyncTransportError.invalidResponse }
-                offset = try await session.perform { try $0.receiveChunk(hash, size: size, offset: at, data) }
+                offset = try await vault.perform(.background) { try $0.receiveChunk(hash, size: size, offset: at, data) }
                 guard offset > at || size == 0 else { throw SyncTransportError.invalidResponse }
             } while offset < size
         }
     }
 
     /// Sends the content the peer lacks, resuming partial transfers.
-    private func upload(_ records: [SyncRecord], from session: VaultSession) async throws {
+    private func upload(_ records: [SyncRecord], from vault: Vault) async throws {
         let sizes = Dictionary(records.compactMap { r in r.hash.map { ($0, r.size ?? 0) } }, uniquingKeysWith: { a, _ in a })
         let missing: [ObjectProgress] = try decode(await request("POST", "/v1/sync/objects/missing",
                                                                  body: try JSONEncoder().encode(sizes.keys.sorted())))
@@ -109,7 +109,7 @@ public final class SyncClient: Sendable {
             var offset = item.received
             repeat {
                 let at = offset, length = Int(min(Int64(VaultRuntime.chunkLimit), size - at))
-                let data = try await session.perform { try $0.objectChunk(item.hash, offset: at, length: length) }
+                let data = try await vault.perform(.background) { try $0.objectChunk(item.hash, offset: at, length: length) }
                 let reply: ObjectProgress = try decode(await request(
                     "PUT", "/v1/sync/objects/\(item.hash)?size=\(size)&offset=\(at)", body: data,
                     headers: ["X-Chunk-SHA256": ObjectStore.hash(data)]))
