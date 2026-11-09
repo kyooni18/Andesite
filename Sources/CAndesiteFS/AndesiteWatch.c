@@ -1,5 +1,8 @@
 #include "AndesiteFS.h"
 #ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_OSX
 #include <CoreServices/CoreServices.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>

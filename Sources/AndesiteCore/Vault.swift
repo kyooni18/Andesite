@@ -75,10 +75,14 @@ public final class Vault: @unchecked Sendable {
     private var closed = false
 
     public static var defaultStateRoot: String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
         #if os(macOS)
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
         return home + "/Library/Application Support/Andesite/States"
+        #elseif canImport(Darwin)
+        // iOS: the app's own container, never its user-visible Documents.
+        return NSHomeDirectory() + "/Library/Application Support/Andesite/States"
         #else
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
         return home + "/.local/share/Andesite/States"
         #endif
     }
@@ -94,7 +98,7 @@ public final class Vault: @unchecked Sendable {
               info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
             throw VaultOpenError.identityUnavailable
         }
-        #if os(macOS)
+        #if canImport(Darwin)
         guard info.st_birthtimespec.tv_sec > 0 else { throw VaultOpenError.identityUnavailable }
         let identity = "vault-state-v1:\(info.st_dev):\(info.st_ino):\(info.st_birthtimespec.tv_sec):\(info.st_birthtimespec.tv_nsec)"
         #else

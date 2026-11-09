@@ -8,6 +8,9 @@ int andesite_rename_noreplace(int from_directory, const char *from, int to_direc
 int andesite_copy_metadata(int source, int destination);
 
 #ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_OSX
 #include <stdint.h>
 typedef struct andesite_fsevents_watch andesite_fsevents_watch;
 typedef struct {
@@ -19,7 +22,7 @@ typedef struct {
 andesite_fsevents_watch *andesite_fsevents_start(const char *root, double latency);
 int andesite_fsevents_drain(andesite_fsevents_watch *watch, andesite_fsevents_events *out);
 void andesite_fsevents_stop(andesite_fsevents_watch *watch);
-#endif /* __APPLE__ */
+#endif /* TARGET_OS_OSX */
 
 #ifdef __linux__
 #include <stdint.h>
