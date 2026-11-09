@@ -40,7 +40,7 @@ start() {
 step() { echo "== $*"; }
 sync() { "$client" sync "$demo/$1" "$url" --state "$demo/state-$1"; }
 round() { sync a; sync b; sync a; } # A's changes reach B, and B's reach A
-server_cat() { container exec "$name" cat "/data/vault/$1"; }
+server_cat() { container exec "$name" cat "/data/vaults/main/$1"; }
 same() { test "$(cat "$demo/a/$1")" = "$2" && test "$(cat "$demo/b/$1")" = "$2" && test "$(server_cat "$1")" = "$2"; }
 
 start
@@ -91,7 +91,7 @@ rm "$demo/a/shared.md"
 round
 test -f "$demo/a/Projects/Roadmap.md" && test ! -e "$demo/a/Projects/Plan.md"
 test ! -e "$demo/b/shared.md"
-container exec "$name" test ! -e /data/vault/shared.md
+container exec "$name" test ! -e /data/vaults/main/shared.md
 
 step "the server keeps everything across a restart"
 container stop "$name" >/dev/null && container rm "$name" >/dev/null

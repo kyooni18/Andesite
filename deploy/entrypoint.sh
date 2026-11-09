@@ -1,16 +1,24 @@
 #!/bin/sh
-# Serves /data/vault (state in /data/state) and forwards port 8790 to it.
+# Serves the vault /data/vaults/$ANDESITE_VAULT (default "main"; state in
+# /data/state) and forwards port 8790 to it. Mount a host folder on
+# /data/vaults to see the notes from the host.
 set -eu
 : "${ANDESITE_API_TOKEN:?set ANDESITE_API_TOKEN to 64 hex digits (openssl rand -hex 32)}"
-mkdir -p /data/vault /data/state
-chown andesite:andesite /data /data/vault /data/state
-chmod 755 /data /data/vault
+vault="/data/vaults/${ANDESITE_VAULT:-main}"
+mkdir -p /data/vaults /data/state
+chown andesite:andesite /data /data/state
+chmod 755 /data
 chmod 700 /data/state
 
 run() { setpriv --reuid=andesite --regid=andesite --init-groups --reset-env \
   env HOME=/home/andesite ANDESITE_API_TOKEN="$ANDESITE_API_TOKEN" "$@"; }
 
-run sh -c 'umask 022; exec andesite-server serve /data/vault --state /data/state --port 8788' &
+# The server only serves a vault its own user owns. A folder shared from the
+# host can't be handed to that user, but one the user creates inside it can.
+chown andesite:andesite /data/vaults 2>/dev/null || :
+run mkdir -p "$vault"
+
+run sh -c "umask 022; exec andesite-server serve '$vault' --state /data/state --port 8788" &
 server=$!
 run /usr/sbin/nginx -c /etc/nginx/andesite.conf -g 'daemon off;' &
 proxy=$!
