@@ -20,4 +20,15 @@ andesite_fsevents_watch *andesite_fsevents_start(const char *root, double latenc
 int andesite_fsevents_drain(andesite_fsevents_watch *watch, andesite_fsevents_events *out);
 void andesite_fsevents_stop(andesite_fsevents_watch *watch);
 #endif /* __APPLE__ */
+
+#ifdef __linux__
+#include <stdint.h>
+typedef struct andesite_inotify_watch andesite_inotify_watch;
+andesite_inotify_watch *andesite_inotify_start(const char *root);
+/* Non-blocking. `generation` counts observed changes; `rescan` reports lost events. */
+int andesite_inotify_drain(andesite_inotify_watch *watch, uint64_t *generation, uint32_t *rescan);
+void andesite_inotify_stop(andesite_inotify_watch *watch);
+/* Birth time via statx (name "" means `directory` is the file itself); -1 if the filesystem has none. */
+int andesite_birth_time(int directory, const char *name, int64_t *seconds, int64_t *nanoseconds);
+#endif /* __linux__ */
 #endif /* ANDESITE_FS_H */

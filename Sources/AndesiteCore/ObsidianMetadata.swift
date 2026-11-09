@@ -93,7 +93,7 @@ public enum ObsidianMetadataParser {
         var invalidHeader: String?
         if normalized.hasPrefix("---\n") || normalized.hasPrefix("---\r\n") ||
            normalized == "---" {
-            let lines = normalized.components(separatedBy: "\n")
+            let lines = normalized.lines()
             var end: Int?
             var headerBytes = 0
             for index in 1..<min(lines.count, 8192) {
@@ -300,7 +300,7 @@ public enum ObsidianMetadataParser {
         var fence: (Character, Int)?
         var inComment = false
         var inlineTicks = 0
-        for line in body.components(separatedBy: "\n") {
+        for line in body.lines() {
             let prefix = line.prefix(while: { $0 == " " }).count
             let trimmed = prefix <= 3 ? String(line.dropFirst(prefix)) : line
             var structural = trimmed
@@ -408,5 +408,14 @@ public enum ObsidianMetadataParser {
             }
         }
         return result
+    }
+}
+
+extension String {
+    /// The text split at every LF, including the LF of a CRLF (lines keep
+    /// their "\r"). `components(separatedBy: "\n")` differs by platform here:
+    /// CRLF is one Character, which Linux Foundation does not split.
+    func lines() -> [String] {
+        unicodeScalars.split(separator: "\n", omittingEmptySubsequences: false).map { String(Substring($0)) }
     }
 }

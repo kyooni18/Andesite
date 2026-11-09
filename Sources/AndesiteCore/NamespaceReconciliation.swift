@@ -16,6 +16,7 @@ struct NamespacePlan {
     let assignment: [Int: Int] // scan index -> old index
     let moved: Set<Int>
     let deleted: Set<Int>
+    private let oldKeys: Set<String>
 
     init(db: SQLiteConnection, vaultID: Data, scan: [ScannedFile]) throws {
         let old = try db.queryValues("SELECT id,path,fs_hint FROM entries WHERE vault_id=? AND state='live' ORDER BY id", bindings: [.blob(vaultID)]).map { row -> CatalogFile in
@@ -52,11 +53,12 @@ struct NamespacePlan {
             Array(scan[current].path.components.joined(separator: "/").utf8) != Array(old[prior].name.utf8) ? prior : nil
         })
         self.deleted = Set(old.indices).subtracting(used)
+        self.oldKeys = Set(old.map(\.path.portabilityKey))
     }
 
     func needsNamespaceCommit(index: Int, file: ScannedFile) -> Bool {
         if let prior = assignment[index] { return moved.contains(prior) }
-        return old.contains { $0.path.portabilityKey == file.path.portabilityKey }
+        return oldKeys.contains(file.path.portabilityKey)
     }
 
     static func validateUnchanged(_ before: [ScannedFile], _ after: [ScannedFile]) throws {

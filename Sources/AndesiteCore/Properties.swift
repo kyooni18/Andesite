@@ -70,7 +70,7 @@ extension VaultRuntime {
             throw VaultError.unsupported("the note's frontmatter is not valid YAML")
         }
         let newline = text.contains("\r\n") ? "\r\n" : "\n"
-        var lines = text.components(separatedBy: "\n").map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+        var lines = text.lines().map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
         let rendered = try value.map { value -> [String] in
             let yaml = try Yams.dump(object: [name: value.yaml], width: -1, allowUnicode: true)
             return yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init).filter { !$0.isEmpty }

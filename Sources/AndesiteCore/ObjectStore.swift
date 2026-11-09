@@ -77,15 +77,14 @@ public final class ObjectStore {
         return hash
     }
 
+    /// Writes the object's data to the device. It becomes crash-durable at
+    /// the next catalog commit, which runs with `fullfsync` and flushes the
+    /// whole device cache; every reference to an object is such a commit, so
+    /// a separate F_FULLFSYNC per object would only repeat that flush.
     func durabilityBarrier(_ fd: Int32) throws {
-        #if canImport(Darwin)
-        guard fcntl(fd, F_FULLFSYNC) == 0 else { throw ObjectStoreError.systemCall("full sync object", errno) }
-        #else
         guard fsync(fd) == 0 else { throw ObjectStoreError.systemCall("sync object", errno) }
-        #endif
     }
 
-    /// Accounting only; does not authorize removal of anything in the store.
     func storageUsage() throws -> (logical: Int64, allocated: Int64, temporary: Int64) {
         let copy = openat(root, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard copy >= 0, let stream = fdopendir(copy) else { throw ObjectStoreError.systemCall("enumerate object storage", errno) }
@@ -104,7 +103,7 @@ public final class ObjectStore {
             guard fstatat(root, name, &s, AT_SYMLINK_NOFOLLOW) == 0, s.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { throw ObjectStoreError.corruptObject }
             let key = "\(s.st_dev):\(s.st_ino)"
             let isHash = name.utf8.count == 64 && name.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
-            if isHash { immutable[key] = (s.st_size, Int64(s.st_blocks) * 512) }
+            if isHash { immutable[key] = (Int64(s.st_size), Int64(s.st_blocks) * 512) }
             else if name.hasPrefix(".object-") { temporary[key] = Int64(s.st_blocks) * 512 }
             else { throw ObjectStoreError.corruptObject }
         }

@@ -168,7 +168,7 @@ final class Journal {
     /// fingerprint is sufficient; otherwise the bytes are hashed.
     private func verifyOriginal(_ directory: VaultDirectory, _ name: String, _ plan: MutationPlan) throws {
         guard let info = try directory.info(name) else { throw VaultError.conflict(current: plan.base) }
-        if let hint = plan.fromHint, FileFingerprint(info) == hint { return }
+        if let hint = plan.fromHint, info == hint { return }
         guard try directory.digest(name, maximumBytes: Int.max)?.hash == plan.fromHash else {
             throw VaultError.conflict(current: plan.base)
         }

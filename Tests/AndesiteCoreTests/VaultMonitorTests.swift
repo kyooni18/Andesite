@@ -1,7 +1,10 @@
-#if os(macOS)
 import Foundation
 import Testing
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 @testable import AndesiteCore
 
 private func fastMonitorSettings(fallback: TimeInterval = 5) -> VaultMonitorSettings {
@@ -124,4 +127,3 @@ final class Reports: @unchecked Sendable {
     #expect(try runtime.search("secondtoken").count == 1)
     try runtime.shutdown()
 }
-#endif

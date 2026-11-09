@@ -106,13 +106,8 @@ struct RuntimeFixture {
     _ = try runtime.reconcile()
     try FileManager.default.moveItem(at: f.vault.appendingPathComponent("a.md"), to: f.vault.appendingPathComponent("moved.md"))
     let move = try runtime.reconcile()
-    #if canImport(Darwin)
     #expect(move.renamed == 1 && move.deleted == 0)
     #expect(try runtime.status().revisions == 2)
-    #else
-    #expect(move.deleted == 1)
-    #expect(try runtime.status().revisions == 3)
-    #endif
     try FileManager.default.moveItem(at: f.vault.appendingPathComponent("moved.md"), to: f.vault.appendingPathComponent("a.md"))
     // Symlinks are never followed or indexed; the scan itself proceeds.
     try FileManager.default.createSymbolicLink(atPath: f.vault.appendingPathComponent("link.md").path, withDestinationPath: f.vault.appendingPathComponent("a.md").path)
@@ -151,8 +146,9 @@ struct RuntimeFixture {
     try f.write("a.md", "# After\nnewtoken")
     try f.write("b.md", "# Discovered\nnewfiletoken")
     #expect(throws: SQLiteFailure.self) { try runtime.reconcile() }
-    #expect(try runtime.status().revisions == 3)
-    #expect(try db.queryValues("SELECT count(*) FROM changes") == [[.integer(3)]])
+    // Both captures committed (one batch); only their index failed.
+    #expect(try runtime.status().revisions == 4)
+    #expect(try db.queryValues("SELECT count(*) FROM changes") == [[.integer(4)]])
     // The old FTS row survives the rollback but cannot pass the current-head join.
     #expect(try SearchIndex.search(db: db, vaultID: runtime.vaultID, phrase: "oldtoken", limit: 10).isEmpty)
     #expect(try SearchIndex.search(db: db, vaultID: Data(repeating: 0x55, count: 16), phrase: "lasttoken", limit: 10).isEmpty)
@@ -163,8 +159,8 @@ struct RuntimeFixture {
     #expect(throws: SQLiteFailure.self) { try restarted.search("oldtoken") }
     try db.execute("DROP TRIGGER index_fault")
     let recovered = try restarted.reconcile()
-    // The failed search above already captured b.md; only its index was
-    // missing, and the scan repairs indexes from stored content.
+    // Nothing is left to capture; the scan repairs the missing indexes
+    // from stored content.
     #expect(recovered.revisionsCreated == 0 && recovered.unchanged == 3, "\(recovered)")
     #expect(try restarted.search("newtoken").count == 1)
     #expect(try restarted.search("oldtoken").isEmpty)

@@ -116,7 +116,6 @@ import Testing
     #expect(try VaultPathRegistry(vaultDirectory: moved.path).storedPath() == moved.path)
 }
 
-#if os(macOS)
 @Test func sessionWatchStartsThenClosesWithoutLeakingStateLock() throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("note.md", "# Watched\nwatchuniquetoken\n")
@@ -132,4 +131,3 @@ import Testing
     #expect(try again.run { try $0.status().revisions } == 1)
     try again.close()
 }
-#endif

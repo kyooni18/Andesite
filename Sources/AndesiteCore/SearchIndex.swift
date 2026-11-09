@@ -30,8 +30,12 @@ public enum SearchIndex {
             let rows = try db.queryValues("SELECT head_revision FROM entries WHERE vault_id=? AND id=? AND state='live' AND kind='markdown'", bindings: [.blob(vaultID), .blob(entryID)])
             guard rows == [[.blob(revisionID)]] else { throw SearchIndexError.staleRevision }
             try db.executeValues("INSERT INTO document_metadata(vault_id,entry_id,indexed_revision,title) VALUES(?,?,?,?) ON CONFLICT(vault_id,entry_id) DO UPDATE SET indexed_revision=excluded.indexed_revision,title=excluded.title", bindings: [.blob(vaultID), .blob(entryID), .blob(revisionID), .text(title)])
-            try db.executeValues("DELETE FROM document_fts WHERE vault_id=? AND entry_id=?", bindings: [.text(vaultKey), .text(entryKey)])
-            try db.executeValues("INSERT INTO document_fts(vault_id,entry_id,title,body) VALUES(?,?,?,?)", bindings: [.text(vaultKey), .text(entryKey), .text(title), .text(body)])
+            // A rowid derived from the entry makes replacing a note's row a
+            // keyed lookup (FTS5 cannot index its UNINDEXED columns).
+            let rowid = Int64(bitPattern: entryID.prefix(8).reduce(0) { $0 << 8 | UInt64($1) })
+            try db.executeValues("DELETE FROM document_fts WHERE rowid=?", bindings: [.integer(rowid)])
+            try db.executeValues("INSERT INTO document_fts(rowid,vault_id,entry_id,title,body) VALUES(?,?,?,?,?)",
+                                 bindings: [.integer(rowid), .text(vaultKey), .text(entryKey), .text(title), .text(body)])
             try db.executeValues("""
                 INSERT INTO document_properties(vault_id,entry_id,indexed_revision,state,properties_json,diagnostic)
                 VALUES(?,?,?,?,?,?)
@@ -133,14 +137,14 @@ public enum SearchIndex {
         let statement = """
             SELECT m.entry_id,m.indexed_revision,m.title,e.path
             FROM document_fts f JOIN document_metadata m
-              ON lower(hex(m.entry_id))=f.entry_id AND lower(hex(m.vault_id))=f.vault_id
+              ON m.vault_id=? AND m.entry_id=unhex(f.entry_id)
             JOIN entries e ON e.vault_id=m.vault_id AND e.id=m.entry_id
             WHERE document_fts MATCH ? AND f.vault_id=? AND m.vault_id=?
               AND e.state='live' AND e.head_revision=m.indexed_revision
               AND NOT EXISTS (SELECT 1 FROM incidents i WHERE i.vault_id=e.vault_id AND (i.entry_id=e.id OR (i.entry_id IS NULL AND i.path_key=e.path_key)) AND i.status='open')
             """ + (filter?.sql ?? "") + " ORDER BY rank, m.entry_id LIMIT ?"
         let rows = try db.queryValues(statement, bindings: [
-            .text(expression), .text(vaultKey), .blob(vaultID)
+            .blob(vaultID), .text(expression), .text(vaultKey), .blob(vaultID)
         ] + (filter?.bindings ?? []) + [.integer(Int64(limit))])
         return try rows.map { row in
             guard row.count == 4, case .blob(let entry) = row[0], case .blob(let revision) = row[1],

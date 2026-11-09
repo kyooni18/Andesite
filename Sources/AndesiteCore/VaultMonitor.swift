@@ -114,6 +114,23 @@ final class FileEvents {
         guard andesite_fsevents_drain(stream, &result) == 0 else { return nil }
         return (result.generation, result.recovery_flags != 0)
     }
+    #elseif os(Linux)
+    private let watch: OpaquePointer
+
+    /// nil when inotify is unavailable (for example the watch limit is
+    /// reached); the watcher then falls back to frequent periodic rescans.
+    init?(directory: String, latency: TimeInterval) throws {
+        guard let watch = andesite_inotify_start(directory) else { return nil }
+        self.watch = watch
+    }
+
+    deinit { andesite_inotify_stop(watch) }
+
+    func drain() -> (generation: UInt64, rescan: Bool)? {
+        var generation: UInt64 = 0, rescan: UInt32 = 0
+        guard andesite_inotify_drain(watch, &generation, &rescan) == 0 else { return (generation, true) }
+        return (generation, rescan != 0)
+    }
     #else
     init?(directory: String, latency: TimeInterval) throws { return nil }
     func drain() -> (generation: UInt64, rescan: Bool)? { nil }

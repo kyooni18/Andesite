@@ -132,7 +132,6 @@ private extension RuntimeFixture {
     try f.write("폴더/Case.md", "changed while moving")
     let runtime = try VaultRuntime(configuration: f.configuration)
     let report = try runtime.reconcile(at: start.addingTimeInterval(3))
-    #if canImport(Darwin)
     #expect(report.renamed == 1 && report.deleted == 0)
     let moved = try #require(runtime.snapshots(path: "폴더/Case.md").last)
     #expect(moved.entryID == originalID && moved.reason == "rename")
@@ -177,11 +176,6 @@ private extension RuntimeFixture {
     #expect(try runtime.reconcile().renamed == 1)
     #expect(try runtime.search("fixed after move").first?.entryID == originalID)
     #expect(try runtime.status().openIncidents == 0)
-    #else
-    // Linux stat currently lacks birthtime evidence in this implementation.
-    #expect(report.deleted == 1 && report.renamed == 0)
-    #expect(try runtime.snapshots(entryID: originalID).allSatisfy { $0.documentState == "deleted" })
-    #endif
     try runtime.shutdown()
 }
 
@@ -219,18 +213,17 @@ private extension RuntimeFixture {
         let runtime = try VaultRuntime(configuration: f.configuration)
         _ = try runtime.reconcile(at: start)
         db = try f.database()
-        try runtime.configureSnapshots(SnapshotPolicy(minimumInterval: 0))
-        try db.execute("CREATE TRIGGER snapshot_fault BEFORE INSERT ON recovery_snapshots BEGIN SELECT RAISE(ABORT,'snapshot fault'); END")
+        // Captured within the snapshot interval: durable, but no snapshot yet.
         try f.write("note.md", "durable head, no snapshot yet")
-        #expect(throws: SQLiteFailure.self) { try runtime.reconcile(at: start.addingTimeInterval(1)) }
+        _ = try runtime.reconcile(at: start.addingTimeInterval(1))
         #expect(try runtime.status().revisions == 2)
         #expect(try db.scalarText("SELECT count(*) FROM recovery_snapshots") == "1")
         // Simulate an abrupt exit: release owner WITHOUT orderly shutdown/flush.
     }
-    try db.execute("DROP TRIGGER snapshot_fault")
     // A newer disk edit must not erase recovery of the last captured head.
     try f.write("note.md", "new disk version after crash")
     let runtime = try VaultRuntime(configuration: f.configuration)
+    try runtime.configureSnapshots(SnapshotPolicy(minimumInterval: 0))
     let recovered = try #require(runtime.snapshots().last)
     #expect(recovered.reason == "recovery")
     #expect(try runtime.snapshotContents(recovered.id) == Data("durable head, no snapshot yet".utf8))

@@ -1,4 +1,5 @@
 import Foundation
+import CAndesiteFS
 #if canImport(Darwin)
 import Darwin
 #else
@@ -50,7 +51,10 @@ public struct FileFingerprint: Equatable, Sendable, Codable {
     public let birthSeconds: Int64?
     public let birthNanos: Int64?
 
-    init(_ s: stat) {
+    /// The fingerprint of `name` in `directory` (or, with an empty name, of
+    /// the open file `directory`). On Linux the birth time, which `stat`
+    /// lacks, comes from `statx` where the filesystem records it.
+    init(_ s: stat, directory: Int32, name: String = "") {
         device = UInt64(s.st_dev); inode = UInt64(s.st_ino); size = Int64(s.st_size)
         #if canImport(Darwin)
         modificationSeconds = Int64(s.st_mtimespec.tv_sec); modificationNanos = Int64(s.st_mtimespec.tv_nsec)
@@ -59,7 +63,12 @@ public struct FileFingerprint: Equatable, Sendable, Codable {
         #else
         modificationSeconds = Int64(s.st_mtim.tv_sec); modificationNanos = Int64(s.st_mtim.tv_nsec)
         changeSeconds = Int64(s.st_ctim.tv_sec); changeNanos = Int64(s.st_ctim.tv_nsec)
-        birthSeconds = nil; birthNanos = nil
+        var seconds: Int64 = 0, nanoseconds: Int64 = 0
+        if andesite_birth_time(directory, name, &seconds, &nanoseconds) == 0 {
+            birthSeconds = seconds; birthNanos = nanoseconds
+        } else {
+            birthSeconds = nil; birthNanos = nil
+        }
         #endif
     }
 
@@ -144,7 +153,7 @@ public final class VaultReader {
                     guard fstat(child, &opened) == 0, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else { throw VaultReadError.unstable }
                     try visit(child, prefix + name + "/")
                 case mode_t(S_IFREG) where info.st_nlink == 1:
-                    paths.append(ScannedFile(path: path, fingerprint: FileFingerprint(info)))
+                    paths.append(ScannedFile(path: path, fingerprint: FileFingerprint(info, directory: fd, name: name)))
                 default:
                     // Symlinks, hard-linked files and special files are never
                     // followed or indexed; Andesite cannot replace them safely.
@@ -199,13 +208,13 @@ public final class VaultReader {
         guard fstat(fd, &before) == 0 else { throw VaultReadError.systemCall("stat file", errno) }
         guard before.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), before.st_nlink == 1,
               UInt64(before.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
-        guard FileFingerprint(before) == expected else { throw VaultReadError.unstable }
+        guard FileFingerprint(before, directory: fd) == expected else { throw VaultReadError.unstable }
         guard before.st_size <= maximumBytes else { throw VaultReadError.tooLarge }
         let stored: (hash: String, size: Int64)
         do { stored = try objects.put(from: fd, maximumBytes: maximumBytes) } catch ObjectStoreError.tooLarge { throw VaultReadError.unstable }
         var after = stat(), atPath = stat()
         guard fstat(fd, &after) == 0, fstatat(directory, name, &atPath, AT_SYMLINK_NOFOLLOW) == 0,
-              FileFingerprint(after) == expected, FileFingerprint(atPath) == expected,
+              FileFingerprint(after, directory: fd) == expected, FileFingerprint(atPath, directory: directory, name: name) == expected,
               stored.size == Int64(after.st_size) else { throw VaultReadError.unstable }
         return stored
     }
@@ -217,7 +226,7 @@ public final class VaultReader {
         var info = stat()
         guard fstatat(directory, path.components.last!, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw VaultReadError.unstable }
         guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), info.st_nlink == 1 else { throw VaultReadError.unsafeFile }
-        return FileFingerprint(info)
+        return FileFingerprint(info, directory: directory, name: path.components.last!)
     }
 
     /// The containing directory, opened without following links.

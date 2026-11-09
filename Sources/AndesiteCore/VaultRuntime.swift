@@ -268,12 +268,19 @@ public final class VaultRuntime {
             report.oversize = all.count - scan.count
             var deferred: [(Int, ExternalCapture.Prepared)] = []
             var quarantinedMove = false
-            func index(_ captured: ExternalCaptureResult, _ kind: String) throws {
-                if kind == "markdown" {
-                    let bytes = try r.objects.get(captured.contentHash, maximumBytes: configuration.maximumBytes)
-                    try SearchIndex.index(db: r.db, vaultID: vaultID, entryID: captured.entryID, revisionID: captured.revisionID, bytes: bytes)
+            /// Indexes captured notes in one transaction. Their revisions are
+            /// already committed; a failed index is repaired by a later scan.
+            func index(_ captured: [(ExternalCaptureResult, String)]) throws {
+                try r.db.transaction {
+                    for (result, kind) in captured where kind == "markdown" {
+                        let bytes = try r.objects.get(result.contentHash, maximumBytes: configuration.maximumBytes)
+                        try SearchIndex.index(db: r.db, vaultID: vaultID, entryID: result.entryID, revisionID: result.revisionID,
+                                              bytes: bytes, withinTransaction: true)
+                    }
                 }
-                if captured.sequence == nil { report.unchanged += 1 } else { report.revisionsCreated += 1 }
+                for (result, _) in captured {
+                    if result.sequence == nil { report.unchanged += 1 } else { report.revisionsCreated += 1 }
+                }
             }
             // Only files whose metadata differs from the catalog are read.
             let changed = scan.indices.filter { index in
@@ -284,26 +291,40 @@ public final class VaultRuntime {
             // One quiet period for the whole batch: a file still being written
             // changes its fingerprint, fails this scan and is retried later.
             if !changed.isEmpty, configuration.debounce > 0 { Thread.sleep(forTimeInterval: configuration.debounce) }
-            for indexInScan in changed {
-                let file = scan[indexInScan]
-                let (hash, size) = try r.reader.capture(file.path, expected: file.fingerprint, into: r.objects,
-                                                        maximumBytes: configuration.limit(for: file.kind))
-                let prepared = try ExternalCapture.prepare(file, hash: hash, size: size, objects: r.objects,
-                                                           maximumMarkdownBytes: configuration.maximumBytes)
-                if plan.needsNamespaceCommit(index: indexInScan, file: file) {
-                    if !prepared.valid {
-                        let id = plan.assignment[indexInScan].map { plan.old[$0].id }
-                        try r.db.transaction { try ExternalCapture.incident(db: r.db, vaultID: vaultID, prepared: prepared, entryID: id, at: date) }
-                        report.invalidMarkdown += 1
-                        quarantinedMove = true
-                    } else { deferred.append((indexInScan, prepared)) }
-                    continue
+            // Captures are committed in batches: one transaction (and one
+            // device flush) for many files instead of several per file.
+            for batch in stride(from: 0, to: changed.count, by: 256).map({ Array(changed[$0..<min($0 + 256, changed.count)]) }) {
+                var ready: [ExternalCapture.Prepared] = []
+                for indexInScan in batch {
+                    let file = scan[indexInScan]
+                    let (hash, size) = try r.reader.capture(file.path, expected: file.fingerprint, into: r.objects,
+                                                            maximumBytes: configuration.limit(for: file.kind))
+                    let prepared = try ExternalCapture.prepare(file, hash: hash, size: size, objects: r.objects,
+                                                               maximumMarkdownBytes: configuration.maximumBytes)
+                    if plan.needsNamespaceCommit(index: indexInScan, file: file) {
+                        if !prepared.valid {
+                            let id = plan.assignment[indexInScan].map { plan.old[$0].id }
+                            try r.db.transaction { try ExternalCapture.incident(db: r.db, vaultID: vaultID, prepared: prepared, entryID: id, at: date) }
+                            report.invalidMarkdown += 1
+                            quarantinedMove = true
+                        } else { deferred.append((indexInScan, prepared)) }
+                    } else {
+                        ready.append(prepared)
+                    }
                 }
-                let captured = try r.db.transaction { try ExternalCapture.publish(db: r.db, vaultID: vaultID, prepared: prepared, at: date) }
-                if let captured {
-                    if try r.db.transaction({ try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: captured.entryID, at: date) }) { report.snapshotsCreated += 1 }
-                    try index(captured, prepared.kind)
-                } else { report.invalidMarkdown += 1 }
+                let captured: [(ExternalCaptureResult, String)] = try r.db.transaction {
+                    var captured: [(ExternalCaptureResult, String)] = []
+                    for prepared in ready {
+                        guard let result = try ExternalCapture.publish(db: r.db, vaultID: vaultID, prepared: prepared, at: date) else {
+                            report.invalidMarkdown += 1
+                            continue
+                        }
+                        if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: result.entryID, at: date) { report.snapshotsCreated += 1 }
+                        captured.append((result, prepared.kind))
+                    }
+                    return captured
+                }
+                try index(captured)
             }
             // Only a fully enumerated, unchanged namespace and a later secure
             // absence check may authorize tombstones. A failure above or here
@@ -343,7 +364,7 @@ public final class VaultRuntime {
                 }
                 return results
             }
-            for (captured, kind) in results { try index(captured, kind) }
+            try index(results)
             // v9 metadata migration: populate missing properties/tag rows
             // from already verified immutable revisions, never source files.
             // Do not declare the index ready with a partial backfill.
@@ -429,7 +450,7 @@ public final class VaultRuntime {
         guard before.byteLength <= 256 * 1024, after.byteLength <= 256 * 1024 else { throw SnapshotError.comparisonTooLarge }
         let a = try snapshotContents(beforeID), b = try snapshotContents(afterID)
         guard let old = String(data: a, encoding: .utf8), let new = String(data: b, encoding: .utf8) else { throw SnapshotError.inconsistentMetadata }
-        let oldLines = old.components(separatedBy: "\n"), newLines = new.components(separatedBy: "\n")
+        let oldLines = old.lines(), newLines = new.lines()
         guard oldLines.count <= 2000, newLines.count <= 2000 else { throw SnapshotError.comparisonTooLarge }
         let changes = newLines.difference(from: oldLines, by: { $0.utf8.elementsEqual($1.utf8) }).map { change -> String in
             switch change {
@@ -469,7 +490,13 @@ public final class VaultRuntime {
         guard try status().state == "ready" else { return 0 }
                 return try r.db.transaction {
             var created = 0
-            for row in try r.db.queryValues("SELECT id FROM entries WHERE vault_id=? AND state='live' AND kind='markdown' ORDER BY id", bindings: [.blob(vaultID)]) {
+            // Only notes whose current version has no snapshot yet can be due.
+            for row in try r.db.queryValues("""
+                SELECT e.id FROM entries e WHERE e.vault_id=? AND e.state='live' AND e.kind='markdown'
+                  AND NOT EXISTS (SELECT 1 FROM recovery_snapshots s
+                                  WHERE s.vault_id=e.vault_id AND s.entry_id=e.id AND s.revision_id=e.head_revision)
+                ORDER BY e.id
+                """, bindings: [.blob(vaultID)]) {
                 guard case .blob(let id) = row[0] else { throw VaultRuntimeError.inconsistentCatalog }
                 if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: id, at: date) { created += 1 }
             }
@@ -488,7 +515,13 @@ public final class VaultRuntime {
         try RecoverySnapshots.validateTime(date)
         return try r.db.transaction {
             var created = 0
-            for row in try r.db.queryValues("SELECT id FROM entries WHERE vault_id=? AND state='live' AND kind='markdown' ORDER BY id", bindings: [.blob(vaultID)]) {
+            // Only notes whose current version has no snapshot yet can be due.
+            for row in try r.db.queryValues("""
+                SELECT e.id FROM entries e WHERE e.vault_id=? AND e.state='live' AND e.kind='markdown'
+                  AND NOT EXISTS (SELECT 1 FROM recovery_snapshots s
+                                  WHERE s.vault_id=e.vault_id AND s.entry_id=e.id AND s.revision_id=e.head_revision)
+                ORDER BY e.id
+                """, bindings: [.blob(vaultID)]) {
                 guard case .blob(let id) = row[0] else { throw VaultRuntimeError.inconsistentCatalog }
                 if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: id, at: date, reason: reason, force: true) { created += 1 }
             }

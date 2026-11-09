@@ -286,6 +286,7 @@ public enum CatalogSchema {
                     """)
                 // Reindex every note (from stored content) at the next scan.
                 try db.execute("DELETE FROM document_metadata")
+                try db.execute("DELETE FROM document_fts")
                 try db.execute("UPDATE vaults SET state='scanRequired'")
                 try db.execute("PRAGMA user_version=13")
             }

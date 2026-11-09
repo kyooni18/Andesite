@@ -84,8 +84,8 @@ enum LinkIndex {
     /// Block identifiers (`text ^block-id` at the end of a line), outside code.
     static func blockIDs(_ text: String) -> [String] {
         var result: [String] = [], fence: Character?
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+        for line in text.lines() {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 fence = fence == nil ? trimmed.first : (trimmed.first == fence ? nil : fence)
                 continue

@@ -322,7 +322,9 @@ extension VaultRuntime {
                         report.conflicts += 1
                         continue
                     }
-                    var plan = self.plan(occupant, to: try asidePath(path, occupant.id), hash: occupant.hash, size: occupant.size)
+                    // Named from the occupant's own head path (it may differ in
+                    // case from `path`), exactly as the peer derives this revision.
+                    var plan = self.plan(occupant, to: try asidePath(occupant.path ?? path, occupant.id), hash: occupant.hash, size: occupant.size)
                     plan.revision = Self.derive("aside", occupant.head!)
                     plan.origin = "sync"
                     try requireAbsent(plan.to!)

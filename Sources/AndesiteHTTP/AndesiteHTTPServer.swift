@@ -172,18 +172,9 @@ public enum AndesiteHTTPServer {
         router.post("/v1/properties") { request, _ in
             let body = try await Data(buffer: request.body.collect(upTo: 256 * 1024))
             return await respond(session) { vault in
-                guard let fields = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { throw APIError(.badRequest, "invalid_json") }
-                let value: PropertyValue?
-                switch fields["value"] {
-                case nil, is NSNull: value = nil
-                case let number as NSNumber where isBoolean(number): value = .bool(number.boolValue)
-                case let number as NSNumber: value = .number(number.doubleValue)
-                case let text as String: value = .text(text)
-                case let list as [String]: value = .list(list)
-                default: throw APIError(.badRequest, "unsupported_value")
-                }
-                return try document(vault.setProperty(required(fields["path"] as? String, "path"), required(fields["name"] as? String, "name"),
-                                                      to: value, revision: required((fields["revision"] as? String).flatMap(Data.init(hex:)), "revision")))
+                guard let edit = try? JSONDecoder().decode(PropertyEdit.self, from: body),
+                      let revision = Data(hex: edit.revision) else { throw APIError(.badRequest, "invalid_json") }
+                return try document(vault.setProperty(edit.path, edit.name, to: edit.value, revision: revision))
             }
         }
         // {"path","revision","add"} or {"path","revision","remove"}.
@@ -390,13 +381,26 @@ func json(_ object: Any, status: Int = 200) throws -> Reply {
     Reply(status: status, body: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
 }
 
-/// JSON `true`/`false`, as opposed to the numbers 1 and 0.
-func isBoolean(_ number: NSNumber) -> Bool {
-    #if canImport(Darwin)
-    return CFGetTypeID(number) == CFBooleanGetTypeID()
-    #else
-    return number === kCFBooleanTrue || number === kCFBooleanFalse || String(describing: type(of: number)).contains("Bool")
-    #endif
+/// `{"path","name","revision","value"}`; a null or missing value removes the property.
+struct PropertyEdit: Decodable {
+    let path: String
+    let name: String
+    let revision: String
+    let value: PropertyValue?
+
+    enum CodingKeys: String, CodingKey { case path, name, revision, value }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decode(String.self, forKey: .path)
+        name = try c.decode(String.self, forKey: .name)
+        revision = try c.decode(String.self, forKey: .revision)
+        if try !c.contains(.value) || c.decodeNil(forKey: .value) { value = nil }
+        else if let flag = try? c.decode(Bool.self, forKey: .value) { value = .bool(flag) }
+        else if let number = try? c.decode(Double.self, forKey: .value) { value = .number(number) }
+        else if let text = try? c.decode(String.self, forKey: .value) { value = .text(text) }
+        else { value = .list(try c.decode([String].self, forKey: .value)) }
+    }
 }
 
 func encoded<T: Encodable>(_ value: T) throws -> Reply {

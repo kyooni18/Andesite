@@ -74,7 +74,7 @@ final class VaultDirectory {
     deinit { close(fd) }
 
     /// nil when absent. Only owned, singly linked regular files are accepted.
-    func info(_ name: String) throws -> stat? {
+    func info(_ name: String) throws -> FileFingerprint? {
         var s = stat()
         if fstatat(fd, name, &s, AT_SYMLINK_NOFOLLOW) != 0 {
             if errno == ENOENT { return nil }
@@ -82,7 +82,7 @@ final class VaultDirectory {
         }
         guard s.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), s.st_nlink == 1,
               UInt64(s.st_dev) == device else { throw VaultError.invalidPath(name) }
-        return s
+        return FileFingerprint(s, directory: fd, name: name)
     }
 
     func exists(_ name: String) -> Bool {
@@ -112,7 +112,7 @@ final class VaultDirectory {
     /// Streams the file through SHA-256. Returns nil when absent.
     func digest(_ name: String, maximumBytes: Int) throws -> (fingerprint: FileFingerprint, hash: String, size: Int64)? {
         guard let before = try info(name) else { return nil }
-        guard before.st_size <= maximumBytes else { throw VaultError.tooLarge }
+        guard before.size <= maximumBytes else { throw VaultError.tooLarge }
         let file = openat(fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard file >= 0 else {
             if errno == ENOENT { return nil }
@@ -133,9 +133,9 @@ final class VaultDirectory {
             hasher.update(bufferPointer: UnsafeRawBufferPointer(rebasing: buffer[0..<n]))
         }
         var after = stat()
-        guard fstat(file, &after) == 0, FileFingerprint(after) == FileFingerprint(before),
+        guard fstat(file, &after) == 0, FileFingerprint(after, directory: file) == before,
               Int64(after.st_size) == size else { throw VaultError.conflict(current: nil) }
-        return (FileFingerprint(after), hasher.finalize().map { String(format: "%02x", $0) }.joined(), size)
+        return (FileFingerprint(after, directory: file), hasher.finalize().map { String(format: "%02x", $0) }.joined(), size)
     }
 
     /// Writes a complete, durable file under a temporary name and then

@@ -3,7 +3,7 @@ import Testing
 @testable import AndesiteCore
 
 @Test func safeVaultObservation() throws {
-    let base = URL(fileURLWithPath: "/private" + FileManager.default.temporaryDirectory.path).appendingPathComponent(UUID().uuidString)
+    let base = try RuntimeFixture().root
     let vault = base.appendingPathComponent("vault"), objects = base.appendingPathComponent("objects")
     try FileManager.default.createDirectory(at: vault.appendingPathComponent("nested"), withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: objects, withIntermediateDirectories: true)

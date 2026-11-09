@@ -208,7 +208,7 @@ extension VaultRuntime {
         guard current.head == revision else { throw VaultError.conflict(current: current.head) }
         let (directory, name) = try journal().open(current.path!)
         let info = try directory.info(name)
-        if let info, let hint = current.hint, FileFingerprint(info) == hint { return current }
+        if let info, let hint = current.hint, info == hint { return current }
         if info != nil, try directory.digest(name, maximumBytes: Int.max)?.hash == current.hash { return current }
         _ = try? reconcile()
         throw VaultError.conflict(current: try Catalog.live(db: r.db, vaultID: vaultID, path: path)?.head)
