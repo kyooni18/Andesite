@@ -72,6 +72,11 @@ public struct FileFingerprint: Equatable, Sendable, Codable {
         #endif
     }
 
+    /// The later of the content and metadata change times, in seconds.
+    var changedAt: Double {
+        max(Double(modificationSeconds) + Double(modificationNanos) / 1e9, Double(changeSeconds) + Double(changeNanos) / 1e9)
+    }
+
     var renameIdentity: String? {
         guard let birthSeconds, let birthNanos, birthSeconds != 0 || birthNanos != 0 else { return nil }
         return "\(device):\(inode):\(birthSeconds):\(birthNanos)"

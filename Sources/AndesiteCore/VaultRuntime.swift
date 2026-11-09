@@ -61,6 +61,7 @@ public final class VaultRuntime {
         let objects: ObjectStore
     }
     private(set) var resources: Resources?
+    private var objectsVerifiedAt: Date?
     private var processLock: ProcessLock?
     let configuration: VaultConfiguration
     public let vaultID: Data
@@ -255,7 +256,13 @@ public final class VaultRuntime {
         try RecoverySnapshots.validateTime(date)
         try setState("scanning")
         do {
-            try verifyObjects()
+            // The full catalog/object cross-check is O(vault): on the first
+            // scan, then at most every five minutes. Content is verified by
+            // hash whenever it is read.
+            if objectsVerifiedAt.map({ Date().timeIntervalSince($0) > 300 }) ?? true {
+                try verifyObjects()
+                objectsVerifiedAt = Date()
+            }
             let all = try r.reader.files()
             // Files over their size limit are left alone: untracked, and not
             // mistaken for the deletion of what was tracked at that path.
@@ -288,9 +295,13 @@ public final class VaultRuntime {
                 return plan.old[prior].fingerprint != scan[index].fingerprint
             }
             report.unchanged = scan.count - changed.count
-            // One quiet period for the whole batch: a file still being written
-            // changes its fingerprint, fails this scan and is retried later.
-            if !changed.isEmpty, configuration.debounce > 0 { Thread.sleep(forTimeInterval: configuration.debounce) }
+            // One quiet period for the whole batch, counted from the latest
+            // change (watcher scans start after one, so they rarely wait). A
+            // file still being written changes its fingerprint, fails this
+            // scan and is retried later.
+            let latest = changed.map { scan[$0].fingerprint.changedAt }.max() ?? 0
+            let wait = min(configuration.debounce, latest + configuration.debounce - Date().timeIntervalSince1970)
+            if wait > 0 { Thread.sleep(forTimeInterval: wait) }
             // Captures are committed in batches: one transaction (and one
             // device flush) for many files instead of several per file.
             for batch in stride(from: 0, to: changed.count, by: 256).map({ Array(changed[$0..<min($0 + 256, changed.count)]) }) {

@@ -135,7 +135,6 @@ import Testing
     try reopened.shutdown()
 }
 
-#if os(macOS)
 @Test func metadataHTTPHandlesPropertiesTagsFiltersAndInvalidRequests() async throws {
     let f = try RuntimeFixture(); defer { f.clean() }
     try f.write("one.md", """
@@ -184,4 +183,3 @@ import Testing
     await server.stop()
     try session.close()
 }
-#endif
