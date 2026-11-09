@@ -391,8 +391,11 @@ public final class Vault: @unchecked Sendable {
                     throw VaultOpenError.unsafeStateDirectory
                 }
             }
-            guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
-                  (info.st_mode & 0o022 == 0 || info.st_mode & mode_t(S_ISVTX) != 0) else {
+            guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+                throw VaultOpenError.unsafeStateDirectory
+            }
+            guard info.st_mode & 0o022 == 0 || info.st_mode & mode_t(S_ISVTX) != 0
+                    || isAboveAppContainer(prefix) else {
                 throw VaultOpenError.unsafeStateDirectory
             }
             // Both root and per-vault state are exclusively owner accessible.
@@ -403,4 +406,17 @@ public final class Vault: @unchecked Sendable {
             }
         }
     }
+}
+
+/// On iOS the sandbox, not Unix modes, keeps other apps out of this
+/// app's container, and the folders above it belong to the system (in
+/// the Simulator, to the Mac's user, some group-writable). Only folders
+/// inside the container are held to the ownership rules.
+func isAboveAppContainer(_ path: String) -> Bool {
+    #if os(macOS) || !canImport(Darwin)
+    return false
+    #else
+    let home = NSHomeDirectory()
+    return home == path || home.hasPrefix(path + "/")
+    #endif
 }

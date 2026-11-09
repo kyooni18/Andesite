@@ -624,7 +624,7 @@ public final class VaultRuntime {
             var s = stat()
             guard lstat(prefix, &s) == 0, s.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else { throw VaultRuntimeError.invalidConfiguration }
             // Ancestors may be shared sticky temp directories, not arbitrary writable directories.
-            guard s.st_mode & 0o022 == 0 || s.st_mode & mode_t(S_ISVTX) != 0 else { throw VaultRuntimeError.invalidConfiguration }
+            guard s.st_mode & 0o022 == 0 || s.st_mode & mode_t(S_ISVTX) != 0 || isAboveAppContainer(prefix) else { throw VaultRuntimeError.invalidConfiguration }
             if prefix == path {
                 guard s.st_uid == geteuid(), !privateDirectory || s.st_mode & 0o077 == 0 else { throw VaultRuntimeError.unsafeState }
             }
