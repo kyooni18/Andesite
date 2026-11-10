@@ -140,7 +140,9 @@ route.
 - **Properties and tags:** `setProperty`, `addTag` and `removeTag` replace only
   the lines of the edited key. They keep line endings and refuse to write
   frontmatter that would not parse. Inline `#tags` are prose and are left
-  alone. `.obsidian/` and other hidden folders are never indexed or modified.
+  alone. `.obsidian/` and other hidden folders are never indexed or modified,
+  except `bookmarks.json`, which Andesite shares with Obsidian's Bookmarks
+  plugin and rewrites when a bookmarked file or folder moves.
 
 ## Reliability
 

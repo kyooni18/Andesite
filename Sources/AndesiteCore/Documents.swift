@@ -183,6 +183,7 @@ extension VaultRuntime {
         try journal().recover()
         do {
             try journal().run(plan)
+            bookmarksFollowMove(from: plan.from, to: plan.to)
         } catch VaultError.conflict {
             // Another writer changed the file mid-operation. Capture its
             // version so the caller can retry against the true head.

@@ -224,6 +224,29 @@ public enum AndesiteHTTPServer {
                 Reply(body: try await vault.snapshotContents(required(id, "id")), contentType: "text/markdown; charset=utf-8")
             }
         }
+        // Bookmarks: the vault's bookmarks.json (Obsidian's format), whole.
+        router.get("/v1/bookmarks") { _, _ in
+            await respond {
+                let (list, version) = try await vault.perform(.read) { try $0.bookmarkStore.read() }
+                return Reply(body: try BookmarkStore.encode(list), etag: version)
+            }
+        }
+        router.put("/v1/bookmarks") { request, _ in
+            let match = request.headers[.init("If-Match")!].map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"")) }
+            let body: ByteBuffer
+            do { body = try await request.body.collect(upTo: 8 * 1024 * 1024) } catch { return response(failure(VaultError.tooLarge)) }
+            return await respond {
+                guard let match else { throw APIError(.preconditionRequired, "if_match_required") }
+                guard let list = try? JSONDecoder().decode(BookmarkList.self, from: Data(buffer: body)) else {
+                    throw APIError(.badRequest, "invalid_json")
+                }
+                let version = try await vault.perform(.write) { runtime in
+                    try runtime.bookmarkStore.save(list, replacing: match)
+                    return try runtime.bookmarkStore.read().version
+                }
+                return Reply(body: try BookmarkStore.encode(list), etag: version)
+            }
+        }
         addSyncRoutes(router, at: "/sync") { _, _ in vault }
         return router
     }

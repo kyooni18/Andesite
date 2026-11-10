@@ -36,6 +36,19 @@ scan completes, index routes return 503 `index_not_ready`.
 | `POST /v1/properties` | `{path, name, value, revision}`; value is a string, number, bool, string list or null (remove) | document JSON |
 | `POST /v1/tags` | `{path, revision, add}` or `{path, revision, remove}` | document JSON |
 
+## Bookmarks
+
+The vault's bookmarks, in the format of Obsidian's Bookmarks plugin
+(`{"items": [...]}`; see `Bookmark` in AndesiteCore). They live in
+`.obsidian/bookmarks.json` when the vault has an `.obsidian` folder, and in
+`.andesite/bookmarks.json` otherwise. Moving a file or folder through the API,
+by sync or outside the app moves its bookmarks along.
+
+| Route | Request | Response |
+|---|---|---|
+| `GET /v1/bookmarks` | | the list, `ETag: "<version>"` (`"none"` before the file exists) |
+| `PUT /v1/bookmarks` | the whole list; `If-Match: "<version>"` | the list and its new `ETag`; 412 `revision_conflict` if it changed |
+
 ## Snapshots
 
 `GET /v1/snapshots?path=` lists recovery snapshots.

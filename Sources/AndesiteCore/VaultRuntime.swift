@@ -415,6 +415,7 @@ public final class VaultRuntime {
                 try setState("quarantined")
                 return (report, true)
             }
+            var renames: [(String, String)] = []
             let results: [Captured] = try r.db.transaction {
                 // Recheck after acquiring SQLite's writer lock, not before a
                 // potentially long lock wait. No metadata has changed yet.
@@ -439,13 +440,18 @@ public final class VaultRuntime {
                     let id = plan.assignment[indexInScan].map { plan.old[$0].id }
                     guard let captured = try ExternalCapture.publish(db: r.db, vaultID: vaultID, prepared: prepared, entryID: id, at: date) else { throw VaultRuntimeError.inconsistentCatalog }
                     let moved = id != nil
-                    if moved { report.renamed += 1 }
+                    if moved {
+                        report.renamed += 1
+                        if let prior = plan.assignment[indexInScan] { renames.append((plan.old[prior].name, prepared.name)) }
+                    }
                     if try RecoverySnapshots.schedule(db: r.db, vaultID: vaultID, entryID: captured.entryID, at: date, reason: moved ? "rename" : "interval", force: moved) { report.snapshotsCreated += 1 }
                     results.append((captured, prepared.kind, nil))
                 }
                 return results
             }
             try index(results)
+            // Files renamed outside the app keep their bookmarks.
+            for (old, new) in renames { bookmarksFollowMove(from: old, to: new) }
             // v9 metadata migration: populate missing properties/tag rows
             // from already verified immutable revisions, never source files.
             // Do not declare the index ready with a partial backfill.
