@@ -38,6 +38,10 @@ struct NamespacePlan {
         var used = Set<Int>()
         for (identity, prior) in priorIdentities where prior.count == 1 {
             if let current = currentIdentities[identity], current.count == 1 {
+                // Settings keep their fixed identity at their fixed path.
+                // Moving a file into or out of .andesite is not a note rename.
+                if old[prior[0]].name == SyncedVaultSettings.path ||
+                    scan[current[0]].path.components.joined(separator: "/") == SyncedVaultSettings.path { continue }
                 assignment[current[0]] = prior[0]; used.insert(prior[0])
             }
         }

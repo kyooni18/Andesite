@@ -274,7 +274,7 @@ extension VaultRuntime {
         guard parents.count <= 2, Set(parents).count == parents.count,
               ["markdown", "attachment"].contains(s.kind), kind(of: s.path) == s.kind,
               s.path.utf8.count <= 1024, let path = try? VaultPath(s.path),
-              !path.components.contains(where: { $0.hasPrefix(".") }),
+              SyncedVaultSettings.permits(path, document: s.document),
               s.deleted == (s.hash == nil), s.deleted == (s.size == nil),
               s.hash.map(ObjectStore.validHash) ?? true, (s.size ?? 0) >= 0, (s.size ?? 0) <= Int64(configuration.limit(for: s.kind)),
               !s.origin.isEmpty, s.origin.utf8.count <= 32 else { throw SyncError.invalidBatch("record \(s.revision.prefix(40))") }
@@ -358,7 +358,7 @@ extension VaultRuntime {
             let live = entry.state == "live"
             var destination: String?
             if !revision.deleted {
-                let path = try vaultPath(revision.path)
+                let path = try vaultPath(revision.path, allowsSettings: true)
                 if let occupant = try Catalog.live(db: db, vaultID: vaultID, path: path), occupant.id != id {
                     if !forced, pending.contains(occupant.id) { return false }
                     if !live, occupant.hash == revision.hash {
@@ -432,6 +432,16 @@ extension VaultRuntime {
                 (result.hash, result.size) = (rb.hash, rb.size)
             } else if baseHash == rb.hash {
                 (result.hash, result.size) = (ra.hash, ra.size)
+            } else if ra.path == SyncedVaultSettings.path && rb.path == SyncedVaultSettings.path {
+                if let merged = SyncedVaultSettings.merge(
+                    base: try baseHash.map { try r.objects.get($0, maximumBytes: configuration.maximumBytes) },
+                    try r.objects.get(ra.hash!, maximumBytes: configuration.maximumBytes),
+                    try r.objects.get(rb.hash!, maximumBytes: configuration.maximumBytes)) {
+                    result.hash = try store(merged, kind: "attachment")
+                    result.size = Int64(merged.count)
+                }
+                // Malformed settings use the deterministic winner. Both versions
+                // remain in history; never create another hidden settings file.
             } else if ra.kind == "markdown", let baseHash,
                       let merged = TextMerge.merge(base: try r.objects.get(baseHash, maximumBytes: configuration.maximumBytes),
                                                    try r.objects.get(ra.hash!, maximumBytes: configuration.maximumBytes),

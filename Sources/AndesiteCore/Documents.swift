@@ -251,8 +251,9 @@ extension VaultRuntime {
 
     /// Validates a path and adopts the on-disk spelling of existing parent
     /// folders, so case-insensitive volumes never get two spellings.
-    func vaultPath(_ path: String) throws -> String {
-        guard let parsed = try? VaultPath(path), !parsed.components.contains(where: { $0.hasPrefix(".") }) else {
+    func vaultPath(_ path: String, allowsSettings: Bool = false) throws -> String {
+        guard let parsed = try? VaultPath(path),
+              (allowsSettings && path == SyncedVaultSettings.path) || !parsed.components.contains(where: { $0.hasPrefix(".") }) else {
             throw VaultError.invalidPath(path)
         }
         let root = try requireOpen().reader.root

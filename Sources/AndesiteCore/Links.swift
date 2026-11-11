@@ -162,16 +162,19 @@ struct CatalogLinkLookup: LinkTargetLookup {
     let vaultID: Data
 
     func kind(of id: Data) throws -> String? {
-        try Catalog.entry(db: db, vaultID: vaultID, id: id)?.kind
+        guard let entry = try Catalog.entry(db: db, vaultID: vaultID, id: id),
+              let path = entry.path, !path.hasPrefix(".") else { return nil }
+        return entry.kind
     }
 
     func live(path: String) throws -> LinkedFile? {
-        guard let entry = try? Catalog.live(db: db, vaultID: vaultID, path: path), let path = entry.path else { return nil }
+        guard let entry = try? Catalog.live(db: db, vaultID: vaultID, path: path), let path = entry.path,
+              !path.hasPrefix(".") else { return nil }
         return LinkedFile(id: entry.id, path: path, kind: entry.kind)
     }
 
     func named(_ key: String) throws -> [LinkedFile] {
-        try db.queryValues("SELECT id,path,kind FROM entries WHERE vault_id=? AND state='live' AND name_key=? ORDER BY path",
+        try db.queryValues("SELECT id,path,kind FROM entries WHERE vault_id=? AND state='live' AND substr(path,1,1)<>'.' AND name_key=? ORDER BY path",
                            bindings: [.blob(vaultID), .text(key)]).compactMap { row -> LinkedFile? in
             guard case .blob(let id) = row[0], case .text(let path) = row[1], case .text(let kind) = row[2] else { return nil }
             return LinkedFile(id: id, path: path, kind: kind)

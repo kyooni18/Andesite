@@ -122,8 +122,9 @@ public final class VaultReader {
     /// enumeration never returns a partial listing.
     ///
     /// Hidden names (".obsidian", ".git", ".trash", ".andesite", journal
-    /// artifacts, editor swap files) are skipped like Obsidian skips them:
-    /// they are neither indexed nor followed.
+    /// artifacts, editor swap files) are skipped like Obsidian skips them.
+    /// Only `.andesite/settings.json` is captured for sync, as an attachment;
+    /// it is excluded from the public file list and link index.
     /// Every regular file in the vault. `visiting` runs before each folder
     /// is read (a scan uses it to give way to user requests).
     public func files(visiting: () throws -> Void = {}) throws -> [ScannedFile] {
@@ -146,7 +147,9 @@ public final class VaultReader {
                     $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(validatingCString: $0) }
                 }
                 guard let name else { throw VaultReadError.invalidPath }
-                if name.hasPrefix(".") { continue }
+                if prefix == ".andesite/" {
+                    guard name == "settings.json" else { continue }
+                } else if name.hasPrefix(".") && !(prefix.isEmpty && name == ".andesite") { continue }
                 let path = try VaultPath(prefix + name)
                 var info = stat()
                 guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw VaultReadError.unstable }
@@ -154,6 +157,7 @@ public final class VaultReader {
                 guard UInt64(info.st_dev) == rootDevice else { throw VaultReadError.unsafeFile }
                 switch info.st_mode & mode_t(S_IFMT) {
                 case mode_t(S_IFDIR):
+                    guard prefix != ".andesite/" else { continue }
                     let child = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                     guard child >= 0 else { throw VaultReadError.unsafeFile }
                     defer { close(child) }
@@ -161,6 +165,7 @@ public final class VaultReader {
                     guard fstat(child, &opened) == 0, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else { throw VaultReadError.unstable }
                     try visit(child, prefix + name + "/")
                 case mode_t(S_IFREG) where info.st_nlink == 1:
+                    guard prefix != "" || name != ".andesite" else { continue }
                     paths.append(ScannedFile(path: path, fingerprint: FileFingerprint(info, directory: fd, name: name)))
                 default:
                     // Symlinks, hard-linked files and special files are never

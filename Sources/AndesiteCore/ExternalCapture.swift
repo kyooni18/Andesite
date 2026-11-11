@@ -65,6 +65,8 @@ public enum ExternalCapture {
             guard current != nil else { throw ExternalCaptureError.corruptCatalog }
         } else {
             current = try Catalog.live(db: db, vaultID: vaultID, path: p.name)
+                ?? (p.name == SyncedVaultSettings.path
+                    ? Catalog.entry(db: db, vaultID: vaultID, id: SyncedVaultSettings.entryID) : nil)
             if let path = current?.path, Array(path.utf8) != Array(p.name.utf8) { throw ExternalCaptureError.pathCollision }
         }
         if let current, current.kind != p.kind { throw ExternalCaptureError.corruptCatalog }
@@ -74,7 +76,7 @@ public enum ExternalCapture {
             try incident(db: db, vaultID: vaultID, prepared: p, entryID: live?.id, at: date)
             return nil
         }
-        let entryID = current?.id ?? identifier()
+        let entryID = current?.id ?? (p.name == SyncedVaultSettings.path ? SyncedVaultSettings.entryID : identifier())
         if let live, let head = live.head, live.hash == p.hash, Array((live.path ?? "").utf8) == Array(p.name.utf8) {
             try db.executeValues("UPDATE entries SET fs_hint=? WHERE vault_id=? AND id=?", bindings: [.blob(p.hint), .blob(vaultID), .blob(entryID)])
             try resolveIncidents(db: db, vaultID: vaultID, key: p.path.portabilityKey, entryID: entryID)

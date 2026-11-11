@@ -22,7 +22,7 @@ extension VaultRuntime {
                    (SELECT min(created_at) FROM revisions WHERE vault_id=e.vault_id AND entry_id=e.id),
                    h.created_at
             FROM entries e JOIN revisions h ON h.vault_id=e.vault_id AND h.revision_id=e.head_revision AND h.deleted=0
-            WHERE e.vault_id=? AND e.state='live' ORDER BY e.path
+            WHERE e.vault_id=? AND e.state='live' AND substr(e.path,1,1)<>'.' ORDER BY e.path
             """, bindings: [.blob(vaultID)])
         let format = ISO8601DateFormatter()
         return try rows.map { row in

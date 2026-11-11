@@ -130,7 +130,7 @@ extension VaultRuntime {
     /// Every live file, with the tags of each note's indexed revision.
     func graphFiles() throws -> (files: [GraphFile], tags: [Data: [String]]) {
         let r = try requireReady()
-        let files = try r.db.queryValues("SELECT id,path,kind,path_key,name_key FROM entries WHERE vault_id=? AND state='live'",
+        let files = try r.db.queryValues("SELECT id,path,kind,path_key,name_key FROM entries WHERE vault_id=? AND state='live' AND substr(path,1,1)<>'.'",
                                          bindings: [.blob(vaultID)]).map { row -> GraphFile in
             guard case .blob(let id) = row[0], case .text(let path) = row[1], case .text(let kind) = row[2],
                   case .text(let pathKey) = row[3] else { throw VaultRuntimeError.inconsistentCatalog }
