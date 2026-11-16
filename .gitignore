@@ -5,3 +5,30 @@
 .yeet/
 vaults/
 .env
+.env.*
+!.env.example
+
+# Local vault metadata, application state and machine-specific configuration.
+.obsidian/
+.andesite/
+.claude/
+/.vscode/
+/.idea/
+/settings/
+/settings.json
+/data/
+/state/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Credentials, including development credentials.
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
