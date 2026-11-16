@@ -1,0 +1,19 @@
+name: andesite
+
+services:
+  andesite:
+    build: .
+    image: andesite-server:local
+    restart: unless-stopped
+    environment:
+      ANDESITE_API_TOKEN: ${ANDESITE_API_TOKEN:?Set ANDESITE_API_TOKEN in .env}
+    ports:
+      - "127.0.0.1:8790:8790"
+      - "[::1]:8790:8790"
+    volumes:
+      - ${ANDESITE_DATA_DIR:-andesite-data}:/data
+      - ${ANDESITE_VAULTS_DIR:-./vaults}:/data/vaults
+    mem_limit: 256m
+
+volumes:
+  andesite-data:
