@@ -82,22 +82,30 @@ public actor VaultLibrary {
 }
 
 extension AndesiteHTTPServer {
-    /// Serves the sync API for every vault in `library`, at
-    /// `/sync/vaults/<name>/…`, with `/sync/…` meaning the vault `main`.
-    /// `GET /sync/vaults` lists them; `POST /sync/vaults {"name"}` adds one.
+    /// Serves every vault in `library` at `/v1/vaults/<name>/…` (the
+    /// document and index API) and `/sync/vaults/<name>/…` (the sync API),
+    /// with `/v1/…` and `/sync/…` meaning the vault `main`.
+    /// `GET /sync/vaults` and `GET /v1/vaults` list them; `POST /sync/vaults
+    /// {"name"}` adds one.
     public static func run(library: VaultLibrary, token: String, port: Int,
+                           sessionLifetime: TimeInterval = SessionStore.defaultLifetime,
                            onReady: @escaping @Sendable (Int) -> Void = { _ in }) async throws {
         guard isValidToken(token) else { throw APIError(.badRequest, "invalid_token") }
-        let app = Application(router: router(library: library, token: token),
+        let app = Application(router: router(library: library, token: token, sessions: SessionStore(lifetime: sessionLifetime)),
                               configuration: .init(address: .hostname("127.0.0.1", port: port), serverName: "Andesite"),
                               onServerRunning: { onReady($0.localAddress?.port ?? port) })
         try await app.runService()
     }
 
-    static func router(library: VaultLibrary, token: String) -> Router<BasicRequestContext> {
+    static func router(library: VaultLibrary, token: String, sessions: SessionStore = SessionStore()) -> Router<BasicRequestContext> {
         let router = Router()
-        router.middlewares.add(BearerAuthentication(token: Array(token.utf8)))
+        router.middlewares.add(Authentication(token: Array(token.utf8), sessions: sessions))
+        addSessionRoutes(router, token: Array(token.utf8), sessions: sessions)
         router.get("/sync/vaults") { _, _ in
+            await respond { try encoded(["vaults": try await library.list()]) }
+        }
+        // The same list under /v1, which browser sessions can reach.
+        router.get("/v1/vaults") { _, _ in
             await respond { try encoded(["vaults": try await library.list()]) }
         }
         router.post("/sync/vaults") { request, _ in
@@ -111,10 +119,13 @@ extension AndesiteHTTPServer {
                 return reply
             }
         }
-        addSyncRoutes(router, at: "/sync/vaults/{vault}") { _, context in
+        let named: VaultResolver = { _, context in
             let name = context.parameters.get("vault") ?? ""
             return try await library.vault(name.removingPercentEncoding ?? name)
         }
+        addVaultRoutes(router, at: "/v1/vaults/{vault}", vault: named)
+        addVaultRoutes(router, at: "/v1") { _, _ in try await library.vault("main") }
+        addSyncRoutes(router, at: "/sync/vaults/{vault}", vault: named)
         addSyncRoutes(router, at: "/sync") { _, _ in try await library.vault("main") }
         return router
     }

@@ -24,10 +24,10 @@ public enum AndesiteHTTPServer {
 
     /// Serves until cancelled or sent SIGINT/SIGTERM. `onReady` receives the
     /// bound port (useful with port 0).
-    public static func run(vault: Vault, token: String, port: Int,
+    public static func run(vault: Vault, token: String, port: Int, sessionLifetime: TimeInterval = SessionStore.defaultLifetime,
                            onReady: @escaping @Sendable (Int) -> Void = { _ in }) async throws {
         guard isValidToken(token) else { throw APIError(.badRequest, "invalid_token") }
-        let app = Application(router: router(vault: vault, token: token),
+        let app = Application(router: router(vault: vault, token: token, sessions: SessionStore(lifetime: sessionLifetime)),
                               configuration: .init(address: .hostname("127.0.0.1", port: port), serverName: "Andesite"),
                               onServerRunning: { onReady($0.localAddress?.port ?? port) })
         try await app.runService()
@@ -36,11 +36,34 @@ public enum AndesiteHTTPServer {
     /// Routes map onto `Vault` methods, which set each call's priority:
     /// document and index routes are user requests; sync routes, which
     /// serve a peer's background sync, are background work.
-    static func router(vault: Vault, token: String) -> Router<BasicRequestContext> {
+    static func router(vault: Vault, token: String, sessions: SessionStore = SessionStore()) -> Router<BasicRequestContext> {
         let router = Router()
-        router.middlewares.add(BearerAuthentication(token: Array(token.utf8)))
+        router.middlewares.add(Authentication(token: Array(token.utf8), sessions: sessions))
+        addSessionRoutes(router, token: Array(token.utf8), sessions: sessions)
+        addVaultRoutes(router, at: "/v1") { _, _ in vault }
+        addSyncRoutes(router, at: "/sync") { _, _ in vault }
+        return router
+    }
 
-        router.get("/v1/status") { _, _ in
+    /// Finds the vault a request is for; throws when there is none.
+    typealias VaultResolver = @Sendable (Request, BasicRequestContext) async throws -> Vault
+
+    /// The document, index, bookmark and snapshot API of one vault at
+    /// `prefix` (`/v1`, or `/v1/vaults/<name>` when serving several).
+    static func addVaultRoutes(_ router: Router<BasicRequestContext>, at prefix: String, vault resolve: @escaping VaultResolver) {
+        typealias Handler = @Sendable (Request, BasicRequestContext, Vault) async throws -> Response
+        func add(_ method: HTTPRequest.Method, _ path: String, _ handler: @escaping Handler) {
+            router.on(RouterPath(prefix + path), method: method) { request, context -> Response in
+                let vault: Vault
+                do { vault = try await resolve(request, context) } catch { return response(failure(error)) }
+                return try await handler(request, context, vault)
+            }
+        }
+        func get(_ path: String, _ handler: @escaping Handler) { add(.get, path, handler) }
+        func put(_ path: String, _ handler: @escaping Handler) { add(.put, path, handler) }
+        func post(_ path: String, _ handler: @escaping Handler) { add(.post, path, handler) }
+        func delete(_ path: String, _ handler: @escaping Handler) { add(.delete, path, handler) }
+        get("/status") { _, _, vault in
             await respond {
                 let s = try await vault.status()
                 return try json(["vault": s.vaultID.hex, "state": s.state, "entries": s.entries, "revisions": s.revisions,
@@ -49,7 +72,7 @@ public enum AndesiteHTTPServer {
         }
 
         // Files, addressed by Vault-relative path.
-        router.get("/v1/file") { request, _ in
+        get("/file") { request, _, vault in
             let path = request.uri.queryParameters["path"].map(String.init)
             let opened: OpenedContent
             do {
@@ -61,7 +84,7 @@ public enum AndesiteHTTPServer {
             } catch { return response(failure(error)) }
             return stream(opened)
         }
-        router.put("/v1/file") { request, _ in
+        put("/file") { request, _, vault in
             let path = request.uri.queryParameters["path"].map(String.init)
             let create = request.headers[.init("If-None-Match")!] == "*"
             let match = revision(request.headers[.init("If-Match")!])
@@ -77,7 +100,7 @@ public enum AndesiteHTTPServer {
                 return try document(await vault.update(path, contentsOf: staged, revision: match))
             }
         }
-        router.delete("/v1/file") { request, _ in
+        delete("/file") { request, _, vault in
             let path = request.uri.queryParameters["path"].map(String.init)
             let match = revision(request.headers[.init("If-Match")!])
             return await respond {
@@ -87,7 +110,7 @@ public enum AndesiteHTTPServer {
                 return try json(["deleted": path])
             }
         }
-        router.post("/v1/move") { request, _ in
+        post("/move") { request, _, vault in
             let fields = try await form(request)
             return await respond {
                 try document(await vault.move(required(fields["path"], "path"), to: required(fields["to"], "to"),
@@ -95,14 +118,14 @@ public enum AndesiteHTTPServer {
                                               updateLinks: fields["updateLinks"] != "false"))
             }
         }
-        router.post("/v1/restore") { request, _ in
+        post("/restore") { request, _, vault in
             let fields = try await form(request)
             return await respond {
                 try document(await vault.restore(required(fields["path"], "path"),
                                                  revision: required(fields["revision"].flatMap(Data.init(hex:)), "revision")))
             }
         }
-        router.get("/v1/history") { request, _ in
+        get("/history") { request, _, vault in
             let path = request.uri.queryParameters["path"].map(String.init)
             return await respond {
                 try json(["revisions": try await vault.history(required(path, "path")).map { r -> [String: Any] in
@@ -112,7 +135,7 @@ public enum AndesiteHTTPServer {
                 }])
             }
         }
-        router.post("/v1/directories") { request, _ in
+        post("/directories") { request, _, vault in
             let fields = try await form(request)
             return await respond {
                 let path = try required(fields["path"], "path")
@@ -124,7 +147,7 @@ public enum AndesiteHTTPServer {
         }
 
         // Index queries.
-        router.get("/v1/documents") { request, _ in
+        get("/documents") { request, _, vault in
             let q = request.uri.queryParameters
             let (limit, offset) = (int(q["limit"]) ?? 50, int(q["offset"]) ?? 0)
             let (tag, property, value) = (q["tag"].map(String.init), q["property"].map(String.init), q["value"].map(String.init))
@@ -136,7 +159,7 @@ public enum AndesiteHTTPServer {
                                  "nextOffset": page.nextOffset.map { $0 as Any } ?? NSNull()])
             }
         }
-        router.get("/v1/search") { request, _ in
+        get("/search") { request, _, vault in
             let q = request.uri.queryParameters
             let (text, limit) = (q["q"].map(String.init) ?? "", int(q["limit"]) ?? 50)
             let (tag, property, value) = (q["tag"].map(String.init), q["property"].map(String.init), q["value"].map(String.init))
@@ -153,19 +176,19 @@ public enum AndesiteHTTPServer {
                 return try json(["hits": hits])
             }
         }
-        router.get("/v1/tags") { request, _ in
+        get("/tags") { request, _, vault in
             let (limit, offset) = (int(request.uri.queryParameters["limit"]) ?? 50, int(request.uri.queryParameters["offset"]) ?? 0)
             return await respond { try encoded(await vault.tags(limit: limit, offset: offset)) }
         }
-        router.get("/v1/properties") { request, _ in
+        get("/properties") { request, _, vault in
             let (limit, offset) = (int(request.uri.queryParameters["limit"]) ?? 50, int(request.uri.queryParameters["offset"]) ?? 0)
             return await respond { try encoded(await vault.properties(limit: limit, offset: offset)) }
         }
-        router.get("/v1/metadata") { request, _ in
+        get("/metadata") { request, _, vault in
             let path = request.uri.queryParameters["path"].map(String.init)
             return await respond { try encoded(await vault.metadata(required(path, "path"))) }
         }
-        router.get("/v1/mentions") { request, _ in
+        get("/mentions") { request, _, vault in
             let path = request.uri.queryParameters["path"].map(String.init)
             return await respond {
                 try json(["mentions": try await vault.unlinkedMentions(required(path, "path")).map {
@@ -174,7 +197,7 @@ public enum AndesiteHTTPServer {
             }
         }
         // Frontmatter edits: {"path","revision","name","value"} (a null value removes the property).
-        router.post("/v1/properties") { request, _ in
+        post("/properties") { request, _, vault in
             let body = try await Data(buffer: request.body.collect(upTo: 256 * 1024))
             return await respond {
                 guard let edit = try? JSONDecoder().decode(PropertyEdit.self, from: body),
@@ -183,7 +206,7 @@ public enum AndesiteHTTPServer {
             }
         }
         // {"path","revision","add"} or {"path","revision","remove"}.
-        router.post("/v1/tags") { request, _ in
+        post("/tags") { request, _, vault in
             let fields = try await form(request)
             return await respond {
                 let path = try required(fields["path"], "path")
@@ -192,7 +215,7 @@ public enum AndesiteHTTPServer {
                 return try document(await vault.removeTag(path, required(fields["remove"], "add_or_remove"), revision: revision))
             }
         }
-        router.get("/v1/links") { request, _ in
+        get("/links") { request, _, vault in
             let q = request.uri.queryParameters
             let path = q["path"].map(String.init), incoming = q["direction"] == "incoming"
             let (limit, offset) = (int(q["limit"]) ?? 50, int(q["offset"]) ?? 0)
@@ -208,7 +231,7 @@ public enum AndesiteHTTPServer {
         }
 
         // Recovery snapshots.
-        router.get("/v1/snapshots") { request, _ in
+        get("/snapshots") { request, _, vault in
             let path = request.uri.queryParameters["path"].map(String.init)
             return await respond {
                 try json(["snapshots": try await vault.snapshots(path: path).reversed().prefix(100).map { s -> [String: Any] in
@@ -218,20 +241,20 @@ public enum AndesiteHTTPServer {
                 }])
             }
         }
-        router.get("/v1/snapshots/{id}/content") { _, context in
+        get("/snapshots/{id}/content") { _, context, vault in
             let id = context.parameters.get("id").flatMap(Data.init(hex:))
             return await respond {
                 Reply(body: try await vault.snapshotContents(required(id, "id")), contentType: "text/markdown; charset=utf-8")
             }
         }
         // Bookmarks: the vault's bookmarks.json (Obsidian's format), whole.
-        router.get("/v1/bookmarks") { _, _ in
+        get("/bookmarks") { _, _, vault in
             await respond {
                 let (list, version) = try await vault.perform(.read) { try $0.bookmarkStore.read() }
                 return Reply(body: try BookmarkStore.encode(list), etag: version)
             }
         }
-        router.put("/v1/bookmarks") { request, _ in
+        put("/bookmarks") { request, _, vault in
             let match = request.headers[.init("If-Match")!].map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"")) }
             let body: ByteBuffer
             do { body = try await request.body.collect(upTo: 8 * 1024 * 1024) } catch { return response(failure(VaultError.tooLarge)) }
@@ -247,8 +270,6 @@ public enum AndesiteHTTPServer {
                 return Reply(body: try BookmarkStore.encode(list), etag: version)
             }
         }
-        addSyncRoutes(router, at: "/sync") { _, _ in vault }
-        return router
     }
 
     /// The sync API for one vault at `prefix`; `vault` finds the vault a
@@ -509,28 +530,4 @@ func form(_ request: Request) async throws -> [String: String] {
 
 extension Data {
     init(buffer: ByteBuffer) { self.init(buffer.readableBytesView) }
-}
-
-/// Requires the whole bearer token, compared in constant time.
-struct BearerAuthentication: RouterMiddleware {
-    typealias Context = BasicRequestContext
-    let token: [UInt8]
-
-    func handle(_ request: Request, context: Context,
-                next: (Request, Context) async throws -> Response) async throws -> Response {
-        let header = request.headers[.authorization] ?? ""
-        let proposed = Array((header.hasPrefix("Bearer ") ? header.dropFirst(7) : "").utf8)
-        var difference = UInt8(truncatingIfNeeded: proposed.count ^ token.count)
-        for index in 0..<token.count { difference |= token[index] ^ (index < proposed.count ? proposed[index] : 0) }
-        guard difference == 0 else {
-            return Response(status: .unauthorized, headers: [.contentType: "application/json; charset=utf-8"],
-                            body: .init(byteBuffer: ByteBuffer(string: "{\"error\":\"authentication_required\"}")))
-        }
-        do {
-            return try await next(request, context)
-        } catch let error as APIError {
-            return Response(status: error.status, headers: [.contentType: "application/json; charset=utf-8"],
-                            body: .init(byteBuffer: ByteBuffer(string: "{\"error\":\"\(error.code)\"}")))
-        }
-    }
 }
