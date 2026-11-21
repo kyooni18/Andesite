@@ -2,7 +2,7 @@
 #
 # The server only listens on the container's loopback (by design); nginx
 # forwards the container's port 8790 to it: /sync/ for sync, /v1/ for the
-# vault API, and everything else is the web frontend in deploy/www. Publish that port to the host's
+# vault API, /auth/ for browser sessions, and everything else is the web frontend in deploy/www. Publish that port to the host's
 # loopback only (-p 127.0.0.1:8790:8790): the sync client accepts plain HTTP
 # only to loopback, and anything wider needs a TLS-terminating proxy.
 #
