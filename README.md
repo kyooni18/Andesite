@@ -107,3 +107,12 @@ andesite-server sync ~/VaultB http://127.0.0.1:8790 --state ~/.andesite/b --ever
 The server listens only on loopback. For another machine, put it behind a
 TLS-terminating reverse proxy. The sync client refuses plain HTTP to any
 address that is not loopback, and it does not follow redirects.
+
+## Web app
+
+The container serves a web app at `/` from `deploy/www`. The app is a separate project, written in
+Mün: [kyooni18/Andesite-Mun](https://github.com/kyooni18/Andesite-Mun). Build it there and copy it
+here with `pnpm run deploy ../Andesite/deploy/www`, then `docker compose up --build`. The browser signs
+in with the API token once (`POST /auth/session`) and uses an HttpOnly session cookie from then on;
+see [docs/http-api.md](docs/http-api.md#browser-sessions). The JSON Schemas of the `/v1` responses are
+in [docs/schemas](docs/schemas/README.md) and the app generates its types from them.
